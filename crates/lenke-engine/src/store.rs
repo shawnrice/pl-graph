@@ -71,6 +71,7 @@ impl Ord for OrdVal {
 /// node ids. Holds only NON-NULL present values (a null never passes a range
 /// predicate — the operand makes it UNKNOWN — so excluding it keeps the seek in
 /// step with a scan+filter).
+#[derive(Clone)]
 struct RangeIndex {
     key: String,
     map: BTreeMap<OrdVal, Vec<u32>>,
@@ -95,6 +96,7 @@ struct Iv {
 /// `lo <= qhi AND hi >= qlo`) can SEED from whichever axis is more selective and
 /// post-filter the other — the RI-tree-lite rule from the bitemporal index (seed
 /// from the selective axis; never materialize and intersect both stabs).
+#[derive(Clone)]
 struct IntervalIndex {
     lo_key: String,
     hi_key: String,
@@ -105,7 +107,7 @@ struct IntervalIndex {
 /// A typed property column, indexed by node id. `present[i]` is false where node
 /// `i` does not carry this property (reads as `Value::Null`). One variant per
 /// value type; a heterogeneous property falls to `Gen`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Column {
     Num {
         data: Vec<f64>,
@@ -432,6 +434,7 @@ pub enum Change {
     EdgeProp { eid: u32, key: String },
 }
 
+#[derive(Clone)]
 enum Undo {
     /// Undo `add_node`: pop the last (highest-id) node. Adds grow `node_count`
     /// monotonically, so reverse-order undo always pops the current top.
@@ -686,12 +689,113 @@ pub struct Store {
     /// changes — it is a pure read encoding, like the CSR overlay.
     edge_num: HashMap<String, (Vec<f64>, Vec<bool>)>,
     edge_num_fresh: bool,
+    /// A monotonic mutation counter, bumped by every data mutation primitive (see
+    /// [`Store::touch`]). NOT part of any query result, codec, or ordering — pure
+    /// out-of-band metadata for host-side change detection (`useSyncExternalStore`),
+    /// so it never affects cross-engine byte-identity. Read via [`Store::version`].
+    version: u64,
+}
+
+// Store holds two derived caches behind `RwLock` (which is not `Clone`), so `Clone`
+// is hand-written: every data field is cloned; the caches clone their current value
+// (identical `props` / `node_count` keep it valid). A missing field is a compile
+// error, so this stays complete as the struct grows.
+impl Clone for Store {
+    fn clone(&self) -> Self {
+        Self {
+            node_count: self.node_count,
+            limits: self.limits,
+            by_label: self.by_label.clone(),
+            props: self.props.clone(),
+            prop_keys_cache: std::sync::RwLock::new(
+                self.prop_keys_cache
+                    .read()
+                    .expect("prop_keys_cache poisoned")
+                    .clone(),
+            ),
+            min_label_cache: std::sync::RwLock::new(
+                self.min_label_cache
+                    .read()
+                    .expect("min_label_cache poisoned")
+                    .clone(),
+            ),
+            etype_ids: self.etype_ids.clone(),
+            out_adj: self.out_adj.clone(),
+            in_adj: self.in_adj.clone(),
+            next_eid: self.next_eid,
+            edge_etype: self.edge_etype.clone(),
+            edge_has_extra: self.edge_has_extra.clone(),
+            edge_extra: self.edge_extra.clone(),
+            edge_ends: self.edge_ends.clone(),
+            node_ext: self.node_ext.clone(),
+            edge_ext: self.edge_ext.clone(),
+            ext_to_node: self.ext_to_node.clone(),
+            deleted: self.deleted.clone(),
+            undo: self.undo.clone(),
+            changes: self.changes.clone(),
+            last_commit: self.last_commit.clone(),
+            unique: self.unique.clone(),
+            required: self.required.clone(),
+            edge_props: self.edge_props.clone(),
+            indexes: self.indexes.clone(),
+            ranges: self.ranges.clone(),
+            edge_type_index: self.edge_type_index,
+            out_type_idx: self.out_type_idx.clone(),
+            in_type_idx: self.in_type_idx.clone(),
+            interval: self.interval.clone(),
+            csr_out_off: self.csr_out_off.clone(),
+            csr_out: self.csr_out.clone(),
+            csr_in_off: self.csr_in_off.clone(),
+            csr_in: self.csr_in.clone(),
+            csr_fresh: self.csr_fresh,
+            csr_out_typed: self.csr_out_typed.clone(),
+            csr_in_typed: self.csr_in_typed.clone(),
+            edge_num: self.edge_num.clone(),
+            edge_num_fresh: self.edge_num_fresh,
+            version: self.version,
+        }
+    }
+}
+
+impl Store {
+    /// Bump the mutation counter. Called by every data-mutation primitive.
+    fn touch(&mut self) {
+        self.version = self.version.wrapping_add(1);
+    }
+
+    /// The monotonic mutation version — changes on every data mutation, for
+    /// host-side change detection. Not observable in query results (see the field).
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Keys carrying a hash (equality) node index, each rendered as a dotted path.
+    #[must_use]
+    pub fn hash_index_keys(&self) -> Vec<String> {
+        self.indexes.iter().map(|i| i.path.join(".")).collect()
+    }
+
+    /// Keys carrying a range (ordered) node index.
+    #[must_use]
+    pub fn range_index_keys(&self) -> Vec<String> {
+        self.ranges.iter().map(|r| r.key.clone()).collect()
+    }
+
+    /// The edge interval index's `(lo_key, hi_key)`, if one exists.
+    #[must_use]
+    pub fn interval_index_keys(&self) -> Option<(String, String)> {
+        self.interval
+            .as_ref()
+            .map(|iv| (iv.lo_key.clone(), iv.hi_key.clone()))
+    }
 }
 
 /// A hash index on a node property PATH. `path` is `["age"]` for a plain property
 /// or `["meta", "city"]` for a dotted record-field path; the index keys on the
 /// value found by descending record fields (`resolve_path`). A plain index
 /// (length-1 path) behaves exactly as before.
+#[derive(Clone)]
 struct Index {
     path: Vec<String>,
     map: HashMap<Vec<u8>, Vec<u32>>,
@@ -1318,6 +1422,7 @@ impl Store {
 
     /// Add a node with `labels` and `(key, value)` properties; returns its id.
     pub fn add_node(&mut self, labels: &[&str], props: &[(&str, Value)]) -> u32 {
+        self.touch();
         // A created node mints its external id from its dense id (stable for the
         // life of the store — dense ids are never reused). Ingest supplies the
         // file's id via `add_node_with_id`.
@@ -1382,6 +1487,7 @@ impl Store {
     /// Add an edge carrying an explicit external id (used by ingest). Returns the
     /// eid.
     pub fn add_edge_with_id(&mut self, ext: &Arc<str>, from: u32, to: u32, label: &str) -> u32 {
+        self.touch();
         self.invalidate_csr();
         self.invalidate_edge_num(); // next_eid grows; the eid-indexed overlay is stale
         assert!(
@@ -1703,6 +1809,7 @@ impl Store {
     /// Set node `node`'s `key` to `value`, creating the column if new and
     /// promoting it to `Gen` if `value`'s type differs from the column's.
     pub fn set_prop(&mut self, node: u32, key: &str, value: Value) {
+        self.touch();
         let rec = self.undo.is_some().then(|| Undo::RestoreCell {
             node,
             key: key.to_string(),
@@ -1752,6 +1859,7 @@ impl Store {
     /// Remove node `node`'s `key` — it reads as NULL again. (Distinct from setting
     /// it to a stored `Null`; that distinction is a Phase-E concern.)
     pub fn remove_prop(&mut self, node: u32, key: &str) {
+        self.touch();
         let rec = self.undo.is_some().then(|| Undo::RestoreCell {
             node,
             key: key.to_string(),
@@ -2243,6 +2351,7 @@ impl Store {
 
     /// Remove edge `eid`'s `key` (reads NULL again).
     pub fn remove_edge_prop(&mut self, eid: u32, key: &str) {
+        self.touch();
         let rec = self.undo.is_some().then(|| Undo::RestoreEdgeCell {
             eid,
             key: key.to_string(),
@@ -2270,6 +2379,7 @@ impl Store {
     /// was its source (so it is safe to call with the endpoints in either order,
     /// e.g. from a hop matched via incoming adjacency). A no-op if already gone.
     pub fn delete_edge(&mut self, u: u32, v: u32, eid: u32) {
+        self.touch();
         self.invalidate_csr();
         self.invalidate_edge_num();
         let logging = self.undo.is_some();
@@ -2317,6 +2427,7 @@ impl Store {
     /// it from every label bucket, and clear its properties. After this it is
     /// absent from all scans and traversals. A no-op if already deleted.
     pub fn delete_node(&mut self, id: u32) {
+        self.touch();
         self.invalidate_csr();
         self.invalidate_edge_num(); // deletes incident edges
         let i = id as usize;
@@ -2812,6 +2923,7 @@ impl Builder {
             csr_in_typed: Vec::new(),
             edge_num: HashMap::new(),
             edge_num_fresh: false,
+            version: 0,
         };
         // Flatten the freshly-built adjacency into the CSR read overlay, and densify
         // the numeric edge properties into the typed read overlay.
@@ -2946,6 +3058,43 @@ fn homogeneous_temporal_kind(pairs: &[(u32, Value)]) -> Option<crate::temporal::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_bumps_on_every_mutation() {
+        let mut s = Store::default();
+        assert_eq!(s.version(), 0);
+        let a = s.add_node(&["N"], &[]);
+        let v1 = s.version();
+        assert!(v1 > 0, "add_node bumps version");
+        let b = s.add_node(&["N"], &[]);
+        assert!(s.version() > v1, "second add_node bumps again");
+        let v2 = s.version();
+        let e = s.add_edge(a, b, "R");
+        assert!(s.version() > v2, "add_edge bumps");
+        let v3 = s.version();
+        s.set_prop(a, "k", Value::Num(1.0));
+        assert!(s.version() > v3, "set_prop bumps");
+        let v4 = s.version();
+        s.delete_edge(a, b, e);
+        assert!(s.version() > v4, "delete_edge bumps");
+    }
+
+    #[test]
+    fn clone_is_deep_and_independent() {
+        let mut s = Store::default();
+        let a = s.add_node(&["N"], &[("k", Value::Num(1.0))]);
+        let b = s.add_node(&["N"], &[]);
+        s.add_edge(a, b, "R");
+        let ver = s.version();
+        let snap = s.clone();
+        assert_eq!(snap.version(), ver, "clone copies the version");
+        // Mutating the original must not touch the clone.
+        s.add_node(&["N"], &[]);
+        assert_eq!(snap.node_count(), 2, "clone unaffected by later mutation");
+        assert_eq!(s.node_count(), 3);
+        assert_eq!(snap.edge_count(), 1);
+        assert_eq!(snap.version(), ver, "clone version is frozen at copy time");
+    }
 
     /// The CSR read overlay must (a) match the per-node adjacency exactly after a
     /// build, (b) reflect a write IMMEDIATELY (invalidation → Vec fallback), and

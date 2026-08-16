@@ -61,11 +61,36 @@ pub fn apply(store: &mut Store, json: &str) -> Result<(), SchemaError> {
     }
 }
 
-/// Dump the constraints the engine can introspect, in the [`apply`] vocabulary,
-/// so `dump` → `apply` round-trips. Indexes are not yet enumerable on `Store`, so
-/// they are omitted (a documented gap, not a silent one).
+/// Dump the schema — indexes and constraints — in the [`apply`] vocabulary, so a
+/// `dump` → `apply` round-trip reconstructs it. Ops are emitted in a stable order
+/// (sorted keys) so the dump is deterministic.
 pub fn dump(store: &Store) -> String {
     let mut out = String::new();
+
+    // Indexes first (a constraint may rely on its backing index existing).
+    let mut hash = store.hash_index_keys();
+    hash.sort();
+    for key in hash {
+        out.push_str("{\"op\":\"createIndex\",\"on\":\"vertex\",\"kind\":\"hash\",\"keys\":");
+        ndjson::encode_str_array(&mut out, std::slice::from_ref(&key));
+        out.push_str("}\n");
+    }
+    let mut range = store.range_index_keys();
+    range.sort();
+    for key in range {
+        out.push_str("{\"op\":\"createIndex\",\"on\":\"vertex\",\"kind\":\"range\",\"keys\":");
+        ndjson::encode_str_array(&mut out, std::slice::from_ref(&key));
+        out.push_str("}\n");
+    }
+    if let Some((lo, hi)) = store.interval_index_keys() {
+        out.push_str("{\"op\":\"createIndex\",\"on\":\"edge\",\"kind\":\"interval\",\"keys\":");
+        ndjson::encode_str_array(&mut out, &[lo, hi]);
+        out.push_str("}\n");
+    }
+    if store.has_edge_type_index() {
+        out.push_str("{\"op\":\"createIndex\",\"on\":\"edge\",\"kind\":\"type\"}\n");
+    }
+
     let mut uniques = store.unique_constraints();
     uniques.sort();
     for (label, keys) in uniques {
@@ -241,6 +266,35 @@ mod tests {
         let mut s = Store::default();
         apply(&mut s, r#"{"op":"createIndex","on":"edge","kind":"type"}"#).unwrap();
         assert!(s.has_edge_type_index());
+    }
+
+    #[test]
+    fn full_schema_dump_roundtrips_indexes_and_constraints() {
+        let mut s = Store::default();
+        for op in [
+            r#"{"op":"createIndex","on":"vertex","kind":"hash","keys":["age"]}"#,
+            r#"{"op":"createIndex","on":"vertex","kind":"range","keys":["score"]}"#,
+            r#"{"op":"createIndex","on":"edge","kind":"interval","keys":["lo","hi"]}"#,
+            r#"{"op":"createIndex","on":"edge","kind":"type"}"#,
+            r#"{"op":"unique","on":"vertex","label":"Person","key":"email"}"#,
+            r#"{"op":"required","on":"vertex","label":"Person","key":"name"}"#,
+        ] {
+            apply(&mut s, op).unwrap();
+        }
+        // Replay the dump into a fresh store; both the dump text and the introspected
+        // index/constraint state must match.
+        let dumped = dump(&s);
+        let mut s2 = Store::default();
+        for line in dumped.lines().filter(|l| !l.is_empty()) {
+            apply(&mut s2, line).unwrap();
+        }
+        assert_eq!(dump(&s), dump(&s2), "dump -> apply -> dump is stable");
+        assert!(s2.has_hash_index("age"));
+        assert!(s2.has_range_index("score"));
+        assert!(s2.has_interval_index("lo", "hi"));
+        assert!(s2.has_edge_type_index());
+        assert_eq!(s2.unique_constraints(), s.unique_constraints());
+        assert_eq!(s2.required_constraints(), s.required_constraints());
     }
 
     #[test]

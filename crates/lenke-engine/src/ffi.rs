@@ -187,17 +187,11 @@ pub unsafe extern "C" fn lnk_close(s: *mut Store) {
 pub unsafe extern "C" fn lnk_clone(s: *const Store) -> *mut Store {
     crate::ffi_error::begin();
     // SAFETY: forwards this fn's contract to store_ref.
-    let Some(_store) = (unsafe { store_ref(s) }) else {
+    let Some(store) = (unsafe { store_ref(s) }) else {
         crate::ffi_error::set("E_FFI", "null store handle");
         return std::ptr::null_mut();
     };
-    // TODO: needs `Store: Clone` (it is `#[derive(Default)]` today). Once derived:
-    //   return Box::into_raw(Box::new(_store.clone()));
-    crate::ffi_error::set(
-        "E_UNIMPLEMENTED",
-        "Store clone is not yet implemented (Store is not Clone)",
-    );
-    std::ptr::null_mut()
+    Box::into_raw(Box::new(store.clone()))
 }
 
 /// Set a resource limit by its stable [`ConfigId`](crate::store::ConfigId). Returns
@@ -222,7 +216,9 @@ pub unsafe extern "C" fn lnk_config(s: *mut Store, id: u32, value: u64) -> u32 {
 }
 
 /// Read a scalar statistic. `which`: 0 = vertex count, 1 = edge count,
-/// 2 = version, 3 = epoch. 0 for a null handle / unknown selector.
+/// 2 = version (monotonic mutation counter). 0 for a null handle / unknown
+/// selector. (Per-token epoch is NOT here — it takes a name, so it rides
+/// `lnk_command` "epoch", not a bare selector.)
 ///
 /// # Safety
 /// `s` must be a valid handle (or null).
@@ -235,8 +231,7 @@ pub unsafe extern "C" fn lnk_stat(s: *const Store, which: u32) -> u64 {
     match which {
         0 => store.node_count() as u64,
         1 => store.edge_count() as u64,
-        // TODO: version / epoch counters are not tracked on Store yet.
-        2 | 3 => 0,
+        2 => store.version(),
         _ => 0,
     }
 }

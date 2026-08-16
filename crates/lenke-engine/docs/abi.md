@@ -62,7 +62,7 @@ core of the pattern; this completes it and drops the prefix.
 
 ```
 lnk_open   format:  0 = NDJSON   1 = binary snapshot        (ptr null + format 0 = empty graph)
-lnk_stat   which:   0 = vertex_count  1 = edge_count  2 = version  3 = epoch
+lnk_stat   which:   0 = vertex_count  1 = edge_count  2 = version   (per-token epoch takes a name → lnk_command "epoch", not a selector)
 lnk_query  lang:    0 = GQL      1 = Gremlin
 lnk_query  format:  0 = JSON rows  1 = Arrow  2 = Arrow IPC
 lnk_tx     action:  0 = begin    1 = commit  2 = rollback
@@ -174,6 +174,7 @@ exports.
 | `prepared_run`     | `{handle, params, format}` | carrier           | prepared statements           |
 | `prepared_free`    | `{handle}`                 | `{}`              | prepared statements           |
 | `last_write_scope` | `{}`                       | `{scope}`         | CDC                           |
+| `epoch`            | `{name}`                   | `{epoch}`         | per-token change epoch        |
 | `merge`            | `{format, bytes}`          | `{}`              | fork / merge                  |
 
 `algo` is listed for completeness but is _also_ reachable through
@@ -214,29 +215,51 @@ transport reshape — byte-identity and the conformance suites are unaffected.
 
 The skeleton exports all 16 symbols today. Wired to existing `Store` methods:
 `abi_version`, `alloc`/`dealloc`/`free`, `last_error_json`, `open` (NDJSON +
-empty), `close`, `config`, `stat` (counts), `query` (GQL + Gremlin, JSON
-format, param-free), `tx`, `encode` (NDJSON), and — as of the schema pass —
+empty), `close`, `clone` (deep copy), `config`, `stat` (counts **and version**),
+`query` (GQL + Gremlin, JSON format, param-free), `tx`, `encode` (NDJSON),
 `schema_apply` + `schema_dump` (see [`src/schema_op.rs`](../src/schema_op.rs)).
 Every remaining capability returns a specific error — that stub list **is** the
 work-queue to finish before the flip:
 
-- `lnk_query` params (`p_len > 0`), Arrow / Arrow-IPC formats
-- `lnk_open` / `lnk_encode` binary-snapshot format
-- `lnk_clone` (needs `Store: Clone`)
-- `lnk_stat` version / epoch (2, 3)
-- every `lnk_command` name
+- `lnk_query` **params** (`p_len > 0`) — the one big remaining engine feature: the
+  standalone engine has no parameter binding at all (no `Param` in the IR, none in
+  the parser/evaluator), so this needs a real `Param` expr + parse + eval, not a
+  wiring change. Arrow / Arrow-IPC formats (deferred tier).
+- `lnk_open` / `lnk_encode` binary-snapshot format (deferred tier; NDJSON covers it)
+- `lnk_command` names (deferred tiers: `algo`, prepared statements, `epoch`,
+  `last_write_scope`, `merge`)
+
+### Lifecycle pass (clone + version)
+
+`lnk_clone` deep-copies the `Store` (hand-written `Clone`: the two `RwLock` derived
+caches are rebuilt; every data field is cloned, compiler-enforced complete).
+`lnk_stat(which=2)` returns a monotonic **version** — a mutation counter bumped by
+every data-mutation primitive (`add_node`, `add_edge`, `set_prop`, `remove_prop`,
+`remove_edge_prop`, `delete_edge`, `delete_node`) via `Store::touch`. Version is
+out-of-band metadata (not in any query result, codec, or ordering), so it does not
+affect byte-identity — verified: the full cross-engine corpus + conformance suites
+still pass. Per-token **epoch** takes a name, so it is *not* a `stat` selector; it
+rides `lnk_command "epoch"` (deferred). Covered by 2 `Store` unit tests.
 
 ### Schema pass (`src/schema_op.rs`)
 
 `schema_apply` parses one `{"op":…}` object (reusing the engine's JSON parser via
 `ndjson::parse_json`) and dispatches to real `Store` methods; `schema_dump` emits
-the **same** vocabulary so `dump → apply` round-trips. `SchemaError` splits
-`BadRequest` (→ `-1`) from `Rejected` (→ `-2`). Covered by 10 unit tests.
+the **same** vocabulary so `dump → apply` round-trips — **indexes and
+constraints**. `SchemaError` splits `BadRequest` (→ `-1`) from `Rejected` (→ `-2`).
+Covered by 11 unit tests.
 
 Implemented ops: `createIndex` on `vertex/hash`, `vertex/range`, `edge/interval`,
 `edge/type`; `unique` and `required` on vertices (single or composite `keys`).
 
 Still bad-request (no backing `Store` method yet — the schema work still to do):
 `dropIndex`; `type` / `cardinality` / `validator` / `invariant`; edge `unique` /
-`required` / `type` constraints; and **index enumeration in `schema_dump`** (only
-constraints are introspectable today, so indexes are omitted from the dump).
+`required` / `type` constraints.
+
+### Testing note
+
+The `capi` feature exports the engine's `lnk_*` symbols, which collide with
+`lenke-core`'s identical exports. The engine's *integration* tests dev-depend on
+core, so **do not** combine `--features capi` with them. Run `cargo test -p
+lenke-engine` (no capi) for the cross-engine conformance/corpus suites, and
+`cargo test -p lenke-engine --lib --features capi` for the ffi/schema unit tests.
