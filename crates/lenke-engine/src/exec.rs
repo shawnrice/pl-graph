@@ -16272,13 +16272,23 @@ fn compare(op: CompareOp, l: &Col, r: &Col) -> Col {
 }
 
 /// Read a column as three-valued booleans (None = UNKNOWN).
+/// Coerce a non-boolean predicate column to Kleene truth for WHERE/FILTER, matching
+/// core's `as_truth`: a NUMBER is true when non-zero and non-NaN; a STRING when
+/// non-empty; NULL is unknown (`None`); any other non-null value (temporal, list,
+/// record, element) is true. (A bare `WHERE <number>` / `WHERE <string>` is thus a
+/// truthiness test, not a no-match — the engine used to drop every non-bool row.)
 fn as_truth(col: &Col) -> Vec<Option<bool>> {
+    let num = |n: f64| Some(n != 0.0 && !n.is_nan());
     match col {
         Col::Bool(bs) => bs.iter().map(|&b| Some(b)).collect(),
+        Col::Num(ns) => ns.iter().map(|&n| num(n)).collect(),
         other => (0..other.len())
             .map(|i| match other.value_at(i) {
+                Value::Null => None,
                 Value::Bool(b) => Some(b),
-                _ => None,
+                Value::Num(n) => num(n),
+                Value::Str(s) => Some(!s.is_empty()),
+                _ => Some(true),
             })
             .collect(),
     }
@@ -20271,6 +20281,38 @@ mod tests {
         assert_eq!(
             list_len("MATCH (n:T) RETURN collect_list(DISTINCT n.g) AS x"),
             2
+        );
+    }
+
+    /// A non-boolean WHERE/FILTER value is a TRUTHINESS test (matching core): a
+    /// non-zero number and a non-empty string keep the row; zero / "" / null drop it.
+    /// The engine used to treat every non-bool as no-match.
+    #[test]
+    fn where_coerces_non_boolean_to_truth() {
+        let mut b = Builder::default();
+        b.node(&["T"], &[("n", n(1.0)), ("s", s("x"))]);
+        b.node(&["T"], &[("n", n(0.0)), ("s", s(""))]);
+        let st = b.build();
+        let count = |q: &str| run(&crate::gql::parse(q).unwrap(), &st).rows.len();
+        assert_eq!(
+            count("MATCH (n:T) WHERE n.n RETURN n.n AS x"),
+            1,
+            "nonzero number is true"
+        );
+        assert_eq!(
+            count("MATCH (n:T) WHERE n.s RETURN n.s AS x"),
+            1,
+            "non-empty string is true"
+        );
+        assert_eq!(
+            count("MATCH (n:T) WHERE 5 RETURN n.n AS x"),
+            2,
+            "constant nonzero → all"
+        );
+        assert_eq!(
+            count("MATCH (n:T) WHERE 0 RETURN n.n AS x"),
+            0,
+            "zero → none"
         );
     }
 
