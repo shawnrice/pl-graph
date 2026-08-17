@@ -635,7 +635,15 @@ pub unsafe extern "C" fn lnk_tx(s: *mut Store, action: u8) -> i32 {
     };
     match action {
         0 => store.begin(),
-        1 => store.commit(),
+        // Commit runs the DEFERRED declared-constraint checks against the fully-staged
+        // graph first; a violation rolls the whole transaction back and fails the commit
+        // with its coded error (so the host `transaction()` throws, matching core).
+        1 => {
+            if let Err(e) = crate::exec::commit_with_deferred_checks(store) {
+                set_exec_error(&e);
+                return -1;
+            }
+        }
         2 => store.rollback(),
         _ => {
             crate::ffi_error::set("E_FFI", "unknown tx action");

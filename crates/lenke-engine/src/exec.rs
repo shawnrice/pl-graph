@@ -403,6 +403,39 @@ fn stmt_rollback(store: &mut Store, scope: StmtScope) {
     }
 }
 
+/// Run a write statement's DEFERRED declared-constraint checks (unique / required /
+/// type / cardinality / validators / invariants) — but ONLY when the statement is
+/// standalone (`Implicit` scope, its own auto-commit transaction). Inside an explicit
+/// transaction (`Nested`) the checks are DEFERRED to that transaction's COMMIT
+/// ([`commit_with_deferred_checks`]), so a later statement can complete a state that is
+/// temporarily invalid mid-transaction — the SQL DEFERRABLE-constraint model core uses.
+/// Immediate faults (a string-`id` collision, a syntax error) are NOT deferred; they
+/// still roll the one statement back at the write site.
+fn check_deferred_if_standalone(store: &Store, scope: StmtScope) -> Result<(), String> {
+    if matches!(scope, StmtScope::Implicit) {
+        store
+            .run_deferred_checks()
+            .and_then(|()| enforce_expr_constraints(store))
+    } else {
+        Ok(())
+    }
+}
+
+/// Commit an explicit transaction: run the deferred declared-constraint checks against
+/// the fully-staged graph, then commit — or roll the WHOLE transaction back on the first
+/// violation. Shared by the GQL `COMMIT` keyword and the host `transaction()` commit.
+pub(crate) fn commit_with_deferred_checks(store: &mut Store) -> Result<(), String> {
+    if let Err(e) = store
+        .run_deferred_checks()
+        .and_then(|()| enforce_expr_constraints(store))
+    {
+        store.rollback();
+        return Err(e);
+    }
+    store.commit();
+    Ok(())
+}
+
 /// Execute an ISO GQL transaction-control command against the store's transaction
 /// frame, returning an empty result (no rows/columns), like a write-only query. ISO
 /// semantics are enforced HERE (matching core's `run_tx_control`), every violation
@@ -431,8 +464,12 @@ pub(crate) fn run_tx_control(
             if !store.in_transaction() {
                 return Err("E_INVALID_GRAPH_OP: COMMIT: no active transaction".into());
             }
-            store.commit();
+            // Run the DEFERRED declared-constraint checks against the fully-staged
+            // graph; a violation rolls the whole transaction back (read-only mode
+            // clears either way).
+            let checked = commit_with_deferred_checks(store);
             store.set_tx_read_only(false);
+            checked?;
         }
         TxKind::Rollback => {
             if !store.in_transaction() {
@@ -563,11 +600,10 @@ fn run_insert(
         for e in edges {
             insert_edge_with_identity(store, ids[e.from], ids[e.to], &e.etype, &e.props)?;
         }
-        // Enforce every constraint this INSERT could have violated (unique, required,
-        // type, cardinality, validators, invariants).
-        store
-            .run_deferred_checks()
-            .and_then(|()| enforce_expr_constraints(store))?;
+        // Enforce the declared constraints this INSERT could have violated (unique,
+        // required, type, cardinality, validators, invariants) — NOW if standalone,
+        // else DEFERRED to the enclosing transaction's COMMIT.
+        check_deferred_if_standalone(store, scope)?;
         Ok(ids)
     })();
     match result {
@@ -647,9 +683,7 @@ fn run_insert_from(
                 )?;
             }
         }
-        store
-            .run_deferred_checks()
-            .and_then(|()| enforce_expr_constraints(store))
+        check_deferred_if_standalone(store, scope)
     })();
     if let Err(err) = result {
         stmt_rollback(store, scope);
@@ -848,12 +882,9 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                 }
                 store.delete_node(node);
             }
-            // Recheck every constraint this statement could have violated; roll it
-            // back on the first violation.
-            if let Err(e) = store
-                .run_deferred_checks()
-                .and_then(|()| enforce_expr_constraints(store))
-            {
+            // Declared-constraint checks: NOW if standalone, else deferred to the
+            // enclosing transaction's COMMIT. Roll back on the first violation.
+            if let Err(e) = check_deferred_if_standalone(store, scope) {
                 stmt_rollback(store, scope);
                 return Err(e);
             }
@@ -982,10 +1013,7 @@ fn execute_merge(
         }
     }
 
-    if let Err(e) = store
-        .run_deferred_checks()
-        .and_then(|()| enforce_expr_constraints(store))
-    {
+    if let Err(e) = check_deferred_if_standalone(store, scope) {
         stmt_rollback(store, scope);
         return Err(e);
     }
@@ -20962,10 +20990,39 @@ mod tests {
     }
 
     #[test]
-    fn per_statement_savepoint_isolates_a_failed_write_inside_a_transaction() {
-        // A unique constraint makes the middle write fault; the app swallows it and
-        // continues. Only that statement rolls back (to its savepoint) — the writes
-        // around it commit with the transaction.
+    fn an_immediate_fault_inside_a_transaction_isolates_to_its_own_statement() {
+        // A string-`id` collision is an IMMEDIATE fault (the element's identity), so it
+        // rolls back only ITS statement's savepoint. The app can swallow it and the
+        // writes around it still commit with the transaction — the "skip the bad row,
+        // commit the good ones" pattern. (Declared constraints DEFER to commit instead;
+        // see the next test.)
+        let mut store = Builder::default().build();
+        stmt(&mut store, "INSERT (:User {id: 'taken'})").unwrap(); // external id 'taken'
+        stmt(&mut store, "START TRANSACTION").unwrap();
+        stmt(&mut store, "INSERT (:User {id: 'a'})").unwrap();
+        // Collides with the existing 'taken' id → an IMMEDIATE fault; the app ignores it.
+        assert!(stmt(&mut store, "INSERT (:User {id: 'taken'})").is_err());
+        stmt(&mut store, "INSERT (:User {id: 'b'})").unwrap();
+        stmt(&mut store, "COMMIT").unwrap();
+
+        assert!(
+            store.node_by_ext("a").is_some(),
+            "the write before the fault committed"
+        );
+        assert!(
+            store.node_by_ext("b").is_some(),
+            "the write after the fault committed"
+        );
+        assert!(store.node_by_ext("taken").is_some());
+        assert_eq!(store.live_node_count(), 3, "taken + a + b (no duplicate)");
+    }
+
+    #[test]
+    fn a_deferred_constraint_violation_surfaces_at_commit_and_rolls_the_whole_transaction_back() {
+        // A DECLARED unique constraint is checked at COMMIT (deferred), matching core.
+        // So the colliding write itself SUCCEEDS mid-transaction, and the violation
+        // surfaces only at COMMIT — rolling back the WHOLE transaction (you cannot
+        // swallow it row-by-row, unlike an immediate fault).
         let mut b = Builder::default();
         b.node(&["User"], &[("email", s("taken@x"))]);
         let mut store = b.build();
@@ -20973,10 +21030,12 @@ mod tests {
 
         stmt(&mut store, "START TRANSACTION").unwrap();
         stmt(&mut store, "INSERT (:User {email: 'a@x'})").unwrap();
-        // Collides with the seeded 'taken@x' → faults; the caller ignores it.
-        let _ = stmt(&mut store, "INSERT (:User {email: 'taken@x'})");
+        // Deferred: the duplicate insert itself does NOT fault here.
+        stmt(&mut store, "INSERT (:User {email: 'taken@x'})")
+            .expect("a deferred unique constraint does not fault at the statement");
         stmt(&mut store, "INSERT (:User {email: 'b@x'})").unwrap();
-        stmt(&mut store, "COMMIT").unwrap();
+        let commit = stmt(&mut store, "COMMIT");
+        assert!(commit.is_err(), "the deferred violation surfaces at COMMIT");
 
         let count = |store: &Store, v: &str| {
             store
@@ -20985,21 +21044,29 @@ mod tests {
                 .filter(|&&nd| matches!(store.prop(nd, "email"), Value::Str(e) if &*e == v))
                 .count()
         };
-        assert_eq!(
-            count(&store, "a@x"),
-            1,
-            "the write before the fault committed"
-        );
-        assert_eq!(
-            count(&store, "b@x"),
-            1,
-            "the write after the fault committed"
-        );
-        assert_eq!(
-            count(&store, "taken@x"),
-            1,
-            "the faulted write left no duplicate"
-        );
+        assert_eq!(count(&store, "a@x"), 0, "whole tx rolled back");
+        assert_eq!(count(&store, "b@x"), 0, "whole tx rolled back");
+        assert_eq!(count(&store, "taken@x"), 1, "only the seed remains");
+    }
+
+    #[test]
+    fn a_deferred_constraint_completed_by_a_later_statement_commits() {
+        // The point of deferral: a row that is temporarily invalid mid-transaction (no
+        // required key) becomes valid before COMMIT (a later statement fills it), so the
+        // transaction commits — the pattern immediate checking would reject.
+        let mut store = Builder::default().build();
+        store.create_required_constraint("Acct", "email").unwrap();
+        stmt(&mut store, "START TRANSACTION").unwrap();
+        // No email yet — deferred, so this SUCCEEDS (immediate checking would reject it).
+        stmt(&mut store, "INSERT (:Acct {id: 'u'})")
+            .expect("a deferred required constraint does not fault at the statement");
+        stmt(
+            &mut store,
+            "MATCH (n:Acct {id: 'u'}) SET n.email = 'u@x.io'",
+        )
+        .unwrap();
+        stmt(&mut store, "COMMIT").expect("valid by commit time");
+        assert_eq!(store.live_node_count(), 1, "the completed row committed");
     }
 
     #[test]

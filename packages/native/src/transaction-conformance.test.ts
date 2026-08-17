@@ -60,13 +60,17 @@ const READ = `MATCH (n:Acct) RETURN n.id, n.bal, n.email ORDER BY n.id`;
 
 /** Run `script` on both engines; assert every outcome and the final Acct state agree. */
 const differential = (
-  declare: (e: Engine) => void,
+  // NB: this parameter MUST NOT be named `declare` — bun's transpiler (1.3.14) parses
+  // a call to a variable named `declare` as a TypeScript ambient `declare` statement
+  // and DELETES it, so `declare(ts)` silently no-ops. That made every constraint
+  // scenario here run vacuously (the constraint was never declared). Named `setup`.
+  setup: (e: Engine) => void,
   script: Array<{ label: string; run: (e: Engine) => unknown }>,
 ): void => {
   const ts = tsEngine();
   const native = nativeEngine();
-  declare(ts);
-  declare(native);
+  setup(ts);
+  setup(native);
 
   for (const { label, run } of script) {
     const a = outcome(() => run(ts));
