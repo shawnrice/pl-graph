@@ -34,6 +34,9 @@ pub mod arrow;
 pub mod batch;
 pub mod binary;
 pub mod bind;
+// The textual codecs (pg-json/pg-text/graphson/csv) over the shared crate — the
+// `codecs` feature; a minimal build drops them (NDJSON/binary stay, native).
+#[cfg(feature = "codecs")]
 pub mod codec;
 pub mod cost;
 pub mod exec;

@@ -320,30 +320,16 @@ pub unsafe extern "C" fn lnk_open(ptr: *const u8, len: usize, format: u8) -> *mu
             }
         }
         // The shared textual codecs (pg-json/pg-text/graphson/csv), via the neutral
-        // GraphData bridge — one byte-identical implementation with lenke-core.
-        _ => {
-            let Some(name) = codec_format_name(format) else {
-                crate::ffi_error::set("E_UNKNOWN_FORMAT", "unknown open format");
-                return std::ptr::null_mut();
-            };
-            // SAFETY: forwards this fn's contract to in_str.
-            let Some(text) = (unsafe { in_str(ptr, len) }) else {
-                crate::ffi_error::set("E_FFI", "codec input is not valid UTF-8");
-                return std::ptr::null_mut();
-            };
-            match crate::codec::deserialize(text, name) {
-                Ok(store) => Box::into_raw(Box::new(store)),
-                Err(e) => {
-                    crate::ffi_error::set(e.code, &e.message);
-                    std::ptr::null_mut()
-                }
-            }
-        }
+        // GraphData bridge — one byte-identical implementation with lenke-core. Gated
+        // behind the `codecs` feature; without it, an unknown format.
+        // SAFETY: forwards this fn's contract to the codec helper.
+        _ => unsafe { open_via_codec(ptr, len, format) },
     }
 }
 
 /// The textual-codec name for a `lnk_open`/`lnk_encode` format byte >= 2, or
 /// `None` for an unknown byte. NDJSON (0) and binary (1) are handled inline.
+#[cfg(feature = "codecs")]
 fn codec_format_name(format: u8) -> Option<&'static str> {
     match format {
         2 => Some("pg-json"),
@@ -352,6 +338,43 @@ fn codec_format_name(format: u8) -> Option<&'static str> {
         5 => Some("csv"),
         _ => None,
     }
+}
+
+/// Open a store from a textual-codec format (>= 2), via the shared crate.
+///
+/// # Safety
+/// If non-null, `ptr`/`len` must describe a readable byte range.
+#[cfg(feature = "codecs")]
+unsafe fn open_via_codec(ptr: *const u8, len: usize, format: u8) -> *mut Store {
+    let Some(name) = codec_format_name(format) else {
+        crate::ffi_error::set("E_UNKNOWN_FORMAT", "unknown open format");
+        return std::ptr::null_mut();
+    };
+    // SAFETY: forwards this fn's contract to in_str.
+    let Some(text) = (unsafe { in_str(ptr, len) }) else {
+        crate::ffi_error::set("E_FFI", "codec input is not valid UTF-8");
+        return std::ptr::null_mut();
+    };
+    match crate::codec::deserialize(text, name) {
+        Ok(store) => Box::into_raw(Box::new(store)),
+        Err(e) => {
+            crate::ffi_error::set(e.code, &e.message);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// The no-codecs build: every textual format is unknown.
+///
+/// # Safety
+/// Trivially safe (touches no pointer); the signature matches the gated version.
+#[cfg(not(feature = "codecs"))]
+unsafe fn open_via_codec(_ptr: *const u8, _len: usize, _format: u8) -> *mut Store {
+    crate::ffi_error::set(
+        "E_UNKNOWN_FORMAT",
+        "this build has no textual codecs (compiled without the `codecs` feature)",
+    );
+    std::ptr::null_mut()
 }
 
 /// Free a `Store` from [`lnk_open`] / [`lnk_clone`].
@@ -680,22 +703,44 @@ pub unsafe extern "C" fn lnk_encode(s: *const Store, format: u8, out_len: *mut u
             // SAFETY: out_len is writable per this fn's contract.
             unsafe { out_bytes(crate::binary::to_binary(store), out_len) }
         }
-        // The shared textual codecs, via the neutral GraphData bridge.
-        _ => {
-            let Some(name) = codec_format_name(format) else {
-                crate::ffi_error::set("E_UNKNOWN_FORMAT", "unknown encode format");
-                return std::ptr::null_mut();
-            };
-            match crate::codec::serialize(store, name) {
-                // SAFETY: out_len is writable per this fn's contract.
-                Ok(text) => unsafe { out_string(text, out_len) },
-                Err(e) => {
-                    crate::ffi_error::set(e.code, &e.message);
-                    std::ptr::null_mut()
-                }
-            }
+        // The shared textual codecs, via the neutral GraphData bridge (the `codecs`
+        // feature; an unknown format without it).
+        // SAFETY: out_len is writable per this fn's contract.
+        _ => unsafe { encode_via_codec(store, format, out_len) },
+    }
+}
+
+/// Encode a store in a textual-codec format (>= 2), via the shared crate.
+///
+/// # Safety
+/// `out_len` must be a valid, writable pointer.
+#[cfg(feature = "codecs")]
+unsafe fn encode_via_codec(store: &Store, format: u8, out_len: *mut usize) -> *mut u8 {
+    let Some(name) = codec_format_name(format) else {
+        crate::ffi_error::set("E_UNKNOWN_FORMAT", "unknown encode format");
+        return std::ptr::null_mut();
+    };
+    match crate::codec::serialize(store, name) {
+        // SAFETY: out_len is writable per this fn's contract.
+        Ok(text) => unsafe { out_string(text, out_len) },
+        Err(e) => {
+            crate::ffi_error::set(e.code, &e.message);
+            std::ptr::null_mut()
         }
     }
+}
+
+/// The no-codecs build: every textual format is unknown.
+///
+/// # Safety
+/// Trivially safe (touches no pointer); the signature matches the gated version.
+#[cfg(not(feature = "codecs"))]
+unsafe fn encode_via_codec(_store: &Store, _format: u8, _out_len: *mut usize) -> *mut u8 {
+    crate::ffi_error::set(
+        "E_UNKNOWN_FORMAT",
+        "this build has no textual codecs (compiled without the `codecs` feature)",
+    );
+    std::ptr::null_mut()
 }
 
 // -------------------------------------------------------------- escape hatch ---

@@ -17,6 +17,11 @@ all = { level = "warn", priority = -1 }
 crate-type = ["lib", "cdylib"]
 
 [features]
+# `default = codecs`: the shipped build ships the extra textual codecs; a minimal
+# build drops them with `--no-default-features` (NDJSON + binary stay — they are
+# native, not in the optional crate — so load/query/snapshot still work).
+default = ["codecs"]
+
 # `capi`: expose the C ABI (`src/ffi.rs` — the `lnk_*` exports). OFF by default so
 # that when lenke-core links this crate as a lib for its `engine-compare` harness,
 # the engine's `#[no_mangle]` symbols (lnk_abi_version, lnk_alloc, lnk_last_error_json,
@@ -25,13 +30,19 @@ crate-type = ["lib", "cdylib"]
 #   cargo build -p lenke-engine --release --features capi
 capi = []
 
+# `codecs`: the extra textual serialization formats (pg-json/pg-text/graphson/csv),
+# via the optional shared `lenke-codec` crate. Droppable — csv especially is heavy —
+# so a size-sensitive wasm build can cut them. NDJSON/binary are NOT here (native).
+codecs = ["dep:lenke-codec"]
+
 [dependencies]
 
 # The shared serialization codecs (pg-json/pg-text/graphson/csv) over a neutral
 # graph model — the SAME crate lenke-core uses, so both engines emit byte-identical
 # format output from identical data. Zero-dep and wasm-clean; the engine supplies
-# only the Store<->GraphData bridge (see `src/codec.rs`).
-lenke-codec = { path = "../lenke-codec" }
+# only the Store<->GraphData bridge (see `src/codec.rs`). Optional so a minimal
+# build can drop the whole dependency — see the `codecs` feature.
+lenke-codec = { path = "../lenke-codec", optional = true }
 
 # The Gremlin `regex()` / `TextP.regex()` predicate. The ONE runtime dependency:
 # byte-identity with core's regex predicate requires the SAME engine, so the crate
