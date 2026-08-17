@@ -6119,6 +6119,43 @@ fn for_each_nbr(
     }
 }
 
+/// Whether a hop's wanted-type set `want` matches EVERY edge (so a count needs no
+/// per-edge type check): an empty `want` (any type), or a set that covers all
+/// interned edge types. `want` is always a distinct subset of the etype ids, so a
+/// length match is the fast test; the `all` probe is a cheap guard against a
+/// degenerate duplicate (`-[:R|R]->`) inflating the length. Computed ONCE per
+/// count, not per node.
+fn want_covers_all_etypes(store: &Store, want: &[u32]) -> bool {
+    want.is_empty()
+        || (want.len() == store.num_etypes()
+            && store.all_etype_ids().iter().all(|id| want.contains(id)))
+}
+
+/// `v`'s matching out/in degree as an f64 — the number of times `for_each_nbr`
+/// would fire for this node — WITHOUT walking each edge when `all_types` says the
+/// type filter is trivially satisfied: a directed hop is then the raw adjacency
+/// length (one read, no per-edge type check). `Dir::Both` keeps the walk (it dedups
+/// the in-side self-loop copy), as does any partial want. Byte-identical in VALUE.
+fn matching_degree(
+    store: &Store,
+    v: u32,
+    dir: Dir,
+    want: &[u32],
+    double_loops: bool,
+    all_types: bool,
+) -> f64 {
+    if all_types {
+        match dir {
+            Dir::Out => return store.out(v).len() as f64,
+            Dir::In => return store.inc(v).len() as f64,
+            Dir::Both => {}
+        }
+    }
+    let mut deg = 0f64;
+    for_each_nbr(store, v, dir, want, double_loops, |_, _| deg += 1.0);
+    deg
+}
+
 /// Slot count of a pure Scan/Expand chain; `None` for anything else (Filter,
 /// Join, VarLength, …). The frontier executor only handles such chains.
 fn chain_width(plan: &Plan) -> Option<usize> {
@@ -9376,17 +9413,21 @@ fn try_fused_count(
         // collapse to distinct nodes with multiplicity and walk each adjacency
         // once, scaled. When they come from a Scan they are already distinct, so
         // that dedup is pure overhead: sum degrees directly.
+        //
+        // When the hop's type set matches EVERY edge (an unlabeled hop, or the
+        // graph's only type), the degree is the raw adjacency length — no per-edge
+        // type check. That is the common "count all my out-neighbours" shape; the
+        // per-edge walk it replaces was the one 1-hop-count regression vs core.
+        let all_types = want_covers_all_etypes(store, &want);
         let mut total = 0f64;
         if matches!(inner.as_ref(), Plan::Expand { .. }) {
             let (distinct, mult) = distinct_with_mult(&src, store.node_count());
             for (i, &v) in distinct.iter().enumerate() {
-                let mut deg = 0f64;
-                for_each_nbr(store, v, *dir, &want, dl, |_, _| deg += 1.0);
-                total += mult[i] * deg;
+                total += mult[i] * matching_degree(store, v, *dir, &want, dl, all_types);
             }
         } else {
             for &v in &src {
-                for_each_nbr(store, v, *dir, &want, dl, |_, _| total += 1.0);
+                total += matching_degree(store, v, *dir, &want, dl, all_types);
             }
         }
         return Some(scalar_num(total));
@@ -17504,6 +17545,59 @@ mod tests {
         let st2 = b2.build();
         // targets passing age>=60: q0→q1(80✓), q0→q3(30✗), q1→q2(90✓), q3→q1(80✓) = 3.
         assert_eq!(count_of(q, &st2), 3.0, "universal flat-sweep path");
+    }
+
+    /// The 1-hop `count(*)` degree-sum reads raw adjacency lengths when the hop's type
+    /// set covers EVERY edge type (the `matching_degree` fast path), and still filters
+    /// by type when it does not — the counts must agree with the per-edge walk in both
+    /// cases. Regression: this shape (`(a)-[:R]->(b) RETURN count(*)`) walked every edge
+    /// with a per-edge type check, ~1.8x slower than core; the raw-length path fixes it
+    /// WITHOUT changing the value.
+    #[test]
+    fn one_hop_count_uses_raw_degree_only_when_type_set_is_universal() {
+        let count_of = |q: &str, st: &Store| -> f64 {
+            match &run(&crate::gql::parse(q).unwrap(), st)
+                .rows
+                .iter()
+                .next()
+                .expect("one count row")[0]
+            {
+                Value::Num(n) => *n,
+                other => panic!("not a number: {other:?}"),
+            }
+        };
+        // Single edge type `R`: `[:R]` covers all types → raw-degree fast path.
+        // Also a MULTI-type graph so a `[:R]` hop is a PARTIAL want (must still filter),
+        // plus a directed self-loop (kept once by Out) and an unlabeled `-->` (any type).
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[]);
+        let c = b.node(&["N"], &[]);
+        let d = b.node(&["N"], &[]);
+        b.edge(a, c, "R");
+        b.edge(a, d, "R");
+        b.edge(a, a, "R"); // directed self-loop: an out-edge counted once
+        b.edge(c, d, "S"); // a SECOND edge type
+        let st = b.build();
+        // Out over R from every N: a has 3 R-out (c, d, self), c has 0 R-out → 3.
+        assert_eq!(
+            count_of("MATCH (x:N)-[:R]->(y) RETURN count(*) AS c", &st),
+            3.0
+        );
+        // In over R: c←1 (a), d←1 (a), a←1 (self) → 3.
+        assert_eq!(
+            count_of("MATCH (x:N)<-[:R]-(y) RETURN count(*) AS c", &st),
+            3.0
+        );
+        // Partial want `[:S]` in a multi-type graph: only the one S edge (c→d) → 1.
+        assert_eq!(
+            count_of("MATCH (x:N)-[:S]->(y) RETURN count(*) AS c", &st),
+            1.0
+        );
+        // Anonymous edge `-[]->` = any type (empty want) → all 4 edges.
+        assert_eq!(
+            count_of("MATCH (x:N)-[]->(y) RETURN count(*) AS c", &st),
+            4.0
+        );
     }
 
     /// A two-column DISTINCT with a high-card Str column dedups on the (Str, other) tuple key

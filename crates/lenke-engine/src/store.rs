@@ -1230,6 +1230,14 @@ impl Store {
         self.etype_ids.values().copied().collect()
     }
 
+    /// How many distinct edge types are interned. A hop whose wanted-type set has
+    /// this many DISTINCT ids matches every edge, so a count can read raw degrees
+    /// instead of type-checking each edge (see exec's `matching_degree`).
+    #[must_use]
+    pub fn num_etypes(&self) -> usize {
+        self.etype_ids.len()
+    }
+
     /// A node's outgoing adjacency.
     #[must_use]
     pub fn out(&self, node: u32) -> &[Adj] {
