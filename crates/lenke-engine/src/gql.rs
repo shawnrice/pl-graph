@@ -5524,6 +5524,14 @@ impl Parser {
                 return name.clone();
             }
         }
+        // An unaliased property access is named `binding.key` (the expression text,
+        // e.g. `n.id`), matching core — not the bare property key `id`. Resolve the
+        // binding's name from its slot; fall back to `default_name` for an unnamed slot.
+        if let Expr::Prop { slot, key } = e {
+            if let Some((var, _)) = self.scope.iter().find(|(_, &s)| s == *slot) {
+                return format!("{var}.{key}");
+            }
+        }
         default_name(e, idx)
     }
 }
@@ -5805,7 +5813,8 @@ mod tests {
             label: Some("Person".into()),
         }
         .project(vec![(
-            "name".into(),
+            // Unaliased `p.name` is named `p.name` (the expression text), like core.
+            "p.name".into(),
             Expr::Prop {
                 slot: 0,
                 key: "name".into(),

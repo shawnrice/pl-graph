@@ -6,26 +6,19 @@
 //
 // Run: bun test packages/native/src/transaction-conformance.test.ts
 import { describe, expect, test } from 'bun:test';
-import { existsSync } from 'node:fs';
 
 import { Graph } from '@lenke/core';
 import { query as tsQuery } from '@lenke/gql';
 import { deserialize as tsDeserialize } from '@lenke/serialization';
 
-import { createFfiBackend } from './backend-ffi.js';
+import { nativeBackend, NATIVE_LIB, nativeReady } from './conformance-harness.js';
 import { graphFromNdjson, type RustGraph } from './graph.js';
 
-const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
-const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
-const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
-  import.meta.url,
-).pathname;
-const hasLib = existsSync(LIB);
+const hasLib = nativeReady;
 
 if (!hasLib) {
   // eslint-disable-next-line no-console
-  console.warn(`[transaction] skipping: ${LIB} not found — run \`bun run build:rust\`.`);
+  console.warn(`[transaction] skipping: ${NATIVE_LIB} not found — run \`bun run build:rust\`.`);
 }
 
 const suite = hasLib ? describe : describe.skip;
@@ -57,7 +50,7 @@ const tsEngine = (): Engine & { _g: Graph } => {
 };
 
 const nativeEngine = (): Engine & { _g: RustGraph } => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const g = graphFromNdjson(backend, SEED);
 
   return { query: (sql) => g.query(sql), transaction: (fn) => g.transaction(fn), _g: g };

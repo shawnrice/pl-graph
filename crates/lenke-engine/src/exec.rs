@@ -362,6 +362,47 @@ fn render_col_into(col: Col, store: &Store, out: &mut [Value], c: usize, ncols: 
 /// unique + required constraints on every touched label and rolling the whole
 /// statement back on the first violation. Returns the ids of the created nodes,
 /// in creation order (index i is the node declared at position i). Shared by
+/// A per-statement atomic scope. A GQL write wraps its mutations so a constraint
+/// violation rolls back exactly that statement. If a transaction is ALREADY open
+/// (an explicit `transaction()`), the scope is a SAVEPOINT within it — the statement
+/// undoes to its own mark on failure without abandoning the caller's transaction, and
+/// its changes commit with the caller's. Standalone, it is an implicit single-statement
+/// `begin`/`commit`. This is what lets the same write run both bare and nested (the
+/// unconditional `begin` used to panic "nested transactions are not supported").
+#[derive(Clone, Copy)]
+enum StmtScope {
+    /// No transaction was open: this scope owns an implicit begin/commit.
+    Implicit,
+    /// A transaction was already open: a savepoint at this undo-log mark.
+    Nested(usize),
+}
+
+fn stmt_begin(store: &mut Store) -> StmtScope {
+    if store.in_transaction() {
+        StmtScope::Nested(store.savepoint())
+    } else {
+        store.begin();
+        StmtScope::Implicit
+    }
+}
+
+/// End a statement scope on SUCCESS: an implicit scope commits; a nested scope leaves
+/// its changes in the enclosing transaction (committed when the caller commits).
+fn stmt_commit(store: &mut Store, scope: StmtScope) {
+    if matches!(scope, StmtScope::Implicit) {
+        store.commit();
+    }
+}
+
+/// End a statement scope on FAILURE: an implicit scope rolls the whole thing back; a
+/// nested scope rolls back only to its savepoint, keeping the caller's transaction open.
+fn stmt_rollback(store: &mut Store, scope: StmtScope) {
+    match scope {
+        StmtScope::Implicit => store.rollback(),
+        StmtScope::Nested(mark) => store.rollback_to(mark),
+    }
+}
+
 /// `Plan::Insert` and `Plan::InsertReturn`.
 fn run_insert(
     store: &mut Store,
@@ -370,7 +411,7 @@ fn run_insert(
 ) -> Result<Vec<u32>, String> {
     // In a transaction so a constraint violation rolls the whole INSERT back
     // rather than leaving a partial write.
-    store.begin();
+    let scope = stmt_begin(store);
     let mut ids = Vec::with_capacity(nodes.len());
     for spec in nodes {
         let labels: Vec<&str> = spec.labels.iter().map(String::as_str).collect();
@@ -394,10 +435,10 @@ fn run_insert(
         .run_deferred_checks()
         .and_then(|()| enforce_expr_constraints(store))
     {
-        store.rollback();
+        stmt_rollback(store, scope);
         return Err(e);
     }
-    store.commit();
+    stmt_commit(store, scope);
     Ok(ids)
 }
 
@@ -536,7 +577,7 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
             // statement back — matching INSERT/_MERGE. Previously SET/REMOVE applied
             // with no recheck, so `SET u.email = <existing>` silently violated a
             // unique constraint and `REMOVE u.email` a required one.
-            store.begin();
+            let scope = stmt_begin(store);
             // Pass 1: property writes and EDGE deletes. Node deletes are deferred to
             // pass 2 so an edge deleted here (`DELETE r, a, b`) leaves its endpoints
             // relationship-free before the non-DETACH node-delete check runs.
@@ -564,7 +605,7 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                     continue;
                 }
                 if !detach && (!store.out(node).is_empty() || !store.inc(node).is_empty()) {
-                    store.rollback();
+                    stmt_rollback(store, scope);
                     return Err(
                         "E_INVALID_GRAPH_OP: cannot DELETE a node that still has relationships; \
                          use DETACH DELETE"
@@ -579,10 +620,10 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                 .run_deferred_checks()
                 .and_then(|()| enforce_expr_constraints(store))
             {
-                store.rollback();
+                stmt_rollback(store, scope);
                 return Err(e);
             }
-            store.commit();
+            stmt_commit(store, scope);
             Ok(empty_rows())
         }
         Plan::Merge {
@@ -625,12 +666,12 @@ fn execute_merge(
     on_update: &crate::ir::MergeUpdate,
 ) -> Result<Rows, String> {
     use crate::ir::MergeUpdate;
-    store.begin();
+    let scope = stmt_begin(store);
     let have: Vec<String> = props.iter().map(|(k, _)| k.clone()).collect();
     let key_keys = match store.infer_merge_key(label, &have) {
         Ok(k) => k,
         Err(e) => {
-            store.rollback();
+            stmt_rollback(store, scope);
             return Err(e);
         }
     };
@@ -661,7 +702,7 @@ fn execute_merge(
                 let gate = match filter.as_ref().map(|f| eval(f, store, &batch)).transpose() {
                     Ok(g) => g.is_none_or(|c| matches!(c.value_at(0), Value::Bool(true))),
                     Err(e) => {
-                        store.rollback();
+                        stmt_rollback(store, scope);
                         return Err(e);
                     }
                 };
@@ -677,7 +718,7 @@ fn execute_merge(
                             }
                         }
                         Err(e) => {
-                            store.rollback();
+                            stmt_rollback(store, scope);
                             return Err(e);
                         }
                     }
@@ -700,7 +741,7 @@ fn execute_merge(
                     }
                 }
                 Err(e) => {
-                    store.rollback();
+                    stmt_rollback(store, scope);
                     return Err(e);
                 }
             }
@@ -711,10 +752,10 @@ fn execute_merge(
         .run_deferred_checks()
         .and_then(|()| enforce_expr_constraints(store))
     {
-        store.rollback();
+        stmt_rollback(store, scope);
         return Err(e);
     }
-    store.commit();
+    stmt_commit(store, scope);
     Ok(empty_rows())
 }
 

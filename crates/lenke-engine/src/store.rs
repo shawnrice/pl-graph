@@ -3382,6 +3382,15 @@ impl Store {
     // to its savepoint on failure without abandoning the whole transaction).
     // Constraint checks and event buffering are deferred to Phase H.
 
+    /// Whether a transaction is currently open. A write statement consults this to
+    /// pick per-statement atomicity via a SAVEPOINT (already in a transaction) vs an
+    /// implicit single-statement `begin`/`commit` (standalone) — so a GQL write runs
+    /// the same inside an explicit `transaction()` as it does on its own.
+    #[must_use]
+    pub fn in_transaction(&self) -> bool {
+        self.undo.is_some()
+    }
+
     /// Open a transaction. Panics if one is already open (no nesting yet).
     pub fn begin(&mut self) {
         assert!(self.undo.is_none(), "nested transactions are not supported");
