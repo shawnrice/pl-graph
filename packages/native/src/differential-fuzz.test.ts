@@ -516,8 +516,10 @@ suite('differential fuzz: TS gql engine vs Rust core', () => {
         );
       }
 
-      if (divergences.length >= 10) {
-        break; // cap the report
+      // Cap the report (raise via FUZZ_MAX_DIV to enumerate the whole landscape
+      // during triage — e.g. FUZZ_MAX_DIV=300 for a full divergence survey).
+      if (divergences.length >= Number(process.env.FUZZ_MAX_DIV ?? 10)) {
+        break;
       }
     }
 

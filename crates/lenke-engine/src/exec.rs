@@ -20316,6 +20316,27 @@ mod tests {
         );
     }
 
+    /// A temporal renders TAGGED in a query result (`{"@duration":"P1D"}`), matching
+    /// core — not a bare ISO string. Covers every temporal kind.
+    #[test]
+    fn query_result_renders_temporals_tagged() {
+        let mut b = Builder::default();
+        b.node(&["T"], &[]);
+        let st = b.build();
+        let json = try_run_gql_json(
+            &crate::gql::parse(
+                "MATCH (n:T) RETURN duration('P1D') AS a, date('2020-01-01') AS b, \
+                 local_time('08:30:00') AS c",
+            )
+            .unwrap(),
+            &st,
+        )
+        .unwrap();
+        assert!(json.contains(r#"{"@duration":"P1D"}"#), "{json}");
+        assert!(json.contains(r#"{"@date":"2020-01-01"}"#), "{json}");
+        assert!(json.contains(r#"{"@localtime":"08:30:00"}"#), "{json}");
+    }
+
     /// INSERT accepts a record/map literal as a property value (a constant record),
     /// stored canonically as a `Value::Record` — the seedable-literal path handles
     /// `{…}`, not just scalars and lists.

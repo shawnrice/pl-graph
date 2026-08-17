@@ -22,7 +22,16 @@ pub(crate) fn write_value(out: &mut String, v: &Value) {
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Num(x) => write_number(out, *x),
         Value::Str(s) => write_string(out, s),
-        Value::Temporal(t) => write_string(out, &t.format()),
+        // A temporal renders TAGGED — `{"@date":"2020-01-01"}`, `{"@duration":"P1D"}`,
+        // … — matching core's query-result form (and the NDJSON/elementMap wire form),
+        // not a bare ISO string.
+        Value::Temporal(t) => {
+            out.push_str("{\"@");
+            out.push_str(t.tag());
+            out.push_str("\":");
+            write_string(out, &t.format());
+            out.push('}');
+        }
         Value::List(items) => {
             out.push('[');
             for (i, it) in items.iter().enumerate() {
