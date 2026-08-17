@@ -16,22 +16,15 @@
 // unspecified (see the ORDER-BY-less contract), and a tie would make the comparison
 // flag a non-bug.
 import { describe, expect, test } from 'bun:test';
-import { existsSync } from 'node:fs';
 
 import { Graph } from '@lenke/core';
 import { query as tsQuery } from '@lenke/gql';
 import { deserialize as tsDeserialize } from '@lenke/serialization';
 
-import { createFfiBackend } from './backend-ffi.js';
+import { nativeBackend, nativeReady, resultsEqual } from './conformance-harness.js';
 import { graphFromNdjson } from './graph.js';
 
-const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
-const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
-const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
-  import.meta.url,
-).pathname;
-const suite = existsSync(LIB) ? describe : describe.skip;
+const suite = nativeReady ? describe : describe.skip;
 
 // A tiny two-vertex, one-edge graph so property access, record fields, edge
 // patterns, and aggregates over rows can all be fuzzed.
@@ -473,7 +466,7 @@ const codeOf = (e: unknown): string =>
 type Outcome = { ok: true; json: string } | { ok: false; code: string };
 
 suite('differential fuzz: TS gql engine vs Rust core', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
 
@@ -510,7 +503,7 @@ suite('differential fuzz: TS gql engine vs Rust core', () => {
       // Both errored → acceptable (both reject the input); a shape divergence is
       // when exactly one succeeds, or both succeed with different JSON.
       if (ts.ok && nat.ok) {
-        if (ts.json !== nat.json) {
+        if (!resultsEqual(ts.json, nat.json)) {
           divergences.push(
             `[seed ${caseSeed(SEED, i)}] ${q}\n    ts:     ${ts.json}\n    native: ${nat.json}`,
           );
