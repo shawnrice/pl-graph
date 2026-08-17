@@ -6914,15 +6914,21 @@ mod tests {
     #[test]
     fn call_scc_procedure_yields_component_id() {
         let store = triangle_store();
-        let rows_of = |q: &str| -> Vec<(f64, f64)> {
+        let rows_of = |q: &str| -> Vec<(f64, String)> {
             run(&super::parse(q).unwrap(), &store)
                 .rows
                 .iter()
-                .map(|r| (node_id(&r[0]), num(&r[1])))
+                .map(|r| (node_id(&r[0]), str_val(&r[1])))
                 .collect()
         };
-        // The directed triangle {0,1,2} is one SCC (rep 0); the isolated node is {3}.
-        let want = vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 3.0)];
+        // The directed triangle {0,1,2} is one SCC (rep 0 → ext id "0"); the isolated
+        // node is {3} (rep 3 → ext id "3").
+        let want = vec![
+            (0.0, "0".to_string()),
+            (1.0, "0".to_string()),
+            (2.0, "0".to_string()),
+            (3.0, "3".to_string()),
+        ];
         assert_eq!(
             rows_of("CALL strongly_connected_components() YIELD node, componentId"),
             want
@@ -7264,14 +7270,21 @@ mod tests {
         bld.edge(z, a, "R");
         let store = bld.build();
 
-        let rows_of = |q: &str| -> Vec<(f64, f64)> {
+        let rows_of = |q: &str| -> Vec<(f64, String)> {
             run(&super::parse(q).unwrap(), &store)
                 .rows
                 .iter()
-                .map(|r| (node_id(&r[0]), num(&r[1])))
+                .map(|r| (node_id(&r[0]), str_val(&r[1])))
                 .collect()
         };
-        let want = vec![(0.0, 1.0), (1.0, 1.0), (2.0, 2.0), (3.0, 3.0)];
+        // Cluster is the rep node's ext id string: node 0 joins cluster "1", sources
+        // keep their own ("1"/"2"/"3").
+        let want = vec![
+            (0.0, "1".to_string()),
+            (1.0, "1".to_string()),
+            (2.0, "2".to_string()),
+            (3.0, "3".to_string()),
+        ];
         assert_eq!(rows_of("CALL peer_pressure() YIELD node, cluster"), want);
         assert_eq!(rows_of("CALL peer_pressure()"), want);
         let out = run(&super::parse("CALL peer_pressure()").unwrap(), &store);
@@ -7291,16 +7304,24 @@ mod tests {
         .map(|r| num(&r[0]))
         .collect();
         assert_eq!(both, vec![2.0, 2.0, 2.0, 0.0]);
-        // connected_components: triangle → component 0, isolated → 3.
-        let comps: Vec<(f64, f64)> = run(
+        // connected_components: triangle → component root ext id "0", isolated → "3".
+        let comps: Vec<(f64, String)> = run(
             &super::parse("CALL connected_components() YIELD node, componentId").unwrap(),
             &store,
         )
         .rows
         .iter()
-        .map(|r| (node_id(&r[0]), num(&r[1])))
+        .map(|r| (node_id(&r[0]), str_val(&r[1])))
         .collect();
-        assert_eq!(comps, vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 3.0)]);
+        assert_eq!(
+            comps,
+            vec![
+                (0.0, "0".to_string()),
+                (1.0, "0".to_string()),
+                (2.0, "0".to_string()),
+                (3.0, "3".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -7462,6 +7483,14 @@ mod tests {
         match v {
             Value::Num(x) => *x,
             other => panic!("expected number, got {other:?}"),
+        }
+    }
+    // A node-id-valued procedure result (componentId / cluster / label) renders as the
+    // representative node's EXTERNAL id string (matching core), not a dense index.
+    fn str_val(v: &Value) -> String {
+        match v {
+            Value::Str(s) => s.to_string(),
+            other => panic!("expected string, got {other:?}"),
         }
     }
     fn col(rows: &Rows, r: usize, name: &str) -> Value {

@@ -1461,16 +1461,21 @@ pub fn run_procedure(
         Some("both") => Dir::Both,
         _ => Dir::Out,
     };
+    // The edge-type filter arrives as `edgeLabel` (core's key, sent by the shared
+    // Backend / direct-algo path) OR `edgeType` (the engine's own CALL spelling) —
+    // accept either so a filtered degree/CC/label-prop/… is honoured on both paths.
+    // Reading only `edgeType` silently no-op'd the filter for every direct-algo call.
+    let edge_filter = || str_of("edgeLabel").or_else(|| str_of("edgeType"));
     // Every remaining procedure is scalar `(node, f64)`; wrap into `(node, Value::Num)`.
     let numeric: Vec<(u32, f64)> = match name {
-        "degree" => degree(store, dir(), str_of("edgeType")),
-        "connected_components" => weakly_connected_components(store, str_of("edgeType"))
+        "degree" => degree(store, dir(), edge_filter()),
+        "connected_components" => weakly_connected_components(store, edge_filter())
             .into_iter()
             .map(|(v, c)| (v, f64::from(c)))
             .collect(),
         "label_propagation" => {
             let iters = num_of("iterations").map_or(DEFAULT_LABEL_ITERATIONS, |n| n as u32);
-            label_propagation(store, str_of("edgeType"), iters)
+            label_propagation(store, edge_filter(), iters)
                 .into_iter()
                 .map(|(v, l)| (v, f64::from(l)))
                 .collect()
@@ -1478,15 +1483,15 @@ pub fn run_procedure(
         "pagerank" => {
             let d = num_of("dampingFactor").unwrap_or(DEFAULT_DAMPING);
             let iters = num_of("iterations").map_or(DEFAULT_PAGERANK_ITERATIONS, |n| n as u32);
-            pagerank(store, str_of("edgeType"), d, iters)
+            pagerank(store, edge_filter(), d, iters)
         }
-        "closeness" => closeness(store, str_of("edgeType"), str_of("weightProperty")),
-        "strongly_connected_components" => strongly_connected_components(store, str_of("edgeType"))
+        "closeness" => closeness(store, edge_filter(), str_of("weightProperty")),
+        "strongly_connected_components" => strongly_connected_components(store, edge_filter())
             .into_iter()
             .map(|(v, c)| (v, f64::from(c)))
             .collect(),
-        "on_cycle" => on_cycle(store, str_of("edgeType")),
-        "betweenness" => betweenness(store, str_of("edgeType"), str_of("weightProperty")),
+        "on_cycle" => on_cycle(store, edge_filter()),
+        "betweenness" => betweenness(store, edge_filter(), str_of("weightProperty")),
         "shortest_path" => {
             if str_of("algorithm") == Some("astar") {
                 // Goal-directed A*: source→target only, guided by heuristicProperty.
@@ -1495,7 +1500,7 @@ pub fn run_procedure(
                     str_of("source"),
                     str_of("target"),
                     dir(),
-                    str_of("edgeType"),
+                    edge_filter(),
                     str_of("weightProperty"),
                     str_of("heuristicProperty"),
                 )
@@ -1504,7 +1509,7 @@ pub fn run_procedure(
                     store,
                     str_of("source"),
                     dir(),
-                    str_of("edgeType"),
+                    edge_filter(),
                     str_of("weightProperty"),
                     str_of("target"),
                 )
@@ -1533,17 +1538,39 @@ pub fn run_procedure(
                     }
                 })
                 .unwrap_or_default();
-            personalized_pagerank(store, str_of("edgeType"), &seeds, d, iters)
+            personalized_pagerank(store, edge_filter(), &seeds, d, iters)
         }
         "peer_pressure" => {
             let iters = num_of("iterations").map_or(DEFAULT_PEER_PRESSURE_ITERATIONS, |n| n as u32);
-            peer_pressure(store, str_of("edgeType"), iters)
+            peer_pressure(store, edge_filter(), iters)
                 .into_iter()
                 .map(|(v, c)| (v, f64::from(c)))
                 .collect()
         }
         _ => return None,
     };
+    // connected_components / strongly_connected_components / label_propagation /
+    // peer_pressure yield a NODE ID (the component root / cluster representative).
+    // Core surfaces it as that node's EXTERNAL id STRING — a stable, user-meaningful
+    // id — not the internal dense index. Map the dense id back through the external
+    // id table so both the direct-algo and GQL `CALL` paths agree with core.
+    if matches!(
+        name,
+        "connected_components"
+            | "strongly_connected_components"
+            | "label_propagation"
+            | "peer_pressure"
+    ) {
+        return Some(
+            numeric
+                .into_iter()
+                .map(|(v, x)| {
+                    let ext = store.node_ext_id(x as u32).unwrap_or_default();
+                    (v, Value::Str(ext))
+                })
+                .collect(),
+        );
+    }
     // `on_cycle` yields a BOOLEAN flag (core surfaces `onCycle` as Bool, not a 0/1
     // number); every other scalar procedure yields a number.
     let to_value: fn(f64) -> Value = if name == "on_cycle" {

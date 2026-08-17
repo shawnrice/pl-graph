@@ -17,7 +17,6 @@
 //
 // Run: bun test packages/native/src/algo-conformance.test.ts
 import { describe, expect, test } from 'bun:test';
-import { existsSync } from 'node:fs';
 
 import {
   type AlgorithmConfig,
@@ -35,20 +34,15 @@ import {
 import { query as tsQuery } from '@lenke/gql';
 import { deserialize as tsDeserialize } from '@lenke/serialization';
 
-import { createFfiBackend } from './backend-ffi.js';
+import { nativeBackend, NATIVE_LIB, nativeReady } from './conformance-harness.js';
 import { graphFromNdjson } from './graph.js';
 
-// --- native library bootstrap (mirrors gql-conformance.test.ts) -------------
-const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
-const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
-const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
-  import.meta.url,
-).pathname;
-const hasLib = existsSync(LIB);
+// --- native library bootstrap (via the drop-in harness: core by default,
+// lenke-engine under LENKE_ENGINE=1; see conformance-harness.ts) --------------
+const hasLib = nativeReady;
 
 if (!hasLib) {
-  console.warn(`[algo-conformance] skipping: ${LIB} not found — run \`bun run build:rust\`.`);
+  console.warn(`[algo-conformance] skipping: ${NATIVE_LIB} not found — run \`bun run build:rust\`.`);
 }
 
 const suite = hasLib ? describe : describe.skip;
@@ -72,7 +66,7 @@ const MODERN_NDJSON = [
 ].join('\n');
 
 suite('graph-algorithm differential: degree (TS core vs native)', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const nativeGraph = graphFromNdjson(backend, MODERN_NDJSON);
   const tsGraph = tsDeserialize(MODERN_NDJSON, 'ndjson', new Graph());
 
@@ -143,7 +137,7 @@ const TWO_COMPONENT_NDJSON = [
 ].join('\n');
 
 suite('graph-algorithm differential: connectedComponents (TS core vs native)', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const nativeGraph = graphFromNdjson(backend, TWO_COMPONENT_NDJSON);
   const tsGraph = tsDeserialize(TWO_COMPONENT_NDJSON, 'ndjson', new Graph());
 
@@ -200,7 +194,7 @@ const LABELPROP_NDJSON = [
 ].join('\n');
 
 suite('graph-algorithm differential: labelPropagation (TS core vs native)', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const nativeGraph = graphFromNdjson(backend, LABELPROP_NDJSON);
   const tsGraph = tsDeserialize(LABELPROP_NDJSON, 'ndjson', new Graph());
 
@@ -252,7 +246,7 @@ const PEERPRESSURE_NDJSON = [
 ].join('\n');
 
 suite('graph-algorithm differential: peerPressure (TS core vs native, f64 votes)', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const nativeGraph = graphFromNdjson(backend, PEERPRESSURE_NDJSON);
   const tsGraph = tsDeserialize(PEERPRESSURE_NDJSON, 'ndjson', new Graph());
 
@@ -303,7 +297,7 @@ const PAGERANK_NDJSON = [
 ].join('\n');
 
 suite('graph-algorithm differential: pagerank (TS core vs native, f64)', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const nativeGraph = graphFromNdjson(backend, PAGERANK_NDJSON);
   const tsGraph = tsDeserialize(PAGERANK_NDJSON, 'ndjson', new Graph());
 
@@ -353,7 +347,7 @@ const ZERO_WEIGHT_NDJSON = [
 ].join('\n');
 
 suite('graph-algorithm differential: weighted pagerank with a zero-out-weight node', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const nativeGraph = graphFromNdjson(backend, ZERO_WEIGHT_NDJSON);
   const tsGraph = tsDeserialize(ZERO_WEIGHT_NDJSON, 'ndjson', new Graph());
 
@@ -395,7 +389,7 @@ const SHORTEST_NDJSON = [
 ].join('\n');
 
 suite('graph-algorithm differential: shortestPath (TS core vs native)', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const nativeGraph = graphFromNdjson(backend, SHORTEST_NDJSON);
   const tsGraph = tsDeserialize(SHORTEST_NDJSON, 'ndjson', new Graph());
 
@@ -488,7 +482,7 @@ const CENTRALITY_NDJSON = [
 ].join('\n');
 
 suite('graph-algorithm differential: betweenness (Brandes, TS core vs native)', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const nativeGraph = graphFromNdjson(backend, CENTRALITY_NDJSON);
   const tsGraph = tsDeserialize(CENTRALITY_NDJSON, 'ndjson', new Graph());
 
@@ -529,7 +523,7 @@ suite('graph-algorithm differential: betweenness (Brandes, TS core vs native)', 
 });
 
 suite('graph-algorithm differential: closeness (TS core vs native)', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const nativeGraph = graphFromNdjson(backend, CENTRALITY_NDJSON);
   const tsGraph = tsDeserialize(CENTRALITY_NDJSON, 'ndjson', new Graph());
 
@@ -589,7 +583,7 @@ const FEATURE_NDJSON = [
 ].join('\n');
 
 suite('graph-algorithm differential: neighborAggregate (TS core vs native)', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const nativeGraph = graphFromNdjson(backend, FEATURE_NDJSON);
   const tsGraph = tsDeserialize(FEATURE_NDJSON, 'ndjson', new Graph());
 

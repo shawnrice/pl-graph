@@ -134,20 +134,43 @@ fn prepared_payload(input: Option<&str>) -> Result<PreparedRun, String> {
     Ok((handle, params, format))
 }
 
+/// Fold a camelCase identifier to snake_case: each uppercase letter becomes `_` +
+/// its lowercase. Idempotent on a snake_case input (no uppercase to fold), so it
+/// maps `connectedComponents` → `connected_components` while leaving
+/// `connected_components` unchanged. Used to accept both algo-name spellings.
+fn camel_to_snake(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('_');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Run the `algo` command: validate the config, run the procedure, optionally
 /// write each result to `writeProperty`, and render the `{columns, rows}` JSON.
 fn run_algo_command(
     store: &mut Store,
     fields: &[(String, crate::ndjson::Json)],
 ) -> Result<String, String> {
-    let name = crate::ndjson::json_string(crate::ndjson::req(fields, "name")?)?;
+    // The shared Backend / direct-algo methods send the camelCase procedure name
+    // (`connectedComponents`, `labelPropagation`, …); GQL `CALL` uses the engine's
+    // snake_case (`connected_components`). Normalize camelCase → snake_case here so
+    // BOTH spellings dispatch — the conversion is idempotent on a snake_case name
+    // (no uppercase to fold), so CALL is unaffected.
+    let raw_name = crate::ndjson::json_string(crate::ndjson::req(fields, "name")?)?;
+    let name = camel_to_snake(&raw_name);
     let config = match crate::ndjson::field(fields, "config") {
         Some(o) => crate::ndjson::params_from_obj(o)?,
         None => Vec::new(),
     };
     crate::algo::validate_config(&config)?;
     let column = crate::algo::procedure_result_col(&name)
-        .ok_or_else(|| format!("unknown algorithm `{name}`"))?;
+        .ok_or_else(|| format!("unknown algorithm `{raw_name}`"))?;
     let results = crate::algo::run_procedure(store, &name, &config)
         .ok_or_else(|| format!("algorithm `{name}` rejected its config"))?;
 
