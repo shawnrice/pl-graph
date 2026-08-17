@@ -495,14 +495,13 @@ pub enum PropType {
     ZonedDateTime,
     Duration,
     List,
-    AnyRecord,
 }
 
 impl PropType {
-    /// Parse a type name (as written in a `createTypeConstraint`). `None` for an
-    /// unknown/malformed name (→ `E_INVALID_VALUE`, matching core).
+    /// Parse a scalar type keyword. `None` for anything else (a record keyword is
+    /// handled by [`TypeSpec::parse`]).
     fn from_name(s: &str) -> Option<Self> {
-        Some(match s.trim() {
+        Some(match s {
             "string" => Self::String,
             "number" => Self::Number,
             "boolean" => Self::Boolean,
@@ -513,11 +512,9 @@ impl PropType {
             "zoned_datetime" => Self::ZonedDateTime,
             "duration" => Self::Duration,
             "list" => Self::List,
-            "record" | "any record" => Self::AnyRecord,
             _ => return None,
         })
     }
-    /// The canonical name for the schema dump (inverse of [`from_name`]).
     fn to_name(self) -> &'static str {
         match self {
             Self::String => "string",
@@ -530,14 +527,159 @@ impl PropType {
             Self::ZonedDateTime => "zoned_datetime",
             Self::Duration => "duration",
             Self::List => "list",
-            Self::AnyRecord => "any record",
         }
     }
 }
 
-/// The [`PropType`] a value satisfies, or `None` for a value EXEMPT from a scalar
-/// constraint (`Null` — nullability is the separate REQUIRED/NOT NULL concern — and
-/// a record, which no scalar type describes). Mirrors core's `value_type`.
+/// A declared property TYPE: a scalar, a closed `record { field :: type, … }` (an
+/// exact field set, each field itself a `TypeSpec`, so records nest), or the open
+/// `any record`. Mirrors lenke-core's `TypeSpec`.
+#[derive(Clone, PartialEq, Eq)]
+pub enum TypeSpec {
+    Scalar(PropType),
+    /// A closed record: sorted `(name, type, not_null)` fields. A field is optional
+    /// (absent or null both satisfy it) unless `not_null`. Closed on extras.
+    Record(Vec<(String, TypeSpec, bool)>),
+    /// The open record type — matches any record value regardless of shape.
+    AnyRecord,
+}
+
+impl TypeSpec {
+    /// Parse a constraint type name (scalar / `record { … }` / `any record`),
+    /// optionally suffixed with a top-level ` NOT NULL`. `None` on malformed input.
+    fn parse_with_not_null(s: &str) -> Option<(Self, bool)> {
+        let mut p = TypeParser {
+            s: s.as_bytes(),
+            i: 0,
+        };
+        let t = p.parse_type()?;
+        let not_null = if p.eat_kw("not") {
+            if !p.eat_kw("null") {
+                return None;
+            }
+            true
+        } else {
+            false
+        };
+        p.skip_ws();
+        (p.i == p.s.len()).then_some((t, not_null))
+    }
+
+    /// The canonical name for the schema dump (round-trips through `parse`).
+    fn to_name(&self) -> String {
+        match self {
+            Self::Scalar(t) => t.to_name().to_string(),
+            Self::Record(fields) => {
+                let inner: Vec<String> = fields
+                    .iter()
+                    .map(|(k, t, nn)| {
+                        format!("{k}::{}{}", t.to_name(), if *nn { " NOT NULL" } else { "" })
+                    })
+                    .collect();
+                format!("record{{{}}}", inner.join(","))
+            }
+            Self::AnyRecord => "any record".to_string(),
+        }
+    }
+}
+
+/// A tiny recursive-descent parser for a constraint type expression (ported from
+/// lenke-core's `TypeParser`).
+struct TypeParser<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl TypeParser<'_> {
+    fn skip_ws(&mut self) {
+        while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
+            self.i += 1;
+        }
+    }
+    fn ident(&mut self) -> Option<String> {
+        self.skip_ws();
+        let start = self.i;
+        while self.i < self.s.len()
+            && (self.s[self.i].is_ascii_alphanumeric() || self.s[self.i] == b'_')
+        {
+            self.i += 1;
+        }
+        (self.i > start).then(|| String::from_utf8_lossy(&self.s[start..self.i]).into_owned())
+    }
+    fn eat(&mut self, c: u8) -> bool {
+        self.skip_ws();
+        if self.i < self.s.len() && self.s[self.i] == c {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
+    fn eat_kw(&mut self, word: &str) -> bool {
+        let save = self.i;
+        if self.ident().is_some_and(|w| w.eq_ignore_ascii_case(word)) {
+            true
+        } else {
+            self.i = save;
+            false
+        }
+    }
+    fn parse_type(&mut self) -> Option<TypeSpec> {
+        let word = self.ident()?;
+        if word.eq_ignore_ascii_case("any") {
+            return self.eat_kw("record").then_some(TypeSpec::AnyRecord);
+        }
+        if word.eq_ignore_ascii_case("record") {
+            self.skip_ws();
+            return if self.i < self.s.len() && self.s[self.i] == b'{' {
+                self.parse_record()
+            } else {
+                Some(TypeSpec::AnyRecord)
+            };
+        }
+        PropType::from_name(&word).map(TypeSpec::Scalar)
+    }
+    fn parse_record(&mut self) -> Option<TypeSpec> {
+        if !self.eat(b'{') {
+            return None;
+        }
+        let mut fields: Vec<(String, TypeSpec, bool)> = Vec::new();
+        self.skip_ws();
+        if !self.eat(b'}') {
+            loop {
+                let name = self.ident()?;
+                if !self.eat(b':') {
+                    return None;
+                }
+                self.eat(b':'); // optional second colon (`::`)
+                let ty = self.parse_type()?;
+                let not_null = if self.eat_kw("not") {
+                    if !self.eat_kw("null") {
+                        return None;
+                    }
+                    true
+                } else {
+                    false
+                };
+                match fields.binary_search_by(|(k, _, _)| k.as_str().cmp(&name)) {
+                    Ok(i) => fields[i] = (name, ty, not_null), // duplicate → last wins
+                    Err(i) => fields.insert(i, (name, ty, not_null)),
+                }
+                if self.eat(b',') {
+                    continue;
+                }
+                if self.eat(b'}') {
+                    break;
+                }
+                return None;
+            }
+        }
+        Some(TypeSpec::Record(fields))
+    }
+}
+
+/// The scalar [`PropType`] a value satisfies, or `None` for a value EXEMPT from a
+/// scalar constraint (`Null` and a record/map). Mirrors core's `value_type`.
 fn value_prop_type(v: &Value) -> Option<PropType> {
     Some(match v {
         Value::Null | Value::Record(_) | Value::Map(_) => return None,
@@ -556,36 +698,53 @@ fn value_prop_type(v: &Value) -> Option<PropType> {
     })
 }
 
-/// Whether `v` satisfies a type constraint of `ty` with `not_null`. A top-level
-/// `Null` passes the type test (only `not_null` rejects it); a record/map is
-/// exempt from a scalar type; `AnyRecord` requires a record. Mirrors core's
+/// Whether `v` satisfies `spec`. A top-level `Null` always passes here (the
+/// property's own nullability is the separate `not_null` check, applied by the
+/// caller); a record/map is exempt from a scalar type. A closed record is checked
+/// closed-on-extras with each field optional unless `NOT NULL`. Mirrors core's
 /// `value_matches`.
-fn value_matches_type(v: &Value, ty: PropType, not_null: bool) -> bool {
+fn value_matches(v: &Value, spec: &TypeSpec) -> bool {
     if matches!(v, Value::Null) {
-        return !not_null;
+        return true;
     }
-    match ty {
-        PropType::AnyRecord => matches!(v, Value::Record(_) | Value::Map(_)),
-        _ => value_prop_type(v).is_none_or(|got| got == ty),
+    match spec {
+        TypeSpec::Scalar(ty) => value_prop_type(v).is_none_or(|got| got == *ty),
+        TypeSpec::AnyRecord => matches!(v, Value::Record(_) | Value::Map(_)),
+        TypeSpec::Record(fields) => {
+            let Value::Record(pairs) = v else {
+                return false;
+            };
+            // No extra fields: every present key must be a declared field.
+            if pairs.iter().any(|(vk, _)| {
+                fields
+                    .binary_search_by(|(fk, _, _)| fk.as_str().cmp(vk))
+                    .is_err()
+            }) {
+                return false;
+            }
+            fields.iter().all(|(fk, ft, not_null)| {
+                match pairs.binary_search_by(|(vk, _)| vk.as_ref().cmp(fk.as_str())) {
+                    Ok(i) => {
+                        let fv = &pairs[i].1;
+                        if matches!(fv, Value::Null) {
+                            !not_null
+                        } else {
+                            value_matches(fv, ft)
+                        }
+                    }
+                    Err(_) => !not_null,
+                }
+            })
+        }
     }
 }
 
-/// Parse a type-constraint spec: a type name optionally suffixed ` NOT NULL`.
-/// `Err` (`E_INVALID_VALUE`-coded) on an unknown/malformed name, matching core.
-fn parse_type_spec(spec: &str) -> Result<(PropType, bool), String> {
-    let trimmed = spec.trim();
-    let (name, not_null) = match trimmed.strip_suffix("NOT NULL") {
-        Some(rest) if rest.is_empty() || rest.ends_with(char::is_whitespace) => {
-            (rest.trim_end(), true)
-        }
-        _ => (trimmed, false),
-    };
-    match PropType::from_name(name) {
-        Some(ty) => Ok((ty, not_null)),
-        None => {
-            Err("E_INVALID_VALUE: unknown or malformed type name for a type constraint".to_string())
-        }
-    }
+/// Parse a type-constraint spec (scalar / `record{…}` / `any record`), optionally
+/// suffixed ` NOT NULL`. `Err` (`E_INVALID_VALUE`) on malformed input, matching core.
+fn parse_type_spec(spec: &str) -> Result<(TypeSpec, bool), String> {
+    TypeSpec::parse_with_not_null(spec).ok_or_else(|| {
+        "E_INVALID_VALUE: unknown or malformed type name for a type constraint".to_string()
+    })
 }
 
 /// Whether a value participates in a unique/index set (a scalar). A null, list, or
@@ -603,7 +762,7 @@ fn is_indexable(v: &Value) -> bool {
 struct TypeRule {
     target: String,
     key: String,
-    ty: PropType,
+    ty: TypeSpec,
     not_null: bool,
 }
 
@@ -1796,14 +1955,7 @@ impl Store {
     pub fn type_constraints(&self) -> Vec<(String, String, String, bool)> {
         self.v_type
             .iter()
-            .map(|r| {
-                (
-                    r.target.clone(),
-                    r.key.clone(),
-                    r.ty.to_name().to_string(),
-                    r.not_null,
-                )
-            })
+            .map(|r| (r.target.clone(), r.key.clone(), r.ty.to_name(), r.not_null))
             .collect()
     }
 
@@ -1812,14 +1964,7 @@ impl Store {
     pub fn edge_type_constraints(&self) -> Vec<(String, String, String, bool)> {
         self.e_type
             .iter()
-            .map(|r| {
-                (
-                    r.target.clone(),
-                    r.key.clone(),
-                    r.ty.to_name().to_string(),
-                    r.not_null,
-                )
-            })
+            .map(|r| (r.target.clone(), r.key.clone(), r.ty.to_name(), r.not_null))
             .collect()
     }
 
@@ -1835,7 +1980,7 @@ impl Store {
         edge: bool,
     ) -> Result<(), String> {
         let (ty, not_null) = parse_type_spec(type_name)?;
-        self.check_target_type(target, key, ty, not_null, edge, true)?;
+        self.check_target_type(target, key, &ty, not_null, edge, true)?;
         let rule = TypeRule {
             target: target.to_string(),
             key: key.to_string(),
@@ -1854,7 +1999,7 @@ impl Store {
         let rules = if edge { &self.e_type } else { &self.v_type };
         for r in rules {
             if r.target == target {
-                self.check_target_type(target, &r.key, r.ty, r.not_null, edge, false)?;
+                self.check_target_type(target, &r.key, &r.ty, r.not_null, edge, false)?;
             }
         }
         Ok(())
@@ -1866,7 +2011,7 @@ impl Store {
         &self,
         target: &str,
         key: &str,
-        ty: PropType,
+        ty: &TypeSpec,
         not_null: bool,
         edge: bool,
         declaring: bool,
@@ -1884,7 +2029,11 @@ impl Store {
             self.nodes_with_label(target).to_vec()
         };
         for id in ids {
-            if !value_matches_type(&value_of(id), ty, not_null) {
+            let v = value_of(id);
+            // The property's own nullability (`not_null`) is checked separately from
+            // the type match (a top-level null is type-exempt).
+            let ok = !(not_null && matches!(v, Value::Null)) && value_matches(&v, ty);
+            if !ok {
                 return Err(if declaring {
                     "E_TYPE: existing data already violates the type constraint being declared"
                         .to_string()
@@ -4837,5 +4986,75 @@ mod tests {
             .create_type_constraint("P", "age", "number", false)
             .unwrap_err();
         assert!(e.starts_with("E_TYPE"), "{e}");
+    }
+
+    /// A CLOSED record type: field types + NOT NULL fields + closed-on-extras, with
+    /// a nested record. A node whose `m` is a matching record accepts the constraint;
+    /// each way of breaking the shape rejects it.
+    #[test]
+    fn closed_record_type_constraint() {
+        let spec = "record{a::number,b::string NOT NULL,c::record{d::boolean}}";
+        // `m` built from a nested JSON object → a canonical Value::Record.
+        let node = |m: &str| {
+            crate::ndjson::from_ndjson(&format!(
+                "{{\"id\":\"a\",\"labels\":[\"P\"],\"props\":{{\"m\":{m}}}}}\n"
+            ))
+            .unwrap()
+        };
+        let declare = |mut st: Store| st.create_type_constraint("P", "m", spec, false);
+
+        // Conforming (optional `a`/`c` omitted; required `b` present; nested ok).
+        assert!(declare(node(r#"{"b":"x"}"#)).is_ok());
+        assert!(declare(node(r#"{"a":1,"b":"x","c":{"d":true}}"#)).is_ok());
+        // Wrong scalar field type.
+        assert!(declare(node(r#"{"a":"nope","b":"x"}"#)).is_err());
+        // Missing a NOT NULL field.
+        assert!(declare(node(r#"{"a":1}"#)).is_err());
+        // Extra field (closed on extras).
+        assert!(declare(node(r#"{"b":"x","z":2}"#)).is_err());
+        // Nested field wrong type.
+        assert!(declare(node(r#"{"b":"x","c":{"d":5}}"#)).is_err());
+        // A null property is exempt (the property is nullable without NOT NULL).
+        assert!(declare(node("null")).is_ok());
+        // A non-record value violates a record type.
+        assert!(declare(node("42")).is_err());
+    }
+
+    #[test]
+    fn any_record_type_constraint() {
+        let node = |m: &str| {
+            crate::ndjson::from_ndjson(&format!(
+                "{{\"id\":\"a\",\"labels\":[\"P\"],\"props\":{{\"m\":{m}}}}}\n"
+            ))
+            .unwrap()
+        };
+        // `any record` accepts any record shape but rejects a scalar.
+        assert!(node(r#"{"anything":1,"here":true}"#)
+            .create_type_constraint("P", "m", "any record", false)
+            .is_ok());
+        assert!(node("42")
+            .create_type_constraint("P", "m", "any record", false)
+            .is_err());
+    }
+
+    #[test]
+    fn record_type_name_round_trips() {
+        // A declared record type dumps a spec that parses back to the same rule.
+        let mut st = crate::ndjson::from_ndjson(
+            "{\"id\":\"a\",\"labels\":[\"P\"],\"props\":{\"m\":{\"a\":1,\"b\":\"x\"}}}\n",
+        )
+        .unwrap();
+        let spec = "record{a::number,b::string NOT NULL}";
+        st.create_type_constraint("P", "m", spec, false).unwrap();
+        let (_, _, dumped, _) = st.type_constraints().into_iter().next().unwrap();
+        // Re-declaring from the dumped name succeeds on the same data (round-trips).
+        let mut st2 = crate::ndjson::from_ndjson(
+            "{\"id\":\"a\",\"labels\":[\"P\"],\"props\":{\"m\":{\"a\":1,\"b\":\"x\"}}}\n",
+        )
+        .unwrap();
+        assert!(
+            st2.create_type_constraint("P", "m", &dumped, false).is_ok(),
+            "dumped: {dumped}"
+        );
     }
 }
