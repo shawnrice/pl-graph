@@ -3955,6 +3955,7 @@ fn aggregate(
         // path — they must build an element map either way, so moving buys nothing there.
         // Byte-identical: row order and rendering are unchanged.
         let movable = keys.is_empty()
+            && !agg.distinct // DISTINCT must dedup — fall through to fold_grouped
             && matches!(agg.func, AggFn::Collect | AggFn::CollectList)
             && matches!(
                 arg_col,
@@ -4422,7 +4423,38 @@ fn fold_grouped(
         return Ok(vec![Value::Null; n_groups]); // sum/min/max/avg with no argument
     };
 
-    Ok(match agg.func {
+    // A DISTINCT aggregate (other than the `Count` arm below, which counts distinct
+    // itself) drops duplicate values per group BEFORE folding: a row whose value has
+    // already appeared in its group is routed to a throwaway SINK group so every fold
+    // arm below simply ignores it — no per-arm change. The sink group's result is
+    // truncated off at the end. Fixes `collect_list(DISTINCT …)`, `min(DISTINCT …)`,
+    // etc. previously folding over duplicates.
+    let orig_groups = n_groups;
+    let sink_remap: Option<Vec<u32>> = if agg.distinct && agg.func != AggFn::Count {
+        let mut seen: Vec<FnvSet<Vec<u8>>> = (0..n_groups).map(|_| FnvSet::default()).collect();
+        let sink = n_groups as u32;
+        let mut remapped = Vec::with_capacity(group_of.len());
+        for (i, &g) in group_of.iter().enumerate() {
+            let mut buf = Vec::new();
+            value::group_key_into(&col.value_at(i), &mut buf);
+            remapped.push(if seen[g as usize].insert(buf) {
+                g
+            } else {
+                sink
+            });
+        }
+        Some(remapped)
+    } else {
+        None
+    };
+    let group_of: &[u32] = sink_remap.as_deref().unwrap_or(group_of);
+    let n_groups = if sink_remap.is_some() {
+        orig_groups + 1
+    } else {
+        orig_groups
+    };
+
+    let mut out: Vec<Value> = match agg.func {
         AggFn::Count if agg.distinct => {
             // Per-group distinct count. A dedicated set per group, keyed by the
             // grouping bytes; a group entry is allocated only for a new value.
@@ -4579,7 +4611,9 @@ fn fold_grouped(
                 .map(|nums| percentile_of(nums, frac, cont))
                 .collect()
         }
-    })
+    };
+    out.truncate(orig_groups); // drop the DISTINCT sink group (no-op otherwise)
+    Ok(out)
 }
 
 /// The `frac`-th percentile of `nums` — interpolated (`cont`) or discrete (`disc`) —
@@ -20207,6 +20241,36 @@ mod tests {
         assert!(
             matches!(i, Err(crate::schema_op::SchemaError::Syntax(_))),
             "{i:?}"
+        );
+    }
+
+    /// A DISTINCT aggregate (other than count) dedups its values per group before
+    /// folding — `collect_list(DISTINCT …)`/`min(DISTINCT …)` were folding over
+    /// duplicates. Covers the keyless fast-path (which used to skip the dedup) too.
+    #[test]
+    fn distinct_aggregate_dedups_values() {
+        let mut b = Builder::default();
+        b.node(&["T"], &[("g", s("a"))]);
+        b.node(&["T"], &[("g", s("a"))]);
+        b.node(&["T"], &[("g", s("b"))]);
+        let st = b.build();
+        let list_len = |q: &str| match &run(&crate::gql::parse(q).unwrap(), &st).rows[0][0] {
+            Value::List(items) => items.len(),
+            o => panic!("expected a list, got {o:?}"),
+        };
+        // Two distinct `g` values ("a","b"); a constant collapses to one.
+        assert_eq!(
+            list_len("MATCH (n:T) RETURN collect_list(DISTINCT n.g) AS x"),
+            2
+        );
+        assert_eq!(
+            list_len("MATCH (n:T) RETURN collect_list(DISTINCT true) AS x"),
+            1
+        );
+        // Grouped: each group dedups independently (here one group of 2 distinct).
+        assert_eq!(
+            list_len("MATCH (n:T) RETURN collect_list(DISTINCT n.g) AS x"),
+            2
         );
     }
 
