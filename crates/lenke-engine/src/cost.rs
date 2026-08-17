@@ -76,6 +76,8 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
         Plan::Scan { label: None } => Card::exact(store.live_node_count()),
         Plan::EdgeScan => Card::exact(store.edge_count()),
         Plan::Row => Card::exact(1),
+        // A transaction-control command yields no rows.
+        Plan::TxControl { .. } => Card::exact(0),
         // A list unwind multiplies the input by the (unknown) list length — treat it
         // as a small fan-out, like a low-degree expansion.
         Plan::Unwind { input, .. } => estimate(input, store).scale(4.0, false),

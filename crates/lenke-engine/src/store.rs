@@ -936,6 +936,10 @@ pub struct Store {
     /// the change list of the MOST RECENT committed transaction — what an observer
     /// reads after a write. Empty until the first commit.
     last_commit: Vec<Change>,
+    /// whether the currently-open transaction was started `READ ONLY` (via GQL
+    /// `START TRANSACTION READ ONLY`). A write statement consults it and is rejected;
+    /// set on START, cleared on COMMIT/ROLLBACK. Meaningless outside a transaction.
+    tx_read_only: bool,
     /// declared unique constraints as `(label, keys)` — at most one live node per
     /// label may carry a given key tuple. Enforced by the write statements, not
     /// the store primitives (which stay infallible for rollback).
@@ -1078,6 +1082,7 @@ impl Clone for Store {
             undo: self.undo.clone(),
             changes: self.changes.clone(),
             last_commit: self.last_commit.clone(),
+            tx_read_only: self.tx_read_only,
             unique: self.unique.clone(),
             required: self.required.clone(),
             e_unique: self.e_unique.clone(),
@@ -3402,6 +3407,19 @@ impl Store {
         self.undo.is_some()
     }
 
+    /// Whether the open transaction is READ ONLY (a write must be rejected). See
+    /// [`set_tx_read_only`](Self::set_tx_read_only).
+    #[must_use]
+    pub fn tx_read_only(&self) -> bool {
+        self.tx_read_only
+    }
+
+    /// Record the open transaction's READ ONLY access mode. Set true by
+    /// `START TRANSACTION READ ONLY`; cleared (false) on COMMIT / ROLLBACK.
+    pub fn set_tx_read_only(&mut self, read_only: bool) {
+        self.tx_read_only = read_only;
+    }
+
     /// Open a transaction. Panics if one is already open (no nesting yet).
     pub fn begin(&mut self) {
         assert!(self.undo.is_none(), "nested transactions are not supported");
@@ -3804,6 +3822,7 @@ impl Builder {
             undo: None,
             changes: None,
             last_commit: Vec::new(),
+            tx_read_only: false,
             unique: Vec::new(),
             required: Vec::new(),
             e_unique: Vec::new(),

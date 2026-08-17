@@ -301,7 +301,8 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
         | Plan::InsertReturn { .. }
         | Plan::Merge { .. }
         | Plan::AddEdge { .. }
-        | Plan::CallProcedure { .. }) => (p, false),
+        | Plan::CallProcedure { .. }
+        | Plan::TxControl { .. }) => (p, false),
         Plan::GroupToMap { input } => {
             let (i, c) = rewrite(*input, idx);
             (Plan::GroupToMap { input: Box::new(i) }, c)
@@ -1619,7 +1620,8 @@ fn width(plan: &Plan) -> usize {
         | Plan::InsertReturn { .. }
         | Plan::Update { .. }
         | Plan::Merge { .. }
-        | Plan::AddEdge { .. } => 0,
+        | Plan::AddEdge { .. }
+        | Plan::TxControl { .. } => 0,
 
         // A bind_edge Expand appends TWO slots (edge then node).
         Plan::Expand {
@@ -2134,7 +2136,8 @@ mod tests {
             | Plan::Insert { .. }
             | Plan::Merge { .. }
             | Plan::AddEdge { .. }
-            | Plan::CallProcedure { .. } => false,
+            | Plan::CallProcedure { .. }
+            | Plan::TxControl { .. } => false,
         }
     }
 

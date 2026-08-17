@@ -552,20 +552,34 @@ pub unsafe extern "C" fn lnk_query(
     let result = match lang {
         0 => {
             let plan = match crate::gql::parse_with_params(q, &params) {
-                Ok(plan) => crate::opt::optimize_indexed(plan, store),
+                Ok(plan) => plan,
                 Err(e) => {
                     crate::ffi_error::set("E_SYNTAX", &e);
                     return std::ptr::null_mut();
                 }
             };
-            // A write query (SET/INSERT/_MERGE/…) runs through the mutable executor
-            // and renders its result rows; a read takes the streaming JSON path.
-            if crate::exec::is_write(&plan) {
+            // An ISO transaction-control command (`START TRANSACTION`/`COMMIT`/
+            // `ROLLBACK`) drives the session's transaction frame and yields no rows —
+            // it is neither optimized nor run as a query plan.
+            if let crate::ir::Plan::TxControl { kind, read_only } = plan {
                 guarded(|| {
-                    crate::exec::execute(&plan, store).map(|rows| crate::json::gql_rows_json(&rows))
+                    crate::exec::run_tx_control(store, kind, read_only)
+                        .map(|rows| crate::json::gql_rows_json(&rows))
                 })
             } else {
-                guarded(|| crate::exec::try_run_gql_json(&plan, store))
+                let plan = crate::opt::optimize_indexed(plan, store);
+                // A write query (SET/INSERT/_MERGE/…) runs through the mutable executor
+                // and renders its result rows — but is rejected first if the active
+                // transaction is READ ONLY; a read takes the streaming JSON path.
+                if crate::exec::is_write(&plan) {
+                    guarded(|| {
+                        crate::exec::enforce_read_only(store)
+                            .and_then(|()| crate::exec::execute(&plan, store))
+                            .map(|rows| crate::json::gql_rows_json(&rows))
+                    })
+                } else {
+                    guarded(|| crate::exec::try_run_gql_json(&plan, store))
+                }
             }
         }
         1 => {

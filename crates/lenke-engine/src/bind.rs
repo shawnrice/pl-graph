@@ -39,7 +39,8 @@ fn bind_plan(plan: &mut Plan, params: &HashMap<&str, &Value>) -> Result<(), Stri
         | Plan::RangeSeek { .. }
         | Plan::Insert { .. }
         | Plan::AddEdge { .. }
-        | Plan::CallProcedure { .. } => {}
+        | Plan::CallProcedure { .. }
+        | Plan::TxControl { .. } => {}
 
         // Single-input wrappers with no expression of their own.
         Plan::Sample { input, .. }

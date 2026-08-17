@@ -952,6 +952,19 @@ pub enum Plan {
         on_create: Vec<(String, Expr)>,
         on_update: MergeUpdate,
     },
+    /// An ISO GQL transaction-control command (`START TRANSACTION [READ ONLY|READ
+    /// WRITE]`, `COMMIT [WORK]`, `ROLLBACK [WORK]`). Not a query — it drives the
+    /// store's transaction frame and yields no rows. `read_only` is only meaningful
+    /// for `Start`.
+    TxControl { kind: TxKind, read_only: bool },
+}
+
+/// Which transaction-control command a [`Plan::TxControl`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxKind {
+    Start,
+    Commit,
+    Rollback,
 }
 
 /// The `_MERGE` update-path disposition when the node already exists.

@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{AggFn, CastTarget, CompareOp, Dir, Expr, PathMode, PathPart, Plan};
+use crate::ir::{AggFn, CastTarget, CompareOp, Dir, Expr, PathMode, PathPart, Plan, TxKind};
 use crate::value::Value;
 
 /// A parsed node pattern head: its optional variable, the SEED label (a single
@@ -315,6 +315,16 @@ fn parse_internal(query: &str, params: &[(String, Value)], prepared: bool) -> Re
         params: params.iter().cloned().collect(),
         prepared,
     };
+    // ISO transaction-control command (`START TRANSACTION`/`COMMIT`/`ROLLBACK`)? A
+    // linear query never begins with a bare START/COMMIT/ROLLBACK, so there is no
+    // ambiguity. It is a standalone statement — no UNION tail.
+    if p.peek_kw("START") || p.peek_kw("COMMIT") || p.peek_kw("ROLLBACK") {
+        let plan = p.parse_tx_control()?;
+        if p.pos != p.toks.len() {
+            return Err(format!("unexpected trailing input at token {}", p.pos));
+        }
+        return Ok(plan);
+    }
     let mut plan = p.query()?;
     // `<query> UNION [ALL] <query> …`: each arm is an independent query with a fresh
     // binding scope. Left-associative.
@@ -736,6 +746,48 @@ impl Parser {
             }
         }
         false
+    }
+
+    /// Parse an ISO GQL transaction-control command:
+    ///   `START TRANSACTION [READ ONLY | READ WRITE]` | `COMMIT [WORK]` | `ROLLBACK [WORK]`
+    /// Mirrors core's grammar — the access mode is optional (default READ WRITE), and
+    /// `WORK` is an optional ISO noise word on COMMIT/ROLLBACK. The single-program
+    /// combined form (`START TRANSACTION <stmts> … COMMIT` in one query) is NOT parsed,
+    /// matching core: issue the commands as separate statements.
+    fn parse_tx_control(&mut self) -> Result<Plan, String> {
+        if self.eat_kw("START") {
+            if !self.eat_kw("TRANSACTION") {
+                return Err("expected TRANSACTION after START".to_string());
+            }
+            // Optional `READ ONLY | READ WRITE` access mode.
+            let read_only = if self.eat_kw("READ") {
+                if self.eat_kw("ONLY") {
+                    true
+                } else if self.eat_kw("WRITE") {
+                    false
+                } else {
+                    return Err("expected ONLY or WRITE after READ".to_string());
+                }
+            } else {
+                false
+            };
+            return Ok(Plan::TxControl {
+                kind: TxKind::Start,
+                read_only,
+            });
+        }
+        let kind = if self.eat_kw("COMMIT") {
+            TxKind::Commit
+        } else if self.eat_kw("ROLLBACK") {
+            TxKind::Rollback
+        } else {
+            return Err("expected START TRANSACTION, COMMIT, or ROLLBACK".to_string());
+        };
+        self.eat_kw("WORK"); // optional ISO noise word
+        Ok(Plan::TxControl {
+            kind,
+            read_only: false,
+        })
     }
 
     fn ident(&mut self) -> Result<String, String> {

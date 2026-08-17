@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::batch::{Batch, Col, Lineage};
-use crate::ir::{Agg, AggFn, CombineOp, CompareOp, Dir, Expr, PathMode, Plan};
+use crate::ir::{Agg, AggFn, CombineOp, CompareOp, Dir, Expr, PathMode, Plan, TxKind};
 use crate::store::{Column, Store};
 use crate::value::{self, Value};
 
@@ -401,6 +401,61 @@ fn stmt_rollback(store: &mut Store, scope: StmtScope) {
         StmtScope::Implicit => store.rollback(),
         StmtScope::Nested(mark) => store.rollback_to(mark),
     }
+}
+
+/// Execute an ISO GQL transaction-control command against the store's transaction
+/// frame, returning an empty result (no rows/columns), like a write-only query. ISO
+/// semantics are enforced HERE (matching core's `run_tx_control`), every violation
+/// carrying the `E_INVALID_GRAPH_OP` wire code: `START TRANSACTION` while one is
+/// active → error (no nesting); `COMMIT` / `ROLLBACK` with no active transaction →
+/// error. The transaction persists across `lnk_query` calls (the store IS the
+/// session), so a `START` here stays open for later statements until a `COMMIT` /
+/// `ROLLBACK`. `READ ONLY` is recorded on the store (cleared on commit/rollback) for
+/// a later write to consult.
+pub(crate) fn run_tx_control(
+    store: &mut Store,
+    kind: TxKind,
+    read_only: bool,
+) -> Result<Rows, String> {
+    match kind {
+        TxKind::Start => {
+            if store.in_transaction() {
+                return Err(
+                    "E_INVALID_GRAPH_OP: START TRANSACTION: a transaction is already active".into(),
+                );
+            }
+            store.begin();
+            store.set_tx_read_only(read_only);
+        }
+        TxKind::Commit => {
+            if !store.in_transaction() {
+                return Err("E_INVALID_GRAPH_OP: COMMIT: no active transaction".into());
+            }
+            store.commit();
+            store.set_tx_read_only(false);
+        }
+        TxKind::Rollback => {
+            if !store.in_transaction() {
+                return Err("E_INVALID_GRAPH_OP: ROLLBACK: no active transaction".into());
+            }
+            store.rollback();
+            store.set_tx_read_only(false);
+        }
+    }
+    Ok(empty_rows())
+}
+
+/// Reject a write statement issued inside a `READ ONLY` transaction, before it
+/// applies. Called by the FFI write path (a read is always allowed). Matches core's
+/// `enforce_read_only`.
+pub(crate) fn enforce_read_only(store: &Store) -> Result<(), String> {
+    if store.tx_read_only() {
+        return Err(
+            "E_INVALID_GRAPH_OP: write statement rejected: the active transaction is READ ONLY"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// `Plan::Insert` and `Plan::InsertReturn`.
@@ -1320,7 +1375,8 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::InsertReturn { .. }
         | Plan::Merge { .. }
         | Plan::AddEdge { .. }
-        | Plan::CallProcedure { .. } => false,
+        | Plan::CallProcedure { .. }
+        | Plan::TxControl { .. } => false,
         Plan::Sample { input, .. }
         | Plan::Enumerate { input, .. }
         | Plan::EdgeVertex { input, .. }
@@ -1391,7 +1447,8 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         | Plan::InsertReturn { .. }
         | Plan::Update { .. }
         | Plan::Merge { .. }
-        | Plan::AddEdge { .. } => Batch::of(Vec::new()),
+        | Plan::AddEdge { .. }
+        | Plan::TxControl { .. } => Batch::of(Vec::new()),
         // `Row` is the leaf of an EXISTS body and is only ever fed a batch by
         // `pull_body`; reaching it through the main pipeline is a bug.
         Plan::Row => {
@@ -20560,6 +20617,231 @@ mod tests {
         )
         .is_ok());
         assert_eq!(count(&store, "c@x"), 1);
+    }
+
+    // ---- ISO transaction-control keywords (START TRANSACTION / COMMIT / ROLLBACK) ----
+
+    /// Run one GQL statement exactly as `lnk_query`'s GQL path does: route a
+    /// transaction-control command to `run_tx_control`, reject a write under a READ
+    /// ONLY transaction, else run the query. Reads go through `run`, writes through
+    /// `execute` — so these tests exercise the real integration, not the pieces.
+    fn stmt(store: &mut Store, q: &str) -> Result<Rows, String> {
+        let plan = crate::gql::parse(q)?;
+        if let Plan::TxControl { kind, read_only } = plan {
+            return run_tx_control(store, kind, read_only);
+        }
+        if is_write(&plan) {
+            enforce_read_only(store)?;
+            return execute(&plan, store);
+        }
+        Ok(run(&plan, store))
+    }
+
+    /// Parse `q` and extract the `(kind, read_only)` of the resulting `TxControl`
+    /// plan (panicking if it is not one). `Plan` has no `PartialEq`, so the parse
+    /// tests compare the extracted parts, not whole plans.
+    fn tx_parts(q: &str) -> (TxKind, bool) {
+        match crate::gql::parse(q).unwrap_or_else(|e| panic!("parse `{q}`: {e}")) {
+            Plan::TxControl { kind, read_only } => (kind, read_only),
+            other => panic!("expected TxControl for `{q}`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tx_keywords_parse_to_the_right_plan() {
+        assert_eq!(tx_parts("START TRANSACTION"), (TxKind::Start, false));
+        assert_eq!(
+            tx_parts("START TRANSACTION READ ONLY"),
+            (TxKind::Start, true)
+        );
+        // Case-insensitive; READ WRITE is the (default) read-write mode.
+        assert_eq!(
+            tx_parts("start transaction read write"),
+            (TxKind::Start, false)
+        );
+        assert_eq!(tx_parts("COMMIT"), (TxKind::Commit, false));
+        assert_eq!(tx_parts("COMMIT WORK"), (TxKind::Commit, false));
+        assert_eq!(tx_parts("ROLLBACK"), (TxKind::Rollback, false));
+        assert_eq!(tx_parts("ROLLBACK WORK"), (TxKind::Rollback, false));
+    }
+
+    #[test]
+    fn tx_keyword_parse_errors() {
+        // START without TRANSACTION, and a bad access mode, are syntax errors.
+        assert!(crate::gql::parse("START").is_err());
+        assert!(crate::gql::parse("START TRANSACTION READ").is_err());
+        assert!(crate::gql::parse("START TRANSACTION READ SOMETIMES").is_err());
+        // Trailing input after a complete command is rejected.
+        assert!(crate::gql::parse("COMMIT EXTRA").is_err());
+    }
+
+    #[test]
+    fn commit_keyword_persists_the_transactions_writes() {
+        let mut store = Builder::default().build();
+        assert!(!store.in_transaction());
+        stmt(&mut store, "START TRANSACTION").unwrap();
+        assert!(store.in_transaction());
+        stmt(&mut store, "INSERT (:Acct {bal: 100})").unwrap();
+        stmt(&mut store, "INSERT (:Acct {bal: 200})").unwrap();
+        stmt(&mut store, "COMMIT").unwrap();
+        assert!(!store.in_transaction(), "COMMIT closes the transaction");
+        assert_eq!(store.live_node_count(), 2, "both inserts persisted");
+    }
+
+    #[test]
+    fn rollback_keyword_discards_the_transactions_writes() {
+        let mut store = Builder::default().build();
+        stmt(&mut store, "INSERT (:Acct {bal: 1})").unwrap(); // committed implicitly (no tx)
+        stmt(&mut store, "START TRANSACTION").unwrap();
+        stmt(&mut store, "INSERT (:Acct {bal: 100})").unwrap();
+        stmt(&mut store, "INSERT (:Acct {bal: 200})").unwrap();
+        stmt(&mut store, "ROLLBACK").unwrap();
+        assert!(!store.in_transaction());
+        assert_eq!(
+            store.live_node_count(),
+            1,
+            "only the pre-transaction insert survives"
+        );
+    }
+
+    #[test]
+    fn transaction_state_persists_across_separate_statements() {
+        // The store IS the session: a START stays open across statement boundaries.
+        let mut store = Builder::default().build();
+        stmt(&mut store, "START TRANSACTION").unwrap();
+        stmt(&mut store, "INSERT (:Acct {bal: 1})").unwrap();
+        assert!(store.in_transaction(), "still open between statements");
+        stmt(&mut store, "INSERT (:Acct {bal: 2})").unwrap();
+        assert!(store.in_transaction());
+        stmt(&mut store, "COMMIT").unwrap();
+        assert_eq!(store.live_node_count(), 2);
+    }
+
+    #[test]
+    fn nested_start_transaction_is_a_coded_error() {
+        let mut store = Builder::default().build();
+        stmt(&mut store, "START TRANSACTION").unwrap();
+        let err = stmt(&mut store, "START TRANSACTION").unwrap_err();
+        assert!(
+            err.starts_with("E_INVALID_GRAPH_OP:"),
+            "nested START is E_INVALID_GRAPH_OP, got: {err}"
+        );
+        assert!(store.in_transaction(), "the original tx is untouched");
+        stmt(&mut store, "ROLLBACK").unwrap(); // clean up
+    }
+
+    #[test]
+    fn commit_or_rollback_with_no_active_transaction_is_a_coded_error() {
+        let mut store = Builder::default().build();
+        let c = stmt(&mut store, "COMMIT").unwrap_err();
+        assert!(c.starts_with("E_INVALID_GRAPH_OP:"), "COMMIT no-tx: {c}");
+        let r = stmt(&mut store, "ROLLBACK").unwrap_err();
+        assert!(r.starts_with("E_INVALID_GRAPH_OP:"), "ROLLBACK no-tx: {r}");
+    }
+
+    #[test]
+    fn read_only_transaction_rejects_writes_but_allows_reads() {
+        let mut store = Builder::default().build();
+        stmt(&mut store, "INSERT (:Acct {bal: 1})").unwrap(); // seed (no tx)
+        stmt(&mut store, "START TRANSACTION READ ONLY").unwrap();
+        assert!(store.tx_read_only());
+        // A read is allowed.
+        assert!(stmt(&mut store, "MATCH (n:Acct) RETURN n.bal").is_ok());
+        // Every write kind is rejected with the coded error, and nothing changes.
+        for w in [
+            "INSERT (:Acct {bal: 9})",
+            "MATCH (n:Acct) SET n.bal = 5",
+            "MATCH (n:Acct) REMOVE n.bal",
+            "MATCH (n:Acct) DELETE n",
+        ] {
+            let e = stmt(&mut store, w).unwrap_err();
+            assert!(e.starts_with("E_INVALID_GRAPH_OP:"), "{w} → {e}");
+        }
+        assert_eq!(
+            store.live_node_count(),
+            1,
+            "read-only left the graph intact"
+        );
+        stmt(&mut store, "COMMIT").unwrap();
+        assert!(!store.tx_read_only(), "COMMIT clears the read-only mode");
+        // After commit the mode is cleared — a write applies.
+        stmt(&mut store, "INSERT (:Acct {bal: 9})").unwrap();
+        assert_eq!(store.live_node_count(), 2);
+    }
+
+    #[test]
+    fn rollback_clears_the_read_only_mode() {
+        let mut store = Builder::default().build();
+        stmt(&mut store, "START TRANSACTION READ ONLY").unwrap();
+        assert!(store.tx_read_only());
+        stmt(&mut store, "ROLLBACK").unwrap();
+        assert!(!store.tx_read_only(), "ROLLBACK clears read-only");
+        stmt(&mut store, "INSERT (:Acct {bal: 1})").unwrap(); // now allowed
+        assert_eq!(store.live_node_count(), 1);
+    }
+
+    #[test]
+    fn per_statement_savepoint_isolates_a_failed_write_inside_a_transaction() {
+        // A unique constraint makes the middle write fault; the app swallows it and
+        // continues. Only that statement rolls back (to its savepoint) — the writes
+        // around it commit with the transaction.
+        let mut b = Builder::default();
+        b.node(&["User"], &[("email", s("taken@x"))]);
+        let mut store = b.build();
+        store.create_unique_constraint("User", &["email"]).unwrap();
+
+        stmt(&mut store, "START TRANSACTION").unwrap();
+        stmt(&mut store, "INSERT (:User {email: 'a@x'})").unwrap();
+        // Collides with the seeded 'taken@x' → faults; the caller ignores it.
+        let _ = stmt(&mut store, "INSERT (:User {email: 'taken@x'})");
+        stmt(&mut store, "INSERT (:User {email: 'b@x'})").unwrap();
+        stmt(&mut store, "COMMIT").unwrap();
+
+        let count = |store: &Store, v: &str| {
+            store
+                .nodes_with_label("User")
+                .iter()
+                .filter(|&&nd| matches!(store.prop(nd, "email"), Value::Str(e) if &*e == v))
+                .count()
+        };
+        assert_eq!(
+            count(&store, "a@x"),
+            1,
+            "the write before the fault committed"
+        );
+        assert_eq!(
+            count(&store, "b@x"),
+            1,
+            "the write after the fault committed"
+        );
+        assert_eq!(
+            count(&store, "taken@x"),
+            1,
+            "the faulted write left no duplicate"
+        );
+    }
+
+    #[test]
+    fn a_required_violation_in_a_transaction_never_persists() {
+        // A required constraint on Acct.email. A row that never fills it must NOT
+        // persist — whether the engine rejects it at the statement (its per-statement
+        // constraint check) or would defer to COMMIT, the invalid row leaves no trace
+        // and the transaction ends cleanly. (Engine checks per-statement; core defers
+        // to commit — a separate constraint-deferral divergence — but both are safe.)
+        let mut store = Builder::default().build();
+        store.create_required_constraint("Acct", "email").unwrap();
+        stmt(&mut store, "START TRANSACTION").unwrap();
+        let insert = stmt(&mut store, "INSERT (:Acct {bal: 1})"); // no email
+        let commit = stmt(&mut store, "COMMIT");
+        assert!(
+            insert.is_err() || commit.is_err(),
+            "a required violation must surface (at the statement or at commit)"
+        );
+        assert_eq!(store.live_node_count(), 0, "the invalid row left no trace");
+        assert!(
+            !store.in_transaction(),
+            "the transaction is closed either way"
+        );
     }
 
     /// `REMOVE` of a required-constraint key is rejected and rolled back.
