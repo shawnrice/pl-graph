@@ -261,6 +261,7 @@ pub fn bfs_distances(
 pub fn pagerank(
     store: &Store,
     edge_label: Option<&str>,
+    weight_property: Option<&str>,
     damping: f64,
     iterations: u32,
 ) -> Vec<(u32, f64)> {
@@ -269,44 +270,108 @@ pub fn pagerank(
     if live.is_empty() {
         return Vec::new();
     }
-    let Some(want) = want_etype(store, edge_label) else {
-        return live.into_iter().map(|v| (v, 1.0 / nf)).collect();
+    // Resolve the wanted edge type. None edge_label = any type; a KNOWN name = that
+    // type; a named-but-UNKNOWN type matches NO edge (every node dangles). The unknown
+    // case is NOT short-circuited to `1/N` — the full iteration must run so the uniform
+    // result is produced by core's exact base formula `(1-d)/N + d·dangling/N`, which
+    // differs from a bare `1.0/N` in the last ULP.
+    let (want, unknown_type): (Option<u32>, bool) = match edge_label {
+        None => (None, false),
+        Some(name) => match store.etype_id(name) {
+            Some(t) => (Some(t), false),
+            None => (None, true),
+        },
     };
     let slots = store.node_count();
 
-    // Out-degree per node (of the wanted type); a 0 marks a dangling node.
-    let mut outdeg = vec![0u32; slots];
-    for &u in &live {
-        let mut c = 0u32;
-        for_each_nbr(store, u, Dir::Out, want, |_| c += 1);
-        outdeg[u as usize] = c;
+    // Mirror core's `build_pull_graph`: resolve each edge's weight, then accumulate
+    // out-strength (weighted out-degree) and an incoming CSR of per-edge factors
+    // (weight / out_strength[src]) — ALL in edge-id order so every f64 sum is pinned
+    // byte-identically to core. Unweighted stays identical: weight 1.0 → out_strength ==
+    // out-degree and factor == 1/out-degree, the same values (and order) core produces.
+    let edges = store.all_edges(); // live eids, ascending = edge-insertion order
+    let type_ok = |eid: u32| {
+        if unknown_type {
+            return false; // named-but-unknown type matches nothing
+        }
+        match want {
+            None => true,
+            Some(t) => store.edge_carries_type(eid, t),
+        }
+    };
+    // Unweighted = weight 1.0; else the numeric `weightProperty` (non-numeric/absent →
+    // 0.0, matching core's `edge_weights`). A source whose total out-weight is 0 dangles.
+    let weight_of = |eid: u32| -> f64 {
+        match weight_property {
+            None => 1.0,
+            Some(k) => match store.edge_prop(eid, k) {
+                Value::Num(x) => x,
+                _ => 0.0,
+            },
+        }
+    };
+
+    // Pass 1: out-strength per source, accumulated in edge-id order.
+    let mut out_strength = vec![0.0f64; slots];
+    for &eid in &edges {
+        if type_ok(eid) {
+            if let Some((src, _)) = store.edge_endpoints(eid) {
+                out_strength[src as usize] += weight_of(eid);
+            }
+        }
+    }
+    // Pass 2: incoming CSR offsets, by destination.
+    let mut inc_off = vec![0usize; slots + 1];
+    for &eid in &edges {
+        if type_ok(eid) {
+            if let Some((_, dst)) = store.edge_endpoints(eid) {
+                inc_off[dst as usize + 1] += 1;
+            }
+        }
+    }
+    for v in 0..slots {
+        inc_off[v + 1] += inc_off[v];
+    }
+    // Pass 3: fill (src, factor) per incoming edge in edge-id order. A dangling source
+    // (out_strength 0) emits a 0 factor — no divide-by-zero; its mass rides the dangling
+    // redistribution — while still occupying its CSR slot so the sum order is unchanged.
+    let mut inc_src = vec![0u32; inc_off[slots]];
+    let mut inc_fac = vec![0.0f64; inc_off[slots]];
+    let mut cursor = inc_off[..slots].to_vec();
+    for &eid in &edges {
+        if !type_ok(eid) {
+            continue;
+        }
+        let Some((src, dst)) = store.edge_endpoints(eid) else {
+            continue;
+        };
+        let os = out_strength[src as usize];
+        let factor = if os == 0.0 { 0.0 } else { weight_of(eid) / os };
+        let pos = cursor[dst as usize];
+        cursor[dst as usize] += 1;
+        inc_src[pos] = src;
+        inc_fac[pos] = factor;
     }
 
     let mut pr = vec![0.0f64; slots];
     for &v in &live {
         pr[v as usize] = 1.0 / nf;
     }
-
-    // In-CSR built once: PageRank pulls over incoming edges every iteration, so the
-    // contiguous sweep amortizes across all of them. Neighbour order equals
-    // `for_each_nbr(Dir::In)` order, keeping the pinned summation order.
-    let in_csr = Csr::build(store, Dir::In, want, slots);
     for _ in 0..iterations {
         // Dangling mass, summed in node-id order (serial — the f64 order is pinned).
         let mut dangling = 0.0;
         for &u in &live {
-            if outdeg[u as usize] == 0 {
+            if out_strength[u as usize] == 0.0 {
                 dangling += pr[u as usize];
             }
         }
         let base = (1.0 - damping) / nf + damping * dangling / nf;
         let mut next = vec![0.0f64; slots];
         for &v in &live {
-            // Pull over incoming edges u→v (in `in_adj` order): each source u has
-            // this out-edge, so its out-degree is ≥ 1 (no divide-by-zero).
+            // Pull over incoming edges in CSR (edge-id) order.
             let mut sum = 0.0;
-            for &u in in_csr.nbrs(v) {
-                sum += pr[u as usize] / f64::from(outdeg[u as usize]);
+            for j in inc_off[v as usize]..inc_off[v as usize + 1] {
+                sum += pr[inc_src[j] as usize] * inc_fac[j];
             }
             next[v as usize] = base + damping * sum;
         }
@@ -455,13 +520,18 @@ pub fn label_propagation(
                     }
                     count[lbl as usize] += 1;
                 }
-                // Most-frequent label; tie → smallest label id. No neighbours → keep.
+                // Most-frequent label; tie → lexicographically smallest EXTERNAL id
+                // (matching core's `vid.text(lbl) < vid.text(bl)`), NOT the internal
+                // dense id — the two orders disagree when nodes were not inserted in
+                // ext-id order, which is exactly when LP diverged. No neighbours → keep.
                 let mut best: Option<(u32, u32)> = None; // (label, count)
                 for &lbl in &touched {
                     let c = count[lbl as usize];
                     let better = match best {
                         None => true,
-                        Some((bl, bc)) => c > bc || (c == bc && lbl < bl),
+                        Some((bl, bc)) => {
+                            c > bc || (c == bc && store.node_ext_id(lbl) < store.node_ext_id(bl))
+                        }
                     };
                     if better {
                         best = Some((lbl, c));
@@ -1483,7 +1553,7 @@ pub fn run_procedure(
         "pagerank" => {
             let d = num_of("dampingFactor").unwrap_or(DEFAULT_DAMPING);
             let iters = num_of("iterations").map_or(DEFAULT_PAGERANK_ITERATIONS, |n| n as u32);
-            pagerank(store, edge_filter(), d, iters)
+            pagerank(store, edge_filter(), str_of("weightProperty"), d, iters)
         }
         "closeness" => closeness(store, edge_filter(), str_of("weightProperty")),
         "strongly_connected_components" => strongly_connected_components(store, edge_filter())
@@ -2161,7 +2231,13 @@ mod tests {
         b.edge(a, bb, "R");
         b.edge(bb, a, "R");
         let st = b.build();
-        let pr = pagerank(&st, None, DEFAULT_DAMPING, DEFAULT_PAGERANK_ITERATIONS);
+        let pr = pagerank(
+            &st,
+            None,
+            None,
+            DEFAULT_DAMPING,
+            DEFAULT_PAGERANK_ITERATIONS,
+        );
         assert!((pr[0].1 - 0.5).abs() < 1e-12);
         assert!((pr[1].1 - 0.5).abs() < 1e-12);
         let total: f64 = pr.iter().map(|(_, r)| r).sum();
@@ -2180,7 +2256,13 @@ mod tests {
         b.edge(n1, n2, "R");
         b.edge(n0, n1, "R");
         let st = b.build();
-        let pr = pagerank(&st, None, DEFAULT_DAMPING, DEFAULT_PAGERANK_ITERATIONS);
+        let pr = pagerank(
+            &st,
+            None,
+            None,
+            DEFAULT_DAMPING,
+            DEFAULT_PAGERANK_ITERATIONS,
+        );
         assert!(pr[2].1 > pr[1].1, "hub should outrank {pr:?}");
         assert!(
             pr[1].1 > pr[0].1,
@@ -2191,7 +2273,13 @@ mod tests {
         // Deterministic: the same input gives a bit-identical result.
         assert_eq!(
             pr,
-            pagerank(&st, None, DEFAULT_DAMPING, DEFAULT_PAGERANK_ITERATIONS)
+            pagerank(
+                &st,
+                None,
+                None,
+                DEFAULT_DAMPING,
+                DEFAULT_PAGERANK_ITERATIONS
+            )
         );
     }
 }

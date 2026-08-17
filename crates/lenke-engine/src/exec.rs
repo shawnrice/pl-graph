@@ -1873,7 +1873,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 GremlinAlgo::PageRank {
                     damping,
                     iterations,
-                } => crate::algo::pagerank(store, el, *damping, *iterations)
+                } => crate::algo::pagerank(store, el, None, *damping, *iterations)
                     .into_iter()
                     .map(|(v, s)| (v, Value::Num(s)))
                     .collect(),

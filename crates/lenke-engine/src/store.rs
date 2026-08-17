@@ -1611,6 +1611,17 @@ impl Store {
         self.etype_name(etype)
     }
 
+    /// Whether edge `eid` carries type id `t` — its primary type OR (on a multi-label
+    /// edge) one of its secondary types. The id-keyed, allocation-free counterpart of
+    /// `edge_labels_of(...).contains(name)`, for hot edge sweeps (e.g. weighted PageRank).
+    #[must_use]
+    pub fn edge_carries_type(&self, eid: u32, t: u32) -> bool {
+        if self.edge_etype.get(eid as usize) == Some(&t) {
+            return true;
+        }
+        self.edge_extra.get(&eid).is_some_and(|ex| ex.contains(&t))
+    }
+
     /// All of edge `eid`'s labels — its type (first) then any secondary labels
     /// (multi-label edges), in that order.
     #[must_use]
