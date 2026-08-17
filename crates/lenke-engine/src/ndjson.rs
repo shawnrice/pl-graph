@@ -1,12 +1,18 @@
-//! NDJSON egress: dump a store as newline-delimited JSON — one object per live
-//! node, then one per edge. Dependency-free (a small hand-rolled JSON writer, no
-//! serde) and deterministic (nodes by id; labels and property keys sorted; edges
-//! in adjacency order).
+//! NDJSON egress/ingest: dump/load a store as newline-delimited JSON — one object
+//! per live node, then one per edge. Dependency-free (a small hand-rolled JSON
+//! writer, no serde) and deterministic (nodes by id; labels and property keys
+//! sorted; edges in adjacency order).
 //!
-//! Line shapes (ids are PRESERVED external ids — strings; a numeric id on ingest
-//! is accepted and kept as its text):
-//! - node: `{"id":"N","labels":[...],"props":{...}}`
-//! - edge: `{"id":"E","from":"F","to":"T","type":"R","props":{...}}`
+//! Emits the SHIPPED shape (byte-shape-compatible with lenke-core /
+//! `@lenke/serialization`) so NDJSON is interchangeable across the engines (ids
+//! are PRESERVED external ids — strings; a numeric id on ingest is kept as text):
+//! - node: `{"type":"node","id":"N","labels":[...],"properties":{...}}`
+//! - edge: `{"type":"edge","id":"E","from":"F","to":"T","labels":["R",...],"properties":{...}}`
+//!
+//! Ingest is lenient: it ALSO reads the engine's earlier shape (node `{"id",…,
+//! "props"}`, edge `{"from","to","type":"<etype>","props"}`), so anything the
+//! engine wrote before still loads. Property key ORDER is unspecified (each engine
+//! emits its own), so cross-engine comparison is structural, not byte-identical.
 //!
 //! This module SERIALIZES values; it does not define value semantics (order,
 //! equality) — those stay in [`crate::value`]. A non-finite number (NaN/Inf) has
@@ -30,13 +36,13 @@ pub fn to_ndjson(store: &Store) -> String {
         if !store.is_alive(id) {
             continue;
         }
-        // Emit the PRESERVED external id (a string), so a dump→load round-trip
-        // keeps element identity stable.
-        out.push_str("{\"id\":");
+        // The SHIPPED shape (lenke-core / @lenke/serialization): a `type`
+        // discriminator, `properties` (not `props`), and the PRESERVED external id.
+        out.push_str("{\"type\":\"node\",\"id\":");
         encode_string(&mut out, &store.node_ext_id(id).unwrap_or_default());
         out.push_str(",\"labels\":");
         encode_str_array(&mut out, &store.labels_of(id));
-        out.push_str(",\"props\":");
+        out.push_str(",\"properties\":");
         encode_object(&mut out, &node_keys, |k| {
             store.has_prop(id, k).then(|| store.prop(id, k))
         });
@@ -48,17 +54,18 @@ pub fn to_ndjson(store: &Store) -> String {
             continue;
         }
         for a in store.out(from) {
-            // Preserved external ids for the edge and its endpoints.
-            out.push_str("{\"id\":");
-            encode_string(&mut out, &store.edge_ext_id(a.eid).unwrap_or_default());
+            let eid = a.eid;
+            // An edge carries a type SET in `labels` (first = primary type), like
+            // core — not a single `type` string.
+            out.push_str("{\"type\":\"edge\",\"id\":");
+            encode_string(&mut out, &store.edge_ext_id(eid).unwrap_or_default());
             out.push_str(",\"from\":");
             encode_string(&mut out, &store.node_ext_id(from).unwrap_or_default());
             out.push_str(",\"to\":");
             encode_string(&mut out, &store.node_ext_id(a.nbr).unwrap_or_default());
-            out.push_str(",\"type\":");
-            encode_string(&mut out, &store.etype_name(a.etype).unwrap_or_default());
-            out.push_str(",\"props\":");
-            let eid = a.eid;
+            out.push_str(",\"labels\":");
+            encode_str_array(&mut out, &store.edge_labels_of(eid));
+            out.push_str(",\"properties\":");
             encode_object(&mut out, &edge_keys, |k| {
                 store.has_edge_prop(eid, k).then(|| store.edge_prop(eid, k))
             });
@@ -282,31 +289,44 @@ fn stage_ndjson(text: &str) -> Result<StagedNdjson, String> {
                 }
                 _ => return Err(err("unknown schema kind".into())),
             }
-        } else if field(&fields, "from").is_some() {
-            let from = json_id(req(&fields, "from").map_err(err)?).map_err(err)?;
-            let to = json_id(req(&fields, "to").map_err(err)?).map_err(err)?;
-            let edge_id = field(&fields, "id").map(json_id).transpose().map_err(err)?;
-            // An edge's type is its FIRST label; the rest are secondary labels
-            // (multi-label edges). Accept either the single-label `"type"` form or a
-            // `"labels":[…]` array (at least one entry required).
-            let labels: Vec<String> = if let Some(l) = field(&fields, "labels") {
-                let arr = json_str_array(l).map_err(err)?;
-                if arr.is_empty() {
+        } else {
+            // A data line. Two shapes are accepted so the engine is a drop-in for
+            // core's NDJSON AND keeps reading anything it wrote earlier:
+            //   core / shipped:  {"type":"node|edge", …, "labels":[…], "properties":{…}}
+            //   engine (legacy): node {"id",…,"props"}; edge {"from","to","type":"<etype>","props"}
+            // Edges are told by a `from` field (both shapes have it). Properties come
+            // from `properties` OR `props` (default empty); an edge's type SET is its
+            // `labels` array, or — legacy — a single `type` string (not "edge").
+            let props_of =
+                |f: &[(String, Json)]| match field(f, "properties").or_else(|| field(f, "props")) {
+                    Some(p) => json_props(p),
+                    None => Ok(Vec::new()),
+                };
+            if field(&fields, "from").is_some() {
+                let from = json_id(req(&fields, "from").map_err(err)?).map_err(err)?;
+                let to = json_id(req(&fields, "to").map_err(err)?).map_err(err)?;
+                let edge_id = field(&fields, "id").map(json_id).transpose().map_err(err)?;
+                let ty = field(&fields, "type")
+                    .map(json_string)
+                    .transpose()
+                    .map_err(err)?;
+                let labels: Vec<String> = match field(&fields, "labels") {
+                    Some(l) => json_str_array(l).map_err(err)?,
+                    // Legacy single-type edge: `type` is the edge type (never "edge").
+                    None => match ty.filter(|t| t != "edge") {
+                        Some(t) => vec![t],
+                        None => return Err(err("edge needs `labels` (or a legacy `type`)".into())),
+                    },
+                };
+                if labels.is_empty() {
                     return Err(err("edge `labels` must have at least one entry".into()));
                 }
-                arr
+                edges.push((from, to, edge_id, labels, props_of(&fields).map_err(err)?));
             } else {
-                vec![json_string(req(&fields, "type").map_err(err)?).map_err(err)?]
-            };
-            let props = json_props(req(&fields, "props").map_err(err)?).map_err(err)?;
-            edges.push((from, to, edge_id, labels, props));
-        } else if let Some(id) = field(&fields, "id") {
-            let ext = json_id(id).map_err(err)?;
-            let labels = json_str_array(req(&fields, "labels").map_err(err)?).map_err(err)?;
-            let props = json_props(req(&fields, "props").map_err(err)?).map_err(err)?;
-            nodes.push((ext, labels, props));
-        } else {
-            return Err(err("object has no `schema`, `id`, or `from`".into()));
+                let ext = json_id(req(&fields, "id").map_err(err)?).map_err(err)?;
+                let labels = json_str_array(req(&fields, "labels").map_err(err)?).map_err(err)?;
+                nodes.push((ext, labels, props_of(&fields).map_err(err)?));
+            }
         }
     }
     Ok(StagedNdjson {
@@ -904,9 +924,9 @@ mod tests {
         let b = st.add_node(&["P"], &[("name", s("b"))]);
         let eid = st.add_edge(a, b, "R");
         st.set_edge_prop(eid, "weight", n(0.5));
-        let expected = "{\"id\":\"0\",\"labels\":[\"P\"],\"props\":{\"age\":1,\"name\":\"a\"}}\n\
-             {\"id\":\"1\",\"labels\":[\"P\"],\"props\":{\"name\":\"b\"}}\n\
-             {\"id\":\"e0\",\"from\":\"0\",\"to\":\"1\",\"type\":\"R\",\"props\":{\"weight\":0.5}}\n";
+        let expected = "{\"type\":\"node\",\"id\":\"0\",\"labels\":[\"P\"],\"properties\":{\"age\":1,\"name\":\"a\"}}\n\
+             {\"type\":\"node\",\"id\":\"1\",\"labels\":[\"P\"],\"properties\":{\"name\":\"b\"}}\n\
+             {\"type\":\"edge\",\"id\":\"e0\",\"from\":\"0\",\"to\":\"1\",\"labels\":[\"R\"],\"properties\":{\"weight\":0.5}}\n";
         assert_eq!(to_ndjson(&st), expected);
     }
 
@@ -973,7 +993,8 @@ mod tests {
         let b = st.add_node(&["P"], &[("name", s("b"))]);
         st.add_edge(a, b, "R");
         st.delete_node(b);
-        let expected = "{\"id\":\"0\",\"labels\":[\"P\"],\"props\":{\"name\":\"a\"}}\n";
+        let expected =
+            "{\"type\":\"node\",\"id\":\"0\",\"labels\":[\"P\"],\"properties\":{\"name\":\"a\"}}\n";
         assert_eq!(to_ndjson(&st), expected);
     }
 
@@ -993,7 +1014,7 @@ mod tests {
         );
         let out = to_ndjson(&st);
         // keys sorted: ok, q, xs, z
-        let expected = "{\"id\":\"0\",\"labels\":[],\"props\":\
+        let expected = "{\"type\":\"node\",\"id\":\"0\",\"labels\":[],\"properties\":\
              {\"ok\":true,\"q\":\"a\\\"b\\nc\",\"xs\":[1,\"y\"],\"z\":null}}\n";
         assert_eq!(out, expected);
     }
@@ -1005,7 +1026,7 @@ mod tests {
         st.add_node(&[], &[("v", n(f64::NAN))]);
         assert_eq!(
             to_ndjson(&st),
-            "{\"id\":\"0\",\"labels\":[],\"props\":{\"v\":null}}\n"
+            "{\"type\":\"node\",\"id\":\"0\",\"labels\":[],\"properties\":{\"v\":null}}\n"
         );
     }
 
@@ -1116,7 +1137,7 @@ mod tests {
         st.create_unique_constraint("P", &["k"]).unwrap();
         st.add_node(&["P"], &[("k", n(1.0))]);
         let expected = "{\"schema\":\"unique\",\"label\":\"P\",\"keys\":[\"k\"]}\n\
-             {\"id\":\"0\",\"labels\":[\"P\"],\"props\":{\"k\":1}}\n";
+             {\"type\":\"node\",\"id\":\"0\",\"labels\":[\"P\"],\"properties\":{\"k\":1}}\n";
         assert_eq!(super::snapshot(&st), expected);
     }
 
