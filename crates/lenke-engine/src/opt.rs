@@ -307,6 +307,21 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             let (i, c) = rewrite(*input, idx);
             (Plan::GroupToMap { input: Box::new(i) }, c)
         }
+        Plan::InsertFrom {
+            input,
+            nodes,
+            edges,
+        } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::InsertFrom {
+                    input: Box::new(i),
+                    nodes,
+                    edges,
+                },
+                c,
+            )
+        }
         Plan::Tree {
             input,
             by,
@@ -1617,6 +1632,7 @@ fn width(plan: &Plan) -> usize {
         // Writes carry no output row. `InsertReturn` is a write too — its RETURN
         // rows are produced by the executor, not by this read-side width pass.
         Plan::Insert { .. }
+        | Plan::InsertFrom { .. }
         | Plan::InsertReturn { .. }
         | Plan::Update { .. }
         | Plan::Merge { .. }
@@ -2134,6 +2150,7 @@ mod tests {
             | Plan::IndexSeek { .. }
             | Plan::RangeSeek { .. }
             | Plan::Insert { .. }
+            | Plan::InsertFrom { .. }
             | Plan::Merge { .. }
             | Plan::AddEdge { .. }
             | Plan::CallProcedure { .. }

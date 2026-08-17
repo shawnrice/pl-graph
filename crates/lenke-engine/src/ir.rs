@@ -957,6 +957,16 @@ pub enum Plan {
     /// store's transaction frame and yields no rows. `read_only` is only meaningful
     /// for `Start`.
     TxControl { kind: TxKind, read_only: bool },
+    /// A row-driven INSERT: `FOR x IN <list> INSERT (…)` (and `MATCH … INSERT`) — the
+    /// `input` produces rows, and for EACH row the node/edge templates are created
+    /// with their property expressions evaluated against that row. The whole
+    /// statement is one atomic unit (all rows commit, or a constraint violation rolls
+    /// them all back). Distinct from `Insert`, whose properties are constant literals.
+    InsertFrom {
+        input: Box<Plan>,
+        nodes: Vec<InsertNodeExpr>,
+        edges: Vec<InsertEdgeExpr>,
+    },
 }
 
 /// Which transaction-control command a [`Plan::TxControl`] carries.
@@ -1023,6 +1033,25 @@ pub struct InsertEdge {
     pub to: usize,
     pub etype: String,
     pub props: Vec<(String, Value)>,
+}
+
+/// A node to create in an `InsertFrom` (a `FOR … INSERT` / `MATCH … INSERT`): its
+/// labels and property EXPRESSIONS, evaluated against each input row (so a property
+/// may reference a bound variable, e.g. `FOR x IN […] INSERT (:N {v: x})`).
+#[derive(Clone, Debug)]
+pub struct InsertNodeExpr {
+    pub labels: Vec<String>,
+    pub props: Vec<(String, Expr)>,
+}
+
+/// An edge to create in an `InsertFrom`, per input row: a typed relationship from
+/// the row's `nodes[from]` to `nodes[to]`, with property expressions.
+#[derive(Clone, Debug)]
+pub struct InsertEdgeExpr {
+    pub from: usize,
+    pub to: usize,
+    pub etype: String,
+    pub props: Vec<(String, Expr)>,
 }
 
 impl Plan {

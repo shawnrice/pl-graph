@@ -497,6 +497,72 @@ fn run_insert(
     Ok(ids)
 }
 
+/// `Plan::InsertFrom` — a row-driven INSERT (`FOR … INSERT`, `MATCH … INSERT`).
+/// Evaluate the templates' property expressions over the input rows (read phase,
+/// immutable borrow), then create each row's nodes/edges (write phase). The whole
+/// statement is ONE atomic scope — a constraint violation on any row rolls back
+/// EVERY row (so `FOR x IN [1,2] INSERT (:U {id:'dup'})` under a unique constraint
+/// leaves zero rows), matching `run_insert`'s per-statement atomicity.
+fn run_insert_from(
+    store: &mut Store,
+    input: &Plan,
+    nodes: &[crate::ir::InsertNodeExpr],
+    edges: &[crate::ir::InsertEdgeExpr],
+) -> Result<(), String> {
+    // Read phase: pull the rows and materialize every template property to an OWNED
+    // per-row value vector, so the immutable borrow ends before the write phase.
+    let (node_props, edge_props, nrows) = {
+        let batch = pull(input, store, needs_lineage(input))?;
+        let nrows = batch.rows();
+        let eval_props = |props: &[(String, Expr)]| -> Result<Vec<(String, Vec<Value>)>, String> {
+            props
+                .iter()
+                .map(|(k, e)| {
+                    let col = eval(e, store, &batch)?;
+                    Ok((k.clone(), (0..nrows).map(|i| col.value_at(i)).collect()))
+                })
+                .collect()
+        };
+        let node_props: Vec<_> = nodes
+            .iter()
+            .map(|n| eval_props(&n.props))
+            .collect::<Result<_, _>>()?;
+        let edge_props: Vec<_> = edges
+            .iter()
+            .map(|e| eval_props(&e.props))
+            .collect::<Result<_, _>>()?;
+        (node_props, edge_props, nrows)
+    };
+    // Write phase: create every row's nodes/edges under one per-statement scope.
+    let scope = stmt_begin(store);
+    for i in 0..nrows {
+        let mut row_ids = Vec::with_capacity(nodes.len());
+        for (t, n) in nodes.iter().enumerate() {
+            let labels: Vec<&str> = n.labels.iter().map(String::as_str).collect();
+            let props: Vec<(&str, Value)> = node_props[t]
+                .iter()
+                .map(|(k, vals)| (k.as_str(), vals[i].clone()))
+                .collect();
+            row_ids.push(store.add_node(&labels, &props));
+        }
+        for (t, e) in edges.iter().enumerate() {
+            let eid = store.add_edge(row_ids[e.from], row_ids[e.to], &e.etype);
+            for (k, vals) in &edge_props[t] {
+                store.set_edge_prop(eid, k, vals[i].clone());
+            }
+        }
+    }
+    if let Err(err) = store
+        .run_deferred_checks()
+        .and_then(|()| enforce_expr_constraints(store))
+    {
+        stmt_rollback(store, scope);
+        return Err(err);
+    }
+    stmt_commit(store, scope);
+    Ok(())
+}
+
 /// Whether `plan`'s root is a write (INSERT / SET / REMOVE / DELETE / _MERGE /
 /// addE). A write must run through [`execute`] (mutable store); a read goes through
 /// the immutable [`try_run`] path. The C ABI's `lnk_query` routes on this.
@@ -506,6 +572,7 @@ pub(crate) fn is_write(plan: &Plan) -> bool {
     matches!(
         plan,
         Plan::Insert { .. }
+            | Plan::InsertFrom { .. }
             | Plan::InsertReturn { .. }
             | Plan::Update { .. }
             | Plan::Merge { .. }
@@ -517,6 +584,14 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
     match plan {
         Plan::Insert { nodes, edges } => {
             run_insert(store, nodes, edges)?;
+            Ok(empty_rows())
+        }
+        Plan::InsertFrom {
+            input,
+            nodes,
+            edges,
+        } => {
+            run_insert_from(store, input, nodes, edges)?;
             Ok(empty_rows())
         }
         Plan::InsertReturn { nodes, edges, tail } => {
@@ -1376,7 +1451,8 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::Merge { .. }
         | Plan::AddEdge { .. }
         | Plan::CallProcedure { .. }
-        | Plan::TxControl { .. } => false,
+        | Plan::TxControl { .. }
+        | Plan::InsertFrom { .. } => false,
         Plan::Sample { input, .. }
         | Plan::Enumerate { input, .. }
         | Plan::EdgeVertex { input, .. }
@@ -1444,6 +1520,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         // is run through `execute`. Yield an empty batch if it somehow reaches
         // here so `run` on a bare write is a harmless no-op rather than a panic.
         Plan::Insert { .. }
+        | Plan::InsertFrom { .. }
         | Plan::InsertReturn { .. }
         | Plan::Update { .. }
         | Plan::Merge { .. }
@@ -20842,6 +20919,160 @@ mod tests {
             !store.in_transaction(),
             "the transaction is closed either way"
         );
+    }
+
+    // ---- row-driven INSERT (`FOR … IN <list> INSERT (…)`) --------------------
+
+    /// Count live nodes carrying label `l`.
+    fn label_count(store: &Store, l: &str) -> usize {
+        store.nodes_with_label(l).len()
+    }
+
+    #[test]
+    fn for_insert_parses_to_insert_from() {
+        match crate::gql::parse("FOR x IN [1, 2] INSERT (:N {v: x})").unwrap() {
+            Plan::InsertFrom { nodes, edges, .. } => {
+                assert_eq!(nodes.len(), 1);
+                assert_eq!(nodes[0].labels, vec!["N".to_string()]);
+                assert_eq!(nodes[0].props.len(), 1);
+                assert_eq!(nodes[0].props[0].0, "v");
+                assert!(edges.is_empty());
+            }
+            other => panic!("expected InsertFrom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn for_insert_creates_one_node_per_element_with_the_bound_variable() {
+        let mut store = Builder::default().build();
+        stmt(&mut store, "FOR x IN [1, 2, 3] INSERT (:Acct {bal: x})").unwrap();
+        assert_eq!(label_count(&store, "Acct"), 3);
+        // Read the values back — one per unwound element.
+        let rows = run(
+            &crate::gql::parse("MATCH (n:Acct) RETURN n.bal AS bal").unwrap(),
+            &store,
+        );
+        let mut vals: Vec<f64> = rows.rows.iter().map(|r| num(&r[0])).collect();
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn for_insert_evaluates_property_expressions_per_row() {
+        let mut store = Builder::default().build();
+        // `b: x * 2` is an EXPRESSION over the unwound `x`, not a literal.
+        stmt(
+            &mut store,
+            "FOR x IN [10, 20] INSERT (:Pair {a: x, b: x * 2})",
+        )
+        .unwrap();
+        let rows = run(
+            &crate::gql::parse("MATCH (n:Pair) RETURN n.a AS a, n.b AS b").unwrap(),
+            &store,
+        );
+        let mut pairs: Vec<(f64, f64)> =
+            rows.rows.iter().map(|r| (num(&r[0]), num(&r[1]))).collect();
+        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert_eq!(pairs, vec![(10.0, 20.0), (20.0, 40.0)]);
+    }
+
+    #[test]
+    fn for_insert_mixes_literal_and_expression_properties() {
+        let mut store = Builder::default().build();
+        stmt(
+            &mut store,
+            "FOR x IN [1, 2] INSERT (:Acct {kind: 'k', bal: x})",
+        )
+        .unwrap();
+        let rows = run(
+            &crate::gql::parse("MATCH (n:Acct) RETURN n.kind AS kind, n.bal AS bal").unwrap(),
+            &store,
+        );
+        assert_eq!(rows.rows.len(), 2);
+        for r in rows.rows.iter() {
+            // the literal `kind` is the same string on every row
+            assert!(
+                matches!(&r[0], Value::Str(s) if &**s == "k"),
+                "kind should be 'k', got {:?}",
+                r[0]
+            );
+        }
+    }
+
+    #[test]
+    fn for_insert_creates_an_edge_per_row() {
+        let mut store = Builder::default().build();
+        stmt(
+            &mut store,
+            "FOR x IN [1, 2] INSERT (:A {v: x})-[:R]->(:B {v: x})",
+        )
+        .unwrap();
+        assert_eq!(label_count(&store, "A"), 2);
+        assert_eq!(label_count(&store, "B"), 2);
+        // Two R edges, one per row (A_x → B_x).
+        let n = run(
+            &crate::gql::parse("MATCH (:A)-[:R]->(:B) RETURN count(*) AS c").unwrap(),
+            &store,
+        );
+        assert_eq!(num(&n.rows[0][0]), 2.0);
+    }
+
+    #[test]
+    fn for_insert_over_an_empty_list_creates_nothing() {
+        let mut store = Builder::default().build();
+        stmt(&mut store, "FOR x IN [] INSERT (:Acct {bal: x})").unwrap();
+        assert_eq!(label_count(&store, "Acct"), 0);
+    }
+
+    #[test]
+    fn for_insert_is_atomic_a_unique_violation_rolls_back_every_row() {
+        // Both rows carry id='dup'; a unique constraint on (Acct, id) means the second
+        // collides. Per-statement atomicity must roll the FIRST row back too — zero rows.
+        let mut store = Builder::default().build();
+        store.create_unique_constraint("Acct", &["id"]).unwrap();
+        let err = stmt(
+            &mut store,
+            "FOR x IN [1, 2] INSERT (:Acct {id: 'dup', bal: x})",
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("E_UNIQUE:") || err.starts_with("E_CONSTRAINT"),
+            "duplicate unique value violates: {err}"
+        );
+        assert_eq!(
+            label_count(&store, "Acct"),
+            0,
+            "the whole FOR-INSERT rolled back — no partial write"
+        );
+    }
+
+    #[test]
+    fn for_insert_inside_a_transaction_commits_and_rolls_back_as_a_unit() {
+        // Committed: the FOR-INSERT's rows persist with the transaction.
+        let mut store = Builder::default().build();
+        stmt(&mut store, "START TRANSACTION").unwrap();
+        stmt(&mut store, "FOR x IN [1, 2, 3] INSERT (:Acct {bal: x})").unwrap();
+        stmt(&mut store, "COMMIT").unwrap();
+        assert_eq!(label_count(&store, "Acct"), 3);
+
+        // Rolled back: START, FOR-INSERT, ROLLBACK → nothing persists.
+        let mut store2 = Builder::default().build();
+        stmt(&mut store2, "START TRANSACTION").unwrap();
+        stmt(&mut store2, "FOR x IN [1, 2] INSERT (:Acct {bal: x})").unwrap();
+        stmt(&mut store2, "ROLLBACK").unwrap();
+        assert_eq!(label_count(&store2, "Acct"), 0);
+    }
+
+    #[test]
+    fn for_insert_is_rejected_in_a_read_only_transaction() {
+        let mut store = Builder::default().build();
+        stmt(&mut store, "START TRANSACTION READ ONLY").unwrap();
+        let err = stmt(&mut store, "FOR x IN [1, 2] INSERT (:Acct {bal: x})").unwrap_err();
+        assert!(
+            err.starts_with("E_INVALID_GRAPH_OP:"),
+            "read-only rejects: {err}"
+        );
+        assert_eq!(label_count(&store, "Acct"), 0);
     }
 
     /// `REMOVE` of a required-constraint key is rejected and rolled back.

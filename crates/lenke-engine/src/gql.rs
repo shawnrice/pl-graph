@@ -1098,8 +1098,16 @@ impl Parser {
                 ops,
             });
         }
+        // A row-driven INSERT tail: `FOR … INSERT (…)` (or `MATCH … INSERT (…)`) —
+        // create the templated nodes/edges once per input row, evaluating each
+        // property EXPRESSION against that row (so `FOR x IN […] INSERT (:N {v: x})`
+        // reads the unwound `x`). The bare top-level `INSERT` (constant literals, no
+        // input) stays on the `insert()` path in `query()`.
+        if self.eat_kw("INSERT") {
+            return self.insert_from(plan);
+        }
         if !self.eat_kw("RETURN") {
-            return Err("expected RETURN, SET, REMOVE, WITH, or MATCH".into());
+            return Err("expected RETURN, SET, REMOVE, WITH, INSERT, or MATCH".into());
         }
         let distinct = self.eat_kw("DISTINCT");
         let items = self.return_items()?;
@@ -2061,6 +2069,129 @@ impl Parser {
             var_to_idx.insert(v, idx);
         }
         Ok(idx)
+    }
+
+    /// A row-driven INSERT (`FOR … INSERT (…)` / `MATCH … INSERT (…)`): parse the
+    /// comma-separated node/edge templates — each property is an EXPRESSION over the
+    /// input row's scope — and wrap `input` in a `Plan::InsertFrom`.
+    fn insert_from(&mut self, input: Plan) -> Result<Plan, String> {
+        let mut nodes: Vec<crate::ir::InsertNodeExpr> = Vec::new();
+        let mut edges: Vec<crate::ir::InsertEdgeExpr> = Vec::new();
+        let mut var_to_idx: HashMap<String, usize> = HashMap::new();
+        loop {
+            self.insert_path_expr(&mut nodes, &mut edges, &mut var_to_idx)?;
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(Plan::InsertFrom {
+            input: Box::new(input),
+            nodes,
+            edges,
+        })
+    }
+
+    /// One `(a)-[:R]->(b)…` path of a row-driven INSERT (see `insert_from`). Mirrors
+    /// `insert_path` but produces expression-valued templates.
+    fn insert_path_expr(
+        &mut self,
+        nodes: &mut Vec<crate::ir::InsertNodeExpr>,
+        edges: &mut Vec<crate::ir::InsertEdgeExpr>,
+        var_to_idx: &mut HashMap<String, usize>,
+    ) -> Result<(), String> {
+        let mut prev = self.insert_node_expr(nodes, var_to_idx)?;
+        while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
+            let rel = self.rel()?;
+            if rel.where_range.is_some() {
+                return Err("inline WHERE on an INSERT relationship is not supported".into());
+            }
+            let next = self.insert_node_expr(nodes, var_to_idx)?;
+            let (from, to) = match rel.dir {
+                Dir::Out => (prev, next),
+                Dir::In => (next, prev),
+                Dir::Both => return Err("INSERT requires a directed relationship".into()),
+            };
+            let etype =
+                match rel.etypes.as_slice() {
+                    [t] => t.clone(),
+                    [] => return Err("INSERT of a relationship requires an edge type".into()),
+                    _ => return Err(
+                        "INSERT of a relationship requires a single edge type, not a disjunction"
+                            .into(),
+                    ),
+                };
+            // A relationship's inline props are literal (the `rel` parser is a MATCH
+            // construct); lift them to constant expressions so the templates are uniform.
+            let props = rel
+                .props
+                .into_iter()
+                .map(|(k, v)| (k, Expr::Lit(v)))
+                .collect();
+            edges.push(crate::ir::InsertEdgeExpr {
+                from,
+                to,
+                etype,
+                props,
+            });
+            prev = next;
+        }
+        Ok(())
+    }
+
+    /// One `(v :Labels {k: <expr>, …})` node of a row-driven INSERT. A property value
+    /// may be any expression over the input row's bindings (a literal is lifted to
+    /// `Expr::Lit`); a repeated variable re-references the same template.
+    fn insert_node_expr(
+        &mut self,
+        nodes: &mut Vec<crate::ir::InsertNodeExpr>,
+        var_to_idx: &mut HashMap<String, usize>,
+    ) -> Result<usize, String> {
+        self.expect(&Tok::LParen)?;
+        let var = if matches!(self.peek(), Some(Tok::Ident(_))) {
+            Some(self.ident()?)
+        } else {
+            None
+        };
+        let mut labels = Vec::new();
+        while self.eat(&Tok::Colon) {
+            labels.push(self.ident()?);
+            while self.eat(&Tok::Amp) {
+                labels.push(self.ident()?);
+            }
+        }
+        let props = if matches!(self.peek(), Some(Tok::LBrace)) {
+            self.insert_expr_props()?
+        } else {
+            Vec::new()
+        };
+        self.expect(&Tok::RParen)?;
+        if let Some(v) = &var {
+            if let Some(&idx) = var_to_idx.get(v) {
+                if !labels.is_empty() || !props.is_empty() {
+                    return Err(format!("variable `{v}` is already defined in this INSERT"));
+                }
+                return Ok(idx);
+            }
+        }
+        let idx = nodes.len();
+        nodes.push(crate::ir::InsertNodeExpr { labels, props });
+        if let Some(v) = var {
+            var_to_idx.insert(v, idx);
+        }
+        Ok(idx)
+    }
+
+    /// A `{k: <expr>, …}` property map for a row-driven INSERT: literals and full
+    /// expressions alike, each returned as an `Expr` (a literal as `Expr::Lit`). The
+    /// expressions resolve against the CURRENT scope (the FOR/MATCH bindings).
+    fn insert_expr_props(&mut self) -> Result<Vec<(String, Expr)>, String> {
+        let (lits, exprs) = self.props()?;
+        let mut out: Vec<(String, Expr)> =
+            lits.into_iter().map(|(k, v)| (k, Expr::Lit(v))).collect();
+        for (k, range) in exprs {
+            out.push((k, self.parse_captured_where(range)?));
+        }
+        Ok(out)
     }
 
     // props := '{' [ key ':' literal ( ',' key ':' literal )* ] '}'

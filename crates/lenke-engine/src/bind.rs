@@ -168,6 +168,23 @@ fn bind_plan(plan: &mut Plan, params: &HashMap<&str, &Value>) -> Result<(), Stri
                 }
             }
         }
+        Plan::InsertFrom {
+            input,
+            nodes,
+            edges,
+        } => {
+            bind_plan(input, params)?;
+            for n in nodes {
+                for (_, e) in &mut n.props {
+                    bind_expr(e, params)?;
+                }
+            }
+            for ed in edges {
+                for (_, e) in &mut ed.props {
+                    bind_expr(e, params)?;
+                }
+            }
+        }
         Plan::Merge {
             on_create,
             on_update,
