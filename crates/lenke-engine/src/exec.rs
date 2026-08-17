@@ -463,6 +463,36 @@ pub(crate) fn enforce_read_only(store: &Store) -> Result<(), String> {
 const ID_DUP_ERR: &str = "E_UNIQUE: an element with this id already exists — a string `id` \
      property is the element's unique identity; use _MERGE to upsert, or a fresh id";
 
+/// The `FAULT_ID_IMMUTABLE` message, matching core: a string `id` is an element's
+/// fixed identity, so `SET x.id = …` is rejected (`E_INVALID_GRAPH_OP`).
+const ID_IMMUTABLE_ERR: &str = "E_INVALID_GRAPH_OP: cannot SET `id`: a string `id` is the \
+     element's identity and is fixed at creation — insert a new element with the new id instead";
+
+/// Whether node `n`'s `id` PROPERTY is its identity — a string equal to its external
+/// id (as set by `INSERT (:P {id: 'x'})`). Such an id is fixed at creation, so a
+/// `SET n.id` is rejected; a numeric / absent / divergent `id` is an ordinary,
+/// SET-able property. Stateless, matching core's `vertex_id_is_identity`.
+fn node_id_is_identity(store: &Store, n: u32) -> bool {
+    if let Value::Str(s) = store.prop(n, "id") {
+        store
+            .node_ext_id(n)
+            .is_some_and(|ext| ext.as_ref() == s.as_ref())
+    } else {
+        false
+    }
+}
+
+/// The edge analogue of [`node_id_is_identity`] — matching core's `edge_id_is_identity`.
+fn edge_id_is_identity(store: &Store, e: u32) -> bool {
+    if let Value::Str(s) = store.edge_prop(e, "id") {
+        store
+            .edge_ext_id(e)
+            .is_some_and(|ext| ext.as_ref() == s.as_ref())
+    } else {
+        false
+    }
+}
+
 /// Create a node for an INSERT, honoring a string `id` property as the element's
 /// EXTERNAL identity (like core's `insert_vertex_with_id`): a string `id` becomes the
 /// node's external id — unique across the graph, a duplicate is a constraint violation
@@ -481,6 +511,33 @@ fn insert_node_with_identity(
         return Ok(store.add_node_with_id(&ext, labels, props));
     }
     Ok(store.add_node(labels, props))
+}
+
+/// Create an edge for an INSERT, honoring a string `id` property as its external
+/// identity (like core's `insert_edge_with_id`): a string `id` becomes the edge's
+/// external id — unique among edges, a duplicate is a constraint violation — and is
+/// still stored as a property. A non-string / absent `id` mints a synthetic edge id.
+/// Sets the edge's properties in either case.
+fn insert_edge_with_identity(
+    store: &mut Store,
+    from: u32,
+    to: u32,
+    etype: &str,
+    props: &[(String, Value)],
+) -> Result<u32, String> {
+    let eid = if let Some((_, Value::Str(id))) = props.iter().find(|(k, _)| k == "id") {
+        if store.edge_by_ext(id).is_some() {
+            return Err(ID_DUP_ERR.into());
+        }
+        let ext: std::sync::Arc<str> = std::sync::Arc::from(id.as_ref());
+        store.add_edge_with_id(&ext, from, to, etype)
+    } else {
+        store.add_edge(from, to, etype)
+    };
+    for (k, v) in props {
+        store.set_edge_prop(eid, k, v.clone());
+    }
+    Ok(eid)
 }
 
 /// `Plan::Insert` and `Plan::InsertReturn`.
@@ -504,10 +561,7 @@ fn run_insert(
             ids.push(insert_node_with_identity(store, &labels, &props)?);
         }
         for e in edges {
-            let eid = store.add_edge(ids[e.from], ids[e.to], &e.etype);
-            for (k, v) in &e.props {
-                store.set_edge_prop(eid, k, v.clone());
-            }
+            insert_edge_with_identity(store, ids[e.from], ids[e.to], &e.etype, &e.props)?;
         }
         // Enforce every constraint this INSERT could have violated (unique, required,
         // type, cardinality, validators, invariants).
@@ -580,10 +634,17 @@ fn run_insert_from(
                 row_ids.push(insert_node_with_identity(store, &labels, &props)?);
             }
             for (t, e) in edges.iter().enumerate() {
-                let eid = store.add_edge(row_ids[e.from], row_ids[e.to], &e.etype);
-                for (k, vals) in &edge_props[t] {
-                    store.set_edge_prop(eid, k, vals[i].clone());
-                }
+                let row_props: Vec<(String, Value)> = edge_props[t]
+                    .iter()
+                    .map(|(k, vals)| (k.clone(), vals[i].clone()))
+                    .collect();
+                insert_edge_with_identity(
+                    store,
+                    row_ids[e.from],
+                    row_ids[e.to],
+                    &e.etype,
+                    &row_props,
+                )?;
             }
         }
         store
@@ -690,6 +751,11 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                             match batch.slot(*slot) {
                                 Col::Nodes(ids) => {
                                     for (i, &id) in ids.iter().enumerate() {
+                                        // A string `id` is the element's fixed identity —
+                                        // re-keying it would break element_id / round-trip.
+                                        if key == "id" && node_id_is_identity(store, id) {
+                                            return Err(ID_IMMUTABLE_ERR.into());
+                                        }
                                         applied.push(Applied::Set(
                                             id,
                                             key.clone(),
@@ -699,6 +765,9 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                                 }
                                 Col::Edges(eids) => {
                                     for (i, &e) in eids.iter().enumerate() {
+                                        if key == "id" && edge_id_is_identity(store, e) {
+                                            return Err(ID_IMMUTABLE_ERR.into());
+                                        }
                                         applied.push(Applied::SetEdge(
                                             e,
                                             key.clone(),
@@ -21156,6 +21225,60 @@ mod tests {
             "intra-statement dup id: {err}"
         );
         assert_eq!(store.live_node_count(), 0, "the whole INSERT rolled back");
+    }
+
+    #[test]
+    fn edge_string_id_is_the_unique_external_identity() {
+        let mut store = Builder::default().build();
+        stmt(
+            &mut store,
+            "INSERT (:A {id: 'a'})-[:R {id: 'e1'}]->(:B {id: 'b'})",
+        )
+        .unwrap();
+        // A duplicate EDGE id is a constraint violation; the statement rolls back.
+        let err = stmt(
+            &mut store,
+            "INSERT (:A {id: 'a2'})-[:R {id: 'e1'}]->(:B {id: 'b2'})",
+        )
+        .unwrap_err();
+        assert!(err.starts_with("E_UNIQUE:"), "duplicate edge id: {err}");
+        let n = run(
+            &crate::gql::parse("MATCH ()-[:R]->() RETURN count(*) AS c").unwrap(),
+            &store,
+        );
+        assert_eq!(num(&n.rows[0][0]), 1.0, "only the first R edge exists");
+    }
+
+    #[test]
+    fn set_on_a_string_identity_id_is_rejected_but_other_and_numeric_ids_are_settable() {
+        let mut store = Builder::default().build();
+        stmt(&mut store, "INSERT (:A {id: 'a', bal: 1})").unwrap();
+        // SET on a string identity `id` → immutable error; the id is unchanged.
+        let err = stmt(&mut store, "MATCH (n:A {id: 'a'}) SET n.id = 'z'").unwrap_err();
+        assert!(
+            err.starts_with("E_INVALID_GRAPH_OP:"),
+            "SET id immutable: {err}"
+        );
+        assert!(store.node_by_ext("a").is_some(), "the id is unchanged");
+        assert!(store.node_by_ext("z").is_none());
+        // A NON-id property is still SET-able on an identity node.
+        stmt(&mut store, "MATCH (n:A {id: 'a'}) SET n.bal = 5").unwrap();
+        // A NUMERIC id is a plain property (not an identity) → SET-able.
+        stmt(&mut store, "INSERT (:N {id: 7})").unwrap();
+        stmt(&mut store, "MATCH (n:N) SET n.id = 8").unwrap();
+    }
+
+    #[test]
+    fn set_on_a_string_identity_edge_id_is_rejected() {
+        let mut store = Builder::default().build();
+        stmt(&mut store, "INSERT (:A)-[:R {id: 'e1', w: 1}]->(:B)").unwrap();
+        let err = stmt(&mut store, "MATCH ()-[r:R]->() SET r.id = 'e2'").unwrap_err();
+        assert!(
+            err.starts_with("E_INVALID_GRAPH_OP:"),
+            "SET edge id immutable: {err}"
+        );
+        // A non-id edge property is still SET-able.
+        stmt(&mut store, "MATCH ()-[r:R]->() SET r.w = 9").unwrap();
     }
 
     /// `REMOVE` of a required-constraint key is rejected and rolled back.

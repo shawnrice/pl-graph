@@ -1672,6 +1672,17 @@ impl Store {
             .filter(|&id| !self.deleted[id as usize])
     }
 
+    /// The eid of a LIVE edge whose external id is `ext`, or None. Scans the current
+    /// adjacency — edges rarely carry an explicit string `id` (auto-ids and NDJSON
+    /// load are the norm), so no reverse index is maintained; used only by the INSERT
+    /// identity path to reject a duplicate edge id.
+    #[must_use]
+    pub fn edge_by_ext(&self, ext: &str) -> Option<u32> {
+        self.all_edges()
+            .into_iter()
+            .find(|&eid| self.edge_ext_id(eid).is_some_and(|e| e.as_ref() == ext))
+    }
+
     // --- Unique constraints ----------------------------------------------
     //
     // A unique constraint declares that at most one live node with `label` may
