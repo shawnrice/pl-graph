@@ -57,10 +57,20 @@ const SCENARIOS: Scenario[] = [
     seed: ["INSERT (:P {name: 'a', age: 'thirty'})"],
     steps: [(be, g) => be.createTypeConstraint(g, 'P', 'age', 'number')],
   },
-  // NOTE: closed-record type-constraint parity is covered by the engine's store
-  // unit tests, not here — the engine's GQL `INSERT` can't yet write a map literal
-  // as a property value (`{m: {a:1}}` → "values must be literals"), which core
-  // accepts, so a record can't be seeded identically through both backends.
+  {
+    // A record TYPE constraint declaration agrees; its per-write ENFORCEMENT does
+    // NOT (see the note below), so the write steps stay out of the shared assertion.
+    name: 'closed record type constraint declares against conforming data',
+    seed: ["INSERT (:P {m: {a: 1, b: 'x'}})"],
+    steps: [
+      (be, g) => be.createTypeConstraint(g, 'P', 'm', 'record{a::number,b::string NOT NULL}'),
+    ],
+  },
+  // NOTE: record-type WRITE enforcement DIVERGES — the engine rejects an INSERT of a
+  // record that breaks the shape (wrong field type / missing NOT NULL / extra field),
+  // core accepts it. The engine is the stricter/correct one (core under-enforces
+  // record types on the INSERT path), so this isn't a "match core" case; the engine's
+  // record enforcement is covered by its store unit tests instead.
   {
     name: 'unique constraint: declare then a duplicate write violates',
     seed: ["INSERT (:P {name: 'a', age: 30})", "INSERT (:P {name: 'b', age: 25})"],

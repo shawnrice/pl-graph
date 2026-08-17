@@ -20210,6 +20210,38 @@ mod tests {
         );
     }
 
+    /// INSERT accepts a record/map literal as a property value (a constant record),
+    /// stored canonically as a `Value::Record` — the seedable-literal path handles
+    /// `{…}`, not just scalars and lists.
+    #[test]
+    fn insert_writes_a_record_literal_property() {
+        let mut store = Builder::default().build();
+        execute(
+            &crate::gql::parse("INSERT (:P {n: 1, m: {y: 'hi', x: 2}})").unwrap(),
+            &mut store,
+        )
+        .unwrap();
+        match store.prop(0, "m") {
+            Value::Record(f) => {
+                // Canonical: keys sorted (x before y), values preserved.
+                assert_eq!(f.len(), 2);
+                assert_eq!(f[0].0.as_ref(), "x");
+                assert_eq!(format!("{:?}", f[0].1), format!("{:?}", Value::Num(2.0)));
+                assert_eq!(f[1].0.as_ref(), "y");
+            }
+            other => panic!("expected a record, got {other:?}"),
+        }
+        // A nested field is queryable back out.
+        let out = run(
+            &crate::gql::parse("MATCH (p:P) RETURN p.m.x AS x").unwrap(),
+            &store,
+        );
+        assert_eq!(
+            format!("{:?}", out.rows[0][0]),
+            format!("{:?}", Value::Num(2.0))
+        );
+    }
+
     /// A single INSERT that creates two colliding nodes is rejected atomically.
     #[test]
     fn insert_rejects_intra_statement_duplicate() {

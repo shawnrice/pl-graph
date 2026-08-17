@@ -2177,6 +2177,26 @@ impl Parser {
             }
             return Ok(Value::List(items));
         }
+        // A record/map literal `{k: <literal>, …}` (empty `{}` allowed) — a constant
+        // record value, so it is seedable in an INSERT / _MERGE / CALL-config
+        // position (a field whose value is a non-literal EXPRESSION makes the whole
+        // record non-literal, which `props` then routes to the expression path).
+        if self.peek() == Some(&Tok::LBrace) {
+            self.bump();
+            let mut fields: Vec<(std::sync::Arc<str>, Value)> = Vec::new();
+            if !self.eat(&Tok::RBrace) {
+                loop {
+                    let key = self.ident()?;
+                    self.expect(&Tok::Colon)?;
+                    fields.push((key.into(), self.literal_value()?));
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Tok::RBrace)?;
+            }
+            return Ok(crate::value::make_record(fields));
+        }
         // A leading `-` on a numeric literal (`{n: -0.0}`, `-3`): negate the number.
         if self.eat(&Tok::Minus) {
             return match self.bump() {
