@@ -23,7 +23,6 @@
 //
 // Run: bun test packages/native/src/gremlin-conformance.test.ts
 import { describe, expect, test } from 'bun:test';
-import { existsSync } from 'node:fs';
 
 import { Edge, Graph, isElement } from '@lenke/core';
 import { ErrorCode, hasErrorCode } from '@lenke/errors';
@@ -77,19 +76,14 @@ import {
   withSack,
 } from '@lenke/gremlin';
 
-import { createFfiBackend } from './backend-ffi.js';
+import { nativeBackend, NATIVE_LIB, nativeReady } from './conformance-harness.js';
 
-// --- native library bootstrap (mirrors backend-ffi.test.ts) -----------------
-const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
-const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
-const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
-  import.meta.url,
-).pathname;
-const hasLib = existsSync(LIB);
+// --- native backend bootstrap (via the drop-in harness: core by default,
+// lenke-engine under LENKE_ENGINE=1; see conformance-harness.ts) --------------
+const hasLib = nativeReady;
 
 if (!hasLib) {
-  console.warn(`[gremlin-conformance] skipping: ${LIB} not found — run \`bun run build:rust\`.`);
+  console.warn(`[gremlin-conformance] skipping: ${NATIVE_LIB} not found — run \`bun run build:rust\`.`);
 }
 
 const suite = hasLib ? describe : describe.skip;
@@ -184,7 +178,7 @@ export const canonJson = (v: unknown): unknown => {
 };
 
 // --- engine runners ---------------------------------------------------------
-const backend = hasLib ? createFfiBackend(LIB) : null;
+const backend = hasLib ? nativeBackend() : null;
 const decoder = new TextDecoder();
 
 const nativeRun = (planStr: string): unknown[] => {

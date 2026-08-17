@@ -5,25 +5,17 @@
 // module itself hand-writes the IPC framing with zero runtime deps. Loads the real
 // FFI cdylib by path.
 import { describe, expect, test } from 'bun:test';
-import { existsSync } from 'node:fs';
 
 import { type Table, tableFromIPC } from 'apache-arrow';
 
 import { toArrowIPC } from './arrow.js';
-import { createFfiBackend } from './backend-ffi.js';
+import { nativeBackend, NATIVE_LIB, nativeReady } from './conformance-harness.js';
 import { graphFromNdjson } from './graph.js';
 
-const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
-const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
-const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
-  import.meta.url,
-).pathname;
-
-const hasLib = existsSync(LIB);
+const hasLib = nativeReady;
 
 if (!hasLib) {
-  console.warn(`[arrow.test] skipping: ${LIB} not found — run \`bun run build:rust\` first.`);
+  console.warn(`[arrow.test] skipping: ${NATIVE_LIB} not found — run \`bun run build:rust\` first.`);
 }
 
 const suite = hasLib ? describe : describe.skip;
@@ -35,7 +27,7 @@ const NDJSON = [
 ].join('\n');
 
 suite('@lenke/native/arrow — real Arrow IPC egress', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const blobOf = (q: string): Uint8Array => {
     const g = graphFromNdjson(backend, NDJSON);
 
@@ -218,7 +210,7 @@ const VEC_NDJSON = [
 ].join('\n');
 
 suite('@lenke/native/arrow — FixedSizeList<Float64> egress', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const Q = 'MATCH (n:V) RETURN n.h AS h ORDER BY n.name';
 
   const table = (native: boolean): Table => {
@@ -318,7 +310,7 @@ const REC_NDJSON = [
 ].join('\n');
 
 suite('@lenke/native/arrow — Struct (record) egress', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = nativeBackend();
   const Q = 'MATCH (n:P) RETURN n.meta AS meta ORDER BY n.name';
 
   const table = (native: boolean): Table => {
