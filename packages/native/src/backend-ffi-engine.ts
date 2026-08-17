@@ -52,7 +52,8 @@ const asHandle = (p: Pointer | null): GraphHandle => p as unknown as GraphHandle
 
 /** Load `liblenke_engine` over bun:ffi. Pass the absolute path to the built cdylib. */
 export const createFfiEngineBackend = (libPath: string): Backend => {
-  const { symbols } = dlopen(libPath, SYMBOLS);
+  const lib = dlopen(libPath, SYMBOLS);
+  const { symbols } = lib;
 
   const abiVersion = symbols.lnk_abi_version();
   assertAbi(abiVersion);
@@ -190,5 +191,13 @@ export const createFfiEngineBackend = (libPath: string): Backend => {
     },
   };
 
-  return buildEngineBackend(abi);
+  const backend = buildEngineBackend(abi);
+  // Retain the bun:ffi Library on the backend: bun closes (dlclose's) a Library when
+  // it is garbage-collected, which invalidates every `symbols` pointer. Destructuring
+  // only `symbols` left the Library unreferenced, so under GC pressure the native lib
+  // could be unloaded WHILE graphs were still calling into it — surfacing as silent
+  // wrong results (e.g. a constraint check that no longer ran), not a clean fault.
+  (backend as { __lib?: unknown }).__lib = lib;
+
+  return backend;
 };

@@ -135,7 +135,8 @@ const asHandle = (p: Pointer | null): GraphHandle => p as unknown as GraphHandle
  * built `liblenke_core.{dylib,so,dll}` (see `build:rust`).
  */
 export const createFfiBackend = (libPath: string): Backend => {
-  const { symbols } = dlopen(libPath, SYMBOLS);
+  const lib = dlopen(libPath, SYMBOLS);
+  const { symbols } = lib;
 
   const abiVersion = symbols.lnk_abi_version();
   assertAbi(abiVersion);
@@ -214,7 +215,7 @@ export const createFfiBackend = (libPath: string): Backend => {
     }
   };
 
-  return {
+  const backend: Backend = {
     abiVersion,
 
     graphFromNdjson: (bytes, parallel) => {
@@ -700,4 +701,10 @@ export const createFfiBackend = (libPath: string): Backend => {
       return asHandle(h);
     },
   };
+  // Retain the bun:ffi Library so bun does not dlclose the native lib under GC while
+  // graphs still call into it (see createFfiEngineBackend for the failure mode: a
+  // silent wrong result, not a fault, when the library unloads mid-use).
+  (backend as { __lib?: unknown }).__lib = lib;
+
+  return backend;
 };
