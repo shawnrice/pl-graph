@@ -4981,7 +4981,38 @@ impl Parser {
         if !self.eat_kw("AS") {
             return Err("expected AS in CAST(expr AS TYPE)".into());
         }
-        let ty = self.ident()?;
+        // Read the target type name, joining the two-word `LOCAL`/`ZONED` temporal
+        // forms (`LOCAL DATETIME` → `local_datetime`, `ZONED TIME` → `zoned_time`),
+        // matching core's `read_type_name`.
+        let mut ty = self.ident()?;
+        let lead = ty.to_ascii_lowercase();
+        if (lead == "local" || lead == "zoned")
+            && matches!(self.peek(), Some(Tok::Ident(w))
+                if matches!(w.to_ascii_lowercase().as_str(), "datetime" | "time"))
+        {
+            let w = self.ident()?;
+            ty = format!("{lead}_{}", w.to_ascii_lowercase());
+        }
+        // A TEMPORAL cast DESUGARS to the matching temporal constructor function
+        // (`CAST(x AS DATE)` → `date(x)`), exactly as core does — `TIMESTAMP` is a
+        // DATETIME alias. A scalar cast keeps the throwing `CastTarget` path below.
+        let temporal_fn = match ty.to_ascii_lowercase().as_str() {
+            "date" => Some("date"),
+            "datetime" | "timestamp" => Some("datetime"),
+            "local_datetime" => Some("local_datetime"),
+            "local_time" => Some("local_time"),
+            "zoned_time" => Some("zoned_time"),
+            "zoned_datetime" => Some("zoned_datetime"),
+            "duration" => Some("duration"),
+            _ => None,
+        };
+        if let Some(fname) = temporal_fn {
+            self.expect(&Tok::RParen)?;
+            return Ok(Expr::Call {
+                name: fname.to_string(),
+                args: vec![*expr],
+            });
+        }
         let target = match ty.to_ascii_uppercase().as_str() {
             "INTEGER" | "INT" => CastTarget::Integer,
             "FLOAT" | "DOUBLE" | "REAL" | "NUMBER" | "NUMERIC" => CastTarget::Float,
@@ -5423,7 +5454,7 @@ impl Parser {
             | "duration" | "to_integer" | "tointeger" | "to_float" | "tofloat" | "to_string"
             | "tostring" | "to_boolean" | "toboolean" | "char_length" | "character_length"
             | "byte_length" | "octet_length" | "reverse" | "tail" | "keys" | "labels" | "type"
-            | "property_names" | "element_id" => args.len() == 1,
+            | "property_names" | "element_id" | "to_list" | "tolist" => args.len() == 1,
             // `round(x)` or `round(x, digits)`
             "round" => args.len() == 1 || args.len() == 2,
             // `list_sort(list)` / `(list, order)` / `(list, order, nullOrder)`

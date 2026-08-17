@@ -14264,6 +14264,24 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         "to_float" | "tofloat" => to_number(&args[0], false),
         "to_string" | "tostring" => to_string_fn(&args[0]),
         "to_boolean" | "toboolean" => to_boolean_fn(&args[0]),
+        // `to_list`: a list → itself; a string → its UTF-16 code-unit chars (the JS
+        // `split('')` model, kept for byte-identity); a non-nullish scalar → a
+        // singleton list; null / non-finite number → null. Matches core's ToList.
+        "to_list" | "tolist" => match &args[0] {
+            Value::List(_) => args[0].clone(),
+            Value::Str(s) => Value::List(
+                s.encode_utf16()
+                    .map(|u| {
+                        Value::Str(std::sync::Arc::from(
+                            String::from_utf16_lossy(&[u]).as_str(),
+                        ))
+                    })
+                    .collect(),
+            ),
+            Value::Num(n) if !n.is_finite() => Value::Null,
+            Value::Null => Value::Null,
+            other => Value::List(vec![other.clone()]),
+        },
         // string (1 arg → string/number)
         "upper" => str_map(&args[0], str::to_uppercase),
         "lower" => str_map(&args[0], str::to_lowercase),
