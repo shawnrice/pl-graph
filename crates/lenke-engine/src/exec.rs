@@ -458,43 +458,74 @@ pub(crate) fn enforce_read_only(store: &Store) -> Result<(), String> {
     Ok(())
 }
 
+/// The `FAULT_ID_DUP` message, matching core: a string `id` is an element's unique
+/// external identity. The `E_UNIQUE:` prefix maps to `E_CONSTRAINT_VIOLATION`.
+const ID_DUP_ERR: &str = "E_UNIQUE: an element with this id already exists — a string `id` \
+     property is the element's unique identity; use _MERGE to upsert, or a fresh id";
+
+/// Create a node for an INSERT, honoring a string `id` property as the element's
+/// EXTERNAL identity (like core's `insert_vertex_with_id`): a string `id` becomes the
+/// node's external id — unique across the graph, a duplicate is a constraint violation
+/// — AND is still stored as an ordinary property (`RETURN n.id` works). A non-string
+/// or absent `id` mints a synthetic external id. (Numeric `id` stays a plain property.)
+fn insert_node_with_identity(
+    store: &mut Store,
+    labels: &[&str],
+    props: &[(&str, Value)],
+) -> Result<u32, String> {
+    if let Some((_, Value::Str(id))) = props.iter().find(|(k, _)| *k == "id") {
+        if store.node_by_ext(id).is_some() {
+            return Err(ID_DUP_ERR.into());
+        }
+        let ext: std::sync::Arc<str> = std::sync::Arc::from(id.as_ref());
+        return Ok(store.add_node_with_id(&ext, labels, props));
+    }
+    Ok(store.add_node(labels, props))
+}
+
 /// `Plan::Insert` and `Plan::InsertReturn`.
 fn run_insert(
     store: &mut Store,
     nodes: &[crate::ir::InsertNode],
     edges: &[crate::ir::InsertEdge],
 ) -> Result<Vec<u32>, String> {
-    // In a transaction so a constraint violation rolls the whole INSERT back
-    // rather than leaving a partial write.
+    // In a transaction so a constraint violation (or a duplicate string `id`) rolls
+    // the whole INSERT back rather than leaving a partial write.
     let scope = stmt_begin(store);
-    let mut ids = Vec::with_capacity(nodes.len());
-    for spec in nodes {
-        let labels: Vec<&str> = spec.labels.iter().map(String::as_str).collect();
-        let props: Vec<(&str, Value)> = spec
-            .props
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.clone()))
-            .collect();
-        ids.push(store.add_node(&labels, &props));
-    }
-    for e in edges {
-        let eid = store.add_edge(ids[e.from], ids[e.to], &e.etype);
-        for (k, v) in &e.props {
-            store.set_edge_prop(eid, k, v.clone());
+    let result = (|| -> Result<Vec<u32>, String> {
+        let mut ids = Vec::with_capacity(nodes.len());
+        for spec in nodes {
+            let labels: Vec<&str> = spec.labels.iter().map(String::as_str).collect();
+            let props: Vec<(&str, Value)> = spec
+                .props
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.clone()))
+                .collect();
+            ids.push(insert_node_with_identity(store, &labels, &props)?);
+        }
+        for e in edges {
+            let eid = store.add_edge(ids[e.from], ids[e.to], &e.etype);
+            for (k, v) in &e.props {
+                store.set_edge_prop(eid, k, v.clone());
+            }
+        }
+        // Enforce every constraint this INSERT could have violated (unique, required,
+        // type, cardinality, validators, invariants).
+        store
+            .run_deferred_checks()
+            .and_then(|()| enforce_expr_constraints(store))?;
+        Ok(ids)
+    })();
+    match result {
+        Ok(ids) => {
+            stmt_commit(store, scope);
+            Ok(ids)
+        }
+        Err(e) => {
+            stmt_rollback(store, scope);
+            Err(e)
         }
     }
-    // Enforce every constraint this INSERT could have violated (unique, required,
-    // type, cardinality, validators, invariants) — roll the whole INSERT back on
-    // the first violation.
-    if let Err(e) = store
-        .run_deferred_checks()
-        .and_then(|()| enforce_expr_constraints(store))
-    {
-        stmt_rollback(store, scope);
-        return Err(e);
-    }
-    stmt_commit(store, scope);
-    Ok(ids)
 }
 
 /// `Plan::InsertFrom` — a row-driven INSERT (`FOR … INSERT`, `MATCH … INSERT`).
@@ -533,29 +564,33 @@ fn run_insert_from(
             .collect::<Result<_, _>>()?;
         (node_props, edge_props, nrows)
     };
-    // Write phase: create every row's nodes/edges under one per-statement scope.
+    // Write phase: create every row's nodes/edges under one per-statement scope. A
+    // string `id` property is the node's external identity (unique) — a duplicate
+    // (across rows or with an existing node) rolls back EVERY row.
     let scope = stmt_begin(store);
-    for i in 0..nrows {
-        let mut row_ids = Vec::with_capacity(nodes.len());
-        for (t, n) in nodes.iter().enumerate() {
-            let labels: Vec<&str> = n.labels.iter().map(String::as_str).collect();
-            let props: Vec<(&str, Value)> = node_props[t]
-                .iter()
-                .map(|(k, vals)| (k.as_str(), vals[i].clone()))
-                .collect();
-            row_ids.push(store.add_node(&labels, &props));
-        }
-        for (t, e) in edges.iter().enumerate() {
-            let eid = store.add_edge(row_ids[e.from], row_ids[e.to], &e.etype);
-            for (k, vals) in &edge_props[t] {
-                store.set_edge_prop(eid, k, vals[i].clone());
+    let result = (|| -> Result<(), String> {
+        for i in 0..nrows {
+            let mut row_ids = Vec::with_capacity(nodes.len());
+            for (t, n) in nodes.iter().enumerate() {
+                let labels: Vec<&str> = n.labels.iter().map(String::as_str).collect();
+                let props: Vec<(&str, Value)> = node_props[t]
+                    .iter()
+                    .map(|(k, vals)| (k.as_str(), vals[i].clone()))
+                    .collect();
+                row_ids.push(insert_node_with_identity(store, &labels, &props)?);
+            }
+            for (t, e) in edges.iter().enumerate() {
+                let eid = store.add_edge(row_ids[e.from], row_ids[e.to], &e.etype);
+                for (k, vals) in &edge_props[t] {
+                    store.set_edge_prop(eid, k, vals[i].clone());
+                }
             }
         }
-    }
-    if let Err(err) = store
-        .run_deferred_checks()
-        .and_then(|()| enforce_expr_constraints(store))
-    {
+        store
+            .run_deferred_checks()
+            .and_then(|()| enforce_expr_constraints(store))
+    })();
+    if let Err(err) = result {
         stmt_rollback(store, scope);
         return Err(err);
     }
@@ -21073,6 +21108,54 @@ mod tests {
             "read-only rejects: {err}"
         );
         assert_eq!(label_count(&store, "Acct"), 0);
+    }
+
+    #[test]
+    fn insert_string_id_is_the_unique_external_identity() {
+        let mut store = Builder::default().build();
+        // A string `id` sets the external identity AND stays a queryable property.
+        stmt(&mut store, "INSERT (:Acct {id: 'x', bal: 5})").unwrap();
+        let rows = run(
+            &crate::gql::parse("MATCH (n:Acct) RETURN n.id AS id, n.bal AS bal").unwrap(),
+            &store,
+        );
+        assert!(
+            matches!(&rows.rows[0][0], Value::Str(s) if &**s == "x"),
+            "n.id stays a stored property"
+        );
+        assert_eq!(num(&rows.rows[0][1]), 5.0);
+        assert!(
+            store.node_by_ext("x").is_some(),
+            "external id is registered"
+        );
+
+        // A duplicate string id is a constraint violation; the graph is unchanged.
+        let err = stmt(&mut store, "INSERT (:Acct {id: 'x'})").unwrap_err();
+        assert!(err.starts_with("E_UNIQUE:"), "duplicate string id: {err}");
+        assert_eq!(label_count(&store, "Acct"), 1);
+
+        // A NUMERIC id is a plain property — no identity, no uniqueness (two coexist).
+        stmt(&mut store, "INSERT (:Num {id: 7})").unwrap();
+        stmt(&mut store, "INSERT (:Num {id: 7})").unwrap();
+        assert_eq!(label_count(&store, "Num"), 2);
+
+        // No id → a synthetic external id; two such nodes coexist.
+        stmt(&mut store, "INSERT (:Plain {bal: 1})").unwrap();
+        stmt(&mut store, "INSERT (:Plain {bal: 2})").unwrap();
+        assert_eq!(label_count(&store, "Plain"), 2);
+    }
+
+    #[test]
+    fn a_string_id_collision_within_one_insert_rolls_the_whole_statement_back() {
+        let mut store = Builder::default().build();
+        // Two nodes in ONE INSERT sharing a new string id → the second collides with
+        // the first; per-statement atomicity leaves neither.
+        let err = stmt(&mut store, "INSERT (:A {id: 'k'}), (:B {id: 'k'})").unwrap_err();
+        assert!(
+            err.starts_with("E_UNIQUE:"),
+            "intra-statement dup id: {err}"
+        );
+        assert_eq!(store.live_node_count(), 0, "the whole INSERT rolled back");
     }
 
     /// `REMOVE` of a required-constraint key is rejected and rolled back.
