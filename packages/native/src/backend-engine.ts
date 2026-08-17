@@ -71,7 +71,8 @@ const LANG_GQL = 0;
 const LANG_GREMLIN = 1;
 const FMT_JSON = 0;
 const FMT_ARROW = 1;
-const FMT_ARROW_IPC = 2;
+const FMT_ARROW_IPC = 2; // Arrow IPC file / Feather layout
+const FMT_ARROW_IPC_STREAM = 3; // Arrow IPC stream layout
 // lnk_open / lnk_encode `format` bytes. 0/1 are the engine's native channels;
 // 2..5 route through the shared lenke-codec bridge (byte-identical with core).
 const FMT_NDJSON = 0;
@@ -326,10 +327,10 @@ export const buildEngineBackend = (abi: EngineAbi): Backend => {
       abi.query(handle, LANG_GQL, query, params ?? null, FMT_JSON),
     queryArrow: (handle, query, params) =>
       abi.query(handle, LANG_GQL, query, params ?? null, FMT_ARROW),
-    // The engine's Arrow-IPC is always the file/Feather layout; the stream layout
-    // (`file: false`) is not yet a separate format.
-    queryArrowIpc: (handle, query, _file, params) =>
-      abi.query(handle, LANG_GQL, query, params ?? null, FMT_ARROW_IPC),
+    // Arrow IPC: format 2 = FILE (Feather), 3 = STREAM. Honor the caller's `file`
+    // flag — dropping it silently emitted the file framing for a stream request.
+    queryArrowIpc: (handle, query, file, params) =>
+      abi.query(handle, LANG_GQL, query, params ?? null, file ? FMT_ARROW_IPC : FMT_ARROW_IPC_STREAM),
     gremlinJson: (handle, query) => abi.query(handle, LANG_GREMLIN, query, null, FMT_JSON),
 
     // Run a native algorithm directly (also reachable via a GQL `CALL` query).

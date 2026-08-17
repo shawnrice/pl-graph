@@ -541,7 +541,11 @@ pub unsafe extern "C" fn lnk_query(
         return match format {
             // SAFETY: out_len is writable per this fn's contract.
             1 => unsafe { out_bytes(crate::arrow::to_arrow(&rows), out_len) },
+            // Arrow IPC: format 2 = FILE (Feather, ARROW1 magic), 3 = STREAM. The host
+            // picks per `queryArrowIpc`'s `format` option; a stream request that lands on
+            // 2 (file) used to emit the wrong framing (the `_file` flag was dropped).
             2 => unsafe { out_bytes(crate::arrow::to_arrow_ipc(&rows, true), out_len) },
+            3 => unsafe { out_bytes(crate::arrow::to_arrow_ipc(&rows, false), out_len) },
             _ => {
                 crate::ffi_error::set("E_FFI", "unknown query format");
                 std::ptr::null_mut()
