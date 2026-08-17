@@ -29,12 +29,25 @@ pub struct CodecError {
 }
 
 impl CodecError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    /// A codec failure with a stable `E_*` wire code. `pub` so a host crate's
+    /// GraphData bridge can raise a codec-coded error (e.g. a temporal that failed
+    /// to validate) alongside the ones this crate raises.
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
         }
     }
+}
+
+/// The `E_*` wire codes this crate raises, exposed so a host can construct a
+/// [`CodecError`] with the matching code from its own bridge logic.
+pub mod codes {
+    pub const INVALID_JSON: &str = super::E_INVALID_JSON;
+    pub const INVALID_SHAPE: &str = super::E_INVALID_SHAPE;
+    pub const INVALID_VALUE: &str = super::E_INVALID_VALUE;
+    pub const UNKNOWN_FORMAT: &str = super::E_UNKNOWN_FORMAT;
+    pub const UNSUPPORTED: &str = super::E_UNSUPPORTED;
 }
 
 pub type CodeResult<T> = Result<T, CodecError>;

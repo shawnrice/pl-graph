@@ -42,7 +42,9 @@ import { graphFromNdjson } from './graph.js';
 const hasLib = nativeReady;
 
 if (!hasLib) {
-  console.warn(`[algo-conformance] skipping: ${NATIVE_LIB} not found — run \`bun run build:rust\`.`);
+  console.warn(
+    `[algo-conformance] skipping: ${NATIVE_LIB} not found — run \`bun run build:rust\`.`,
+  );
 }
 
 const suite = hasLib ? describe : describe.skip;

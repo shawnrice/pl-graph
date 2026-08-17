@@ -60,6 +60,7 @@ dependencies = [
 name = "lenke-engine"
 version = "0.0.0"
 dependencies = [
+ "lenke-codec",
  "regex",
 ]
 
