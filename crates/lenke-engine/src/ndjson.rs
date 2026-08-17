@@ -317,15 +317,33 @@ fn stage_ndjson(text: &str) -> Result<StagedNdjson, String> {
     })
 }
 
-/// Merge an NDJSON document into an EXISTING store with **last-write-wins**
-/// semantics, keyed on external id: a node/edge whose id already exists has its
-/// property values overwritten (new keys added, existing keys replaced); an
-/// unknown id is inserted. Node labels are immutable once created, so only props
-/// update on an existing node. Schema lines (constraints) are applied if present.
-/// Edges are matched by their external `id`; an edge line without an `id` is
-/// always inserted (it has no identity to match).
-pub fn merge_ndjson(store: &mut Store, text: &str) -> Result<(), String> {
+/// What a [`merge_ndjson`] applied vs. skipped — so a caller (the sync demand-fill
+/// path) can surface anything that did not land cleanly. Empty skip/phantom lists
+/// mean a clean merge. Mirrors lenke-core's `MergeReport`.
+#[derive(Default)]
+pub struct MergeReport {
+    pub nodes_added: usize,
+    pub edges_added: usize,
+    /// Batch node ids skipped because the id already existed (first-wins).
+    pub nodes_skipped: Vec<String>,
+    /// Batch edge ids skipped because the explicit id already existed.
+    pub edges_skipped: Vec<String>,
+    /// Endpoint ids an edge referenced that were not declared — created as bare
+    /// vertices (the lenient endpoint policy) and reported.
+    pub phantom_vertices: Vec<String>,
+}
+
+/// Merge an NDJSON document into an EXISTING store with **first-wins** semantics
+/// (matching lenke-core's `ndjson::append`): a node whose id already exists is
+/// SKIPPED (the graph's copy kept) and reported; an edge with an already-present
+/// explicit id is skipped; an undeclared edge endpoint is created as a bare vertex
+/// and reported as a phantom; explicit edge ids are preserved. An id-less edge is
+/// always inserted (it has no identity to dedup on). Schema lines (constraints)
+/// are applied if present. This is the bulk demand-fill path — NOT an upsert; the
+/// keyed upsert is GQL `_MERGE`.
+pub fn merge_ndjson(store: &mut Store, text: &str) -> Result<MergeReport, String> {
     let staged = stage_ndjson(text)?;
+    let mut report = MergeReport::default();
 
     for (label, keys) in &staged.constraints {
         let krefs: Vec<&str> = keys.iter().map(String::as_str).collect();
@@ -335,25 +353,20 @@ pub fn merge_ndjson(store: &mut Store, text: &str) -> Result<(), String> {
         store.create_required_constraint(label, key)?;
     }
 
+    // Nodes first (first-wins), so a same-batch edge can reference one.
     for (ext, labels, props) in &staged.nodes {
-        match store.node_by_ext(ext) {
-            Some(id) => {
-                // Last-wins: overwrite each supplied property value.
-                for (k, v) in props {
-                    store.set_prop(id, k, v.clone());
-                }
-            }
-            None => {
-                let lrefs: Vec<&str> = labels.iter().map(String::as_str).collect();
-                let prefs: Vec<(&str, Value)> =
-                    props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                store.add_node_with_id(&Arc::from(ext.as_str()), &lrefs, &prefs);
-            }
+        if store.node_by_ext(ext).is_some() {
+            report.nodes_skipped.push(ext.clone()); // first-wins: existing kept
+            continue;
         }
+        let lrefs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let prefs: Vec<(&str, Value)> =
+            props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        store.add_node_with_id(&Arc::from(ext.as_str()), &lrefs, &prefs);
+        report.nodes_added += 1;
     }
 
-    // Reverse index (edge external id → eid) over LIVE edges, built once so an
-    // edge upsert is O(1) instead of scanning per merged edge.
+    // Edge external id → eid over live edges, so an explicit-id dedup is O(1).
     let mut ext_to_eid: std::collections::HashMap<Arc<str>, u32> = std::collections::HashMap::new();
     for eid in store.all_edges() {
         if let Some(ext) = store.edge_ext_id(eid) {
@@ -362,19 +375,15 @@ pub fn merge_ndjson(store: &mut Store, text: &str) -> Result<(), String> {
     }
 
     for (from, to, edge_id, labels, props) in &staged.edges {
-        // An edge with a known external id updates in place (last-wins on props).
-        if let Some(id) = edge_id.as_ref().and_then(|e| ext_to_eid.get(e.as_str())) {
-            for (k, v) in props {
-                store.set_edge_prop(*id, k, v.clone());
+        // An edge whose explicit id already exists is a duplicate — drop it.
+        if let Some(id) = edge_id {
+            if ext_to_eid.contains_key(id.as_str()) {
+                report.edges_skipped.push(id.clone());
+                continue;
             }
-            continue;
         }
-        let f = store
-            .node_by_ext(from)
-            .ok_or_else(|| format!("edge references unknown node id {from}"))?;
-        let t = store
-            .node_by_ext(to)
-            .ok_or_else(|| format!("edge references unknown node id {to}"))?;
+        let f = resolve_or_phantom(store, from, &mut report);
+        let t = resolve_or_phantom(store, to, &mut report);
         let etype = &labels[0];
         let eid = match edge_id {
             Some(id) => store.add_edge_with_id(&Arc::from(id.as_str()), f, t, etype),
@@ -390,10 +399,21 @@ pub fn merge_ndjson(store: &mut Store, text: &str) -> Result<(), String> {
         if let Some(e) = edge_id {
             ext_to_eid.insert(Arc::from(e.as_str()), eid);
         }
+        report.edges_added += 1;
     }
     store.rebuild_csr();
     store.rebuild_edge_num();
-    Ok(())
+    Ok(report)
+}
+
+/// An endpoint id → its node, creating a bare vertex (and recording a phantom) for
+/// an undeclared one — the lenient endpoint policy, matching core.
+fn resolve_or_phantom(store: &mut Store, ext: &str, report: &mut MergeReport) -> u32 {
+    if let Some(id) = store.node_by_ext(ext) {
+        return id;
+    }
+    report.phantom_vertices.push(ext.to_string());
+    store.add_node_with_id(&Arc::from(ext), &[], &[])
 }
 
 /// Load a store from NDJSON in the [`to_ndjson`] format. Node lines
@@ -778,45 +798,80 @@ mod tests {
     }
 
     #[test]
-    fn merge_last_wins_on_existing_node() {
+    fn merge_first_wins_on_existing_node() {
         let mut st = from_ndjson(
             "{\"id\":\"1\",\"labels\":[\"P\"],\"props\":{\"n\":\"a\",\"k\":\"keep\"}}\n",
         )
         .unwrap();
-        merge_ndjson(
+        let report = merge_ndjson(
             &mut st,
             "{\"id\":\"1\",\"labels\":[\"P\"],\"props\":{\"n\":\"z\",\"age\":5}}\n",
         )
         .unwrap();
         let id = st.node_by_ext("1").unwrap();
         let v = |x: Value| format!("{x:?}"); // Value is not PartialEq — compare via Debug
-        assert_eq!(v(st.prop(id, "n")), v(s("z"))); // overwritten (last-wins)
-        assert_eq!(v(st.prop(id, "age")), v(Value::Num(5.0))); // new key added
-        assert_eq!(v(st.prop(id, "k")), v(s("keep"))); // untouched key preserved
-        assert_eq!(st.node_count(), 1); // no duplicate node
+                                             // First-wins: the existing node is kept UNCHANGED and reported as skipped.
+        assert_eq!(
+            v(st.prop(id, "n")),
+            v(s("a")),
+            "existing kept, not overwritten"
+        );
+        assert_eq!(
+            v(st.prop(id, "age")),
+            v(Value::Null),
+            "no new key merged in"
+        );
+        assert_eq!(v(st.prop(id, "k")), v(s("keep")));
+        assert_eq!(st.node_count(), 1);
+        assert_eq!(report.nodes_skipped, vec!["1"]);
+        assert_eq!(report.nodes_added, 0);
     }
 
     #[test]
-    fn merge_adds_unknown_node_and_upserts_edge_by_id() {
+    fn merge_adds_unknown_node_and_skips_edge_by_id() {
         let mut st = from_ndjson(
             "{\"id\":\"1\",\"labels\":[\"P\"],\"props\":{}}\n\
              {\"id\":\"2\",\"labels\":[\"P\"],\"props\":{}}\n\
              {\"from\":\"1\",\"to\":\"2\",\"id\":\"e0\",\"type\":\"R\",\"props\":{\"w\":1}}\n",
         )
         .unwrap();
-        merge_ndjson(
+        let report = merge_ndjson(
             &mut st,
             "{\"id\":\"3\",\"labels\":[\"P\"],\"props\":{}}\n\
              {\"from\":\"1\",\"to\":\"2\",\"id\":\"e0\",\"type\":\"R\",\"props\":{\"w\":9}}\n",
         )
         .unwrap();
-        assert_eq!(st.node_count(), 3); // node 3 inserted
-        assert_eq!(st.edge_count(), 1); // e0 upserted in place, not duplicated
+        assert_eq!(st.node_count(), 3, "node 3 inserted");
+        assert_eq!(
+            st.edge_count(),
+            1,
+            "e0 skipped (first-wins), not duplicated"
+        );
         let eid = st.all_edges()[0];
+        // First-wins: the existing edge's property is kept.
         assert_eq!(
             format!("{:?}", st.edge_prop(eid, "w")),
-            format!("{:?}", Value::Num(9.0))
+            format!("{:?}", Value::Num(1.0))
         );
+        assert_eq!(report.nodes_added, 1);
+        assert_eq!(report.edges_skipped, vec!["e0"]);
+    }
+
+    #[test]
+    fn merge_auto_creates_a_phantom_endpoint() {
+        // An edge to an undeclared node creates a bare vertex + reports it.
+        let mut st = from_ndjson("{\"id\":\"1\",\"labels\":[\"P\"],\"props\":{}}\n").unwrap();
+        let report = merge_ndjson(
+            &mut st,
+            "{\"from\":\"1\",\"to\":\"ghost\",\"type\":\"R\",\"props\":{}}\n",
+        )
+        .unwrap();
+        assert!(
+            st.node_by_ext("ghost").is_some(),
+            "phantom endpoint created"
+        );
+        assert_eq!(report.phantom_vertices, vec!["ghost"]);
+        assert_eq!(report.edges_added, 1);
     }
 
     /// A required constraint survives a snapshot round trip: it dumps a schema

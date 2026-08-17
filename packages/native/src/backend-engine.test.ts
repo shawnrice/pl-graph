@@ -129,6 +129,29 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
       be.graphFree(g);
     });
 
+    test('mergeNdjson is first-wins and reports skips + phantoms', async () => {
+      const be = await make();
+      const g = be.graphFromNdjson(NDJSON, false); // nodes "1","2"
+      const report = be.mergeNdjson(
+        g,
+        enc.encode(
+          // a fresh node, a colliding id (skipped), and an edge to an undeclared node
+          '{"id":"3","labels":["P"],"props":{"name":"cara"}}\n' +
+            '{"id":"1","labels":["P"],"props":{"name":"OVERWRITE?"}}\n' +
+            '{"from":"3","to":"ghost","type":"KNOWS","props":{}}\n',
+        ),
+      );
+      expect(report.nodesAdded).toBe(1); // node 3
+      expect(report.nodesSkipped).toEqual(['1']); // first-wins: existing kept
+      expect(report.phantomVertices).toEqual(['ghost']);
+      // The colliding node was NOT overwritten (first-wins).
+      const name = rows(
+        be.queryRows(g, "MATCH (n:P) WHERE n.name = 'alice' RETURN count(*) AS c"),
+      ).rows;
+      expect(name).toEqual([[1]]);
+      be.graphFree(g);
+    });
+
     test('an unknown serialization format is reported', async () => {
       const be = await make();
       const g = be.graphFromNdjson(NDJSON, false);

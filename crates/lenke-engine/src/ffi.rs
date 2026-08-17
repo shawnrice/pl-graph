@@ -741,20 +741,27 @@ pub unsafe extern "C" fn lnk_command(
             // SAFETY: out_len is writable per this fn's contract.
             unsafe { out_string(store.last_write_scope_json(scope_key), out_len) }
         }
-        // Merge an NDJSON document into this store, last-write-wins by external id.
-        // Input is the NDJSON text; output the post-merge `{"nodes":N,"edges":M}`.
+        // First-wins bulk merge of an NDJSON document (matching core). Input is the
+        // NDJSON text; output the `MergeReport`
+        // `{"nodesAdded","edgesAdded","nodesSkipped":[…],"edgesSkipped":[…],"phantomVertices":[…]}`.
         "merge" => {
             let Some(text) = input else {
                 crate::ffi_error::set("E_FFI", "merge requires an NDJSON payload as input");
                 return std::ptr::null_mut();
             };
             match crate::ndjson::merge_ndjson(store, text) {
-                Ok(()) => {
-                    let json = format!(
-                        "{{\"nodes\":{},\"edges\":{}}}",
-                        store.node_count(),
-                        store.edge_count()
-                    );
+                Ok(report) => {
+                    let mut json = String::new();
+                    json.push_str(&format!(
+                        "{{\"nodesAdded\":{},\"edgesAdded\":{},\"nodesSkipped\":",
+                        report.nodes_added, report.edges_added
+                    ));
+                    crate::ndjson::encode_str_array(&mut json, &report.nodes_skipped);
+                    json.push_str(",\"edgesSkipped\":");
+                    crate::ndjson::encode_str_array(&mut json, &report.edges_skipped);
+                    json.push_str(",\"phantomVertices\":");
+                    crate::ndjson::encode_str_array(&mut json, &report.phantom_vertices);
+                    json.push('}');
                     // SAFETY: out_len is writable per this fn's contract.
                     unsafe { out_string(json, out_len) }
                 }

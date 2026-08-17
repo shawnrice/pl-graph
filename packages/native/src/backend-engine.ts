@@ -265,21 +265,10 @@ export const buildEngineBackend = (abi: EngineAbi): Backend => {
     abiVersion: abi.abiVersion,
 
     graphFromNdjson: (bytes) => abi.open(bytes, FMT_NDJSON),
-    mergeNdjson: (handle, bytes): MergeReport => {
-      // The engine merge is LAST-WINS by external id and returns post-merge totals,
-      // so it cannot report the first-wins skip/phantom lists the core merge does.
-      // Added counts are computed as deltas; the skip lists are empty.
-      const before = { n: abi.stat(handle, STAT_VERTEX), e: abi.stat(handle, STAT_EDGE) };
-      const out = parseJson<{ nodes: number; edges: number }>(abi.command(handle, 'merge', bytes));
-
-      return {
-        nodesAdded: out.nodes - before.n,
-        edgesAdded: out.edges - before.e,
-        nodesSkipped: [],
-        edgesSkipped: [],
-        phantomVertices: [],
-      };
-    },
+    mergeNdjson: (handle, bytes): MergeReport =>
+      // First-wins bulk merge (matching core): the engine returns the full report
+      // (added counts + skipped ids + phantom endpoints) directly.
+      parseJson<MergeReport>(abi.command(handle, 'merge', bytes)),
     graphClone: (handle) => abi.clone(handle),
     graphFree: (handle) => abi.close(handle),
 

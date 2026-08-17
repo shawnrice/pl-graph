@@ -172,15 +172,15 @@ prepared statement) are returned as an integer id into a `Store`-side slab and
 passed back in later commands — so even handle-based features add no pointer-typed
 exports.
 
-| `name`             | input                    | output                 | status                     |
-| ------------------ | ------------------------ | ---------------------- | -------------------------- |
-| `last_write_scope` | scope-key name (raw str) | `{scopes:[…], open:b}` | **wired** (CDC)            |
-| `epoch`            | token name (raw str)     | `{epoch:N}`            | **wired** (per-token)      |
-| `merge`            | NDJSON text (raw)        | `{nodes:N, edges:M}`   | **wired** (last-wins)      |
-| `prepare`          | query text (raw str)     | `{handle:"<ptr>"}`     | **wired** (prepared stmts) |
-| `prepared_run`     | `{handle, params, format?}` | `{columns, rows}` / Arrow | **wired** (JSON + Arrow) |
-| `prepared_free`    | `{handle}`               | `{}`                   | **wired** (prepared stmts) |
-| `algo`             | `{name, config}`         | `{columns, rows}`      | **wired** (also via CALL)  |
+| `name`             | input                       | output                                | status                     |
+| ------------------ | --------------------------- | ------------------------------------- | -------------------------- |
+| `last_write_scope` | scope-key name (raw str)    | `{scopes:[…], open:b}`                | **wired** (CDC)            |
+| `epoch`            | token name (raw str)        | `{epoch:N}`                           | **wired** (per-token)      |
+| `merge`            | NDJSON text (raw)           | `MergeReport` (added/skipped/phantom) | **wired** (first-wins)     |
+| `prepare`          | query text (raw str)        | `{handle:"<ptr>"}`                    | **wired** (prepared stmts) |
+| `prepared_run`     | `{handle, params, format?}` | `{columns, rows}` / Arrow             | **wired** (JSON + Arrow)   |
+| `prepared_free`    | `{handle}`                  | `{}`                                  | **wired** (prepared stmts) |
+| `algo`             | `{name, config}`            | `{columns, rows}`                     | **wired** (also via CALL)  |
 
 `prepared_run` takes an optional `format` (`json` default, `arrow`, `arrow_ipc`),
 so a prepared statement has the same output surface as `lnk_query`. `algo` runs a
@@ -251,7 +251,7 @@ empty + **binary**), `close`, `clone` (deep copy), `config`, `stat` (counts **an
 version**), `query` (GQL + Gremlin JSON; GQL params; **Arrow** raw + IPC, formats
 1/2), `tx`, `encode` (NDJSON + **binary**), `schema_apply` + `schema_dump`, and
 `lnk_command` for `last_write_scope` (CDC), `epoch` (per-token), and `merge`
-(last-wins). The binary snapshot ([`src/binary.rs`](../src/binary.rs)) is the
+(first-wins bulk fill, matching core). The binary snapshot ([`src/binary.rs`](../src/binary.rs)) is the
 engine's own versioned format (`LNKB` magic + `u16` version header, so a future
 bump is recognized not mis-decoded) for compact/fast browser-local persistence;
 it funnels decode through the shared `build_store`, so fidelity matches NDJSON.
