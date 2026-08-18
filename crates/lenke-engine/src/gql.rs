@@ -5812,6 +5812,298 @@ mod tests {
         Value::Num(x)
     }
 
+    /// Run a GQL write through the same path real usage does (optimize then execute).
+    #[cfg(test)]
+    fn exec_gql(st: &mut Store, sql: &str) {
+        let p = crate::opt::optimize_indexed(super::parse(sql).unwrap(), st);
+        crate::exec::execute(&p, st).unwrap();
+    }
+
+    /// The three property states — present-value / present-null / absent — must stay
+    /// distinguishable, read correctly, and survive transitions. Pins the semantics for
+    /// the typed-column `nulls` bit: `has_prop` distinguishes present-null (true) from
+    /// absent (false); both read NULL; a value written over a null restores it; REMOVE of
+    /// a present-null makes it absent.
+    #[test]
+    fn present_null_tristate_and_transitions() {
+        let mut st = Builder::default().build();
+        exec_gql(
+            &mut st,
+            "INSERT (:P {id:'v', age: 10}), (:P {id:'z', age: 20}), (:P {id:'a', age: 30})",
+        );
+        exec_gql(&mut st, "MATCH (n:P {id:'z'}) SET n.age = null"); // z: present-null
+        exec_gql(&mut st, "MATCH (n:P {id:'a'}) REMOVE n.age"); // a: absent
+                                                                // ids by creation order: v=0, z=1, a=2.
+        assert!(st.has_prop(0, "age"));
+        assert!(matches!(st.prop(0, "age"), Value::Num(x) if x == 10.0));
+        assert!(st.has_prop(1, "age"), "present-null IS present");
+        assert!(st.prop(1, "age").is_null(), "present-null reads NULL");
+        assert!(!st.has_prop(2, "age"), "REMOVEd is absent");
+        assert!(st.prop(2, "age").is_null());
+
+        // A real value written over a present-null restores both value and presence.
+        exec_gql(&mut st, "MATCH (n:P {id:'z'}) SET n.age = 99");
+        assert!(st.has_prop(1, "age"));
+        assert!(matches!(st.prop(1, "age"), Value::Num(x) if x == 99.0));
+        // REMOVE of a (re-nulled) present-null yields absent, distinct from the stored null.
+        exec_gql(&mut st, "MATCH (n:P {id:'z'}) SET n.age = null");
+        assert!(st.has_prop(1, "age"));
+        exec_gql(&mut st, "MATCH (n:P {id:'z'}) REMOVE n.age");
+        assert!(!st.has_prop(1, "age"), "REMOVE of a present-null -> absent");
+    }
+
+    /// A present-null must survive an NDJSON round-trip AS a present-null — not collapse
+    /// to absent (which would silently turn `has('k')` false). The distinct-from-absent
+    /// invariant has to hold through serialization, whatever column form backs it.
+    #[test]
+    fn present_null_survives_ndjson_roundtrip() {
+        let mut st = Builder::default().build();
+        exec_gql(
+            &mut st,
+            "INSERT (:P {id:'v', age: 10}), (:P {id:'z', age: 20}), (:P {id:'a', age: 30})",
+        );
+        exec_gql(&mut st, "MATCH (n:P {id:'z'}) SET n.age = null"); // present-null
+        exec_gql(&mut st, "MATCH (n:P {id:'a'}) REMOVE n.age"); // absent
+
+        let nd = crate::ndjson::to_ndjson(&st);
+        // The present-null serializes as an explicit null; the absent node omits `age`.
+        assert!(
+            nd.contains("\"age\":null"),
+            "present-null emits an explicit null: {nd}"
+        );
+        let st2 = crate::ndjson::from_ndjson(&nd).unwrap();
+        // Dense ids are assigned in file order, which `to_ndjson` emits in id order.
+        assert!(matches!(st2.prop(0, "age"), Value::Num(x) if x == 10.0));
+        assert!(
+            st2.has_prop(1, "age") && st2.prop(1, "age").is_null(),
+            "present-null round-trips as a present null, not absent"
+        );
+        assert!(!st2.has_prop(2, "age"), "absent round-trips as absent");
+    }
+
+    /// Rollback restores the exact state a `SET k = null` overwrote — the value AND its
+    /// presence come back. And rolling back a `SET value` over a present-null restores the
+    /// null. The undo log must treat the null write like any other cell write.
+    #[test]
+    fn present_null_survives_rollback() {
+        let mut st = Builder::default().build();
+        exec_gql(&mut st, "INSERT (:P {id:'v', age: 10})"); // node 0, present value
+
+        st.begin();
+        st.set_prop(0, "age", Value::Null); // present-null inside the txn
+        assert!(st.prop(0, "age").is_null());
+        st.rollback();
+        assert!(
+            matches!(st.prop(0, "age"), Value::Num(x) if x == 10.0),
+            "rollback restores the value a SET null overwrote"
+        );
+
+        // The reverse: a present-null, then SET a value, rolled back -> the null returns.
+        st.set_prop(0, "age", Value::Null);
+        assert!(st.has_prop(0, "age") && st.prop(0, "age").is_null());
+        st.begin();
+        st.set_prop(0, "age", Value::Num(7.0));
+        st.rollback();
+        assert!(
+            st.has_prop(0, "age") && st.prop(0, "age").is_null(),
+            "rollback restores a present null"
+        );
+    }
+
+    /// A present-null interacts with constraints like core: a REQUIRED key must be
+    /// present AND non-null, so `SET k = null` on it is rejected (a present-null is not a
+    /// value); a UNIQUE key EXEMPTS nulls, so two present-nulls don't collide. Verifies
+    /// the write-path enforcement end to end.
+    #[test]
+    fn present_null_and_constraints() {
+        let try_gql = |st: &mut Store, sql: &str| -> Result<(), String> {
+            let p = crate::opt::optimize_indexed(super::parse(sql).unwrap(), st);
+            crate::exec::execute(&p, st).map(|_| ())
+        };
+
+        // REQUIRED: setting the key to null is rejected; the prior value is rolled back.
+        let mut st = Builder::default().build();
+        exec_gql(&mut st, "INSERT (:User {id:'a', email: 'a@x'})");
+        st.create_required_constraint("User", "email").unwrap();
+        assert!(
+            try_gql(&mut st, "MATCH (n:User {id:'a'}) SET n.email = null").is_err(),
+            "SET a required key to null must be rejected (present-null is not 'present, non-null')"
+        );
+        assert!(
+            matches!(st.prop(0, "email"), Value::Str(v) if &*v == "a@x"),
+            "the rejected write rolled back — the value survives"
+        );
+
+        // UNIQUE: nulls are exempt — two present-nulls under a unique key are allowed.
+        let mut st2 = Builder::default().build();
+        exec_gql(
+            &mut st2,
+            "INSERT (:U {id:'b', k: 'v1'}), (:U {id:'c', k: 'v2'})",
+        );
+        st2.create_unique_constraint("U", &["k"]).unwrap();
+        assert!(try_gql(&mut st2, "MATCH (n:U {id:'b'}) SET n.k = null").is_ok());
+        assert!(
+            try_gql(&mut st2, "MATCH (n:U {id:'c'}) SET n.k = null").is_ok(),
+            "two present-nulls do NOT violate a unique constraint (nulls exempt)"
+        );
+    }
+
+    /// Characterization of PRESENT-NULL semantics — the executable spec a future
+    /// typed-column `nulls` bitset must preserve. Today a stored null forces the column
+    /// to `Gen` (the correct oracle); every assertion here must STILL hold once a null
+    /// keeps the column typed. The landmine these guard against: a typed fast-path that
+    /// reads `data[i]` when `present[i]` — without checking the null bit — would surface
+    /// the placeholder (0.0), so `min`/`= 0`/`count` would silently go wrong.
+    #[test]
+    fn present_null_semantics_characterization() {
+        use crate::exec::execute;
+        let q = |st: &mut Store, sql: &str| {
+            let p = crate::opt::optimize_indexed(super::parse(sql).unwrap(), st);
+            execute(&p, st).unwrap();
+        };
+        let mut st = Builder::default().build();
+        // ids 0..3 by creation order: a=0 b=1 c=2 d=3.
+        q(
+            &mut st,
+            "INSERT (:P {id:'a', age: 10}), (:P {id:'b', age: 20}), (:P {id:'c', age: 99}), (:P {id:'d', age: 0})",
+        );
+        q(&mut st, "MATCH (n:P {id:'c'}) SET n.age = null"); // c: PRESENT null
+        q(&mut st, "MATCH (n:P {id:'d'}) REMOVE n.age"); // d: ABSENT
+
+        // --- presence: present-null IS present and distinct from absent ---
+        assert!(
+            st.has_prop(2, "age"),
+            "a stored null is PRESENT (has('age') true)"
+        );
+        assert!(!st.has_prop(3, "age"), "a REMOVEd value is ABSENT");
+        assert!(
+            st.prop(2, "age").is_null(),
+            "present-null reads NULL, not 99/0"
+        );
+        assert!(st.prop(3, "age").is_null(), "absent reads NULL");
+
+        // --- query results: a present-null must NOT surface the placeholder 0.0 ---
+        let one = |st: &Store, sql: &str| -> f64 {
+            let p = crate::opt::optimize_indexed(super::parse(sql).unwrap(), st);
+            match &run(&p, st).rows[0][0] {
+                Value::Num(x) => *x,
+                other => panic!("expected a number, got {other:?} for `{sql}`"),
+            }
+        };
+        // count(expr) skips BOTH present-null and absent → only a,b.
+        assert_eq!(one(&st, "MATCH (n:P) RETURN count(n.age) AS c"), 2.0);
+        assert_eq!(one(&st, "MATCH (n:P) RETURN count(*) AS c"), 4.0);
+        // min/sum skip nulls: min is 10, NOT 0 (the placeholder). This is THE leak catcher.
+        assert_eq!(one(&st, "MATCH (n:P) RETURN min(n.age) AS m"), 10.0);
+        assert_eq!(one(&st, "MATCH (n:P) RETURN sum(n.age) AS s"), 30.0);
+        // equality against the placeholder value must NOT match a present-null.
+        assert_eq!(
+            one(&st, "MATCH (n:P) WHERE n.age = 0 RETURN count(*) AS c"),
+            0.0
+        );
+        // IS NULL is true for BOTH present-null and absent (3VL); IS NOT NULL neither.
+        assert_eq!(
+            one(&st, "MATCH (n:P) WHERE n.age IS NULL RETURN count(*) AS c"),
+            2.0
+        );
+        assert_eq!(
+            one(
+                &st,
+                "MATCH (n:P) WHERE n.age IS NOT NULL RETURN count(*) AS c"
+            ),
+            2.0
+        );
+
+        // --- an index seek must also exclude the present-null (not seek it under 0) ---
+        st.create_index("age");
+        let idx_plan = crate::opt::optimize_indexed(
+            super::parse("MATCH (n:P) WHERE n.age = 0 RETURN count(*) AS c").unwrap(),
+            &st,
+        );
+        match &run(&idx_plan, &st).rows[0][0] {
+            Value::Num(x) => assert_eq!(*x, 0.0, "indexed `= 0` must not return a present-null"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The typed-vs-`Gen` EQUIVALENCE harness — the centerpiece guard for any change to
+    /// how a typed column stores values (e.g. adding a `nulls` bit). `Gen` is the boxed,
+    /// always-correct oracle; a typed column carrying the SAME values must produce
+    /// identical results under EVERY query shape. Running the battery below over a
+    /// column and its `force_gen` twin catches any typed fast-path (vectorized filter,
+    /// index seek, aggregate, string search, group/distinct) that reads a value wrong —
+    /// exactly the class of bug a mishandled null bit would introduce. Extend the fixture
+    /// with `SET k = null` once the typed column can hold a present null.
+    #[test]
+    fn typed_and_gen_columns_agree() {
+        use crate::exec::execute;
+        let exec_gql = |st: &mut Store, sql: &str| {
+            let p = crate::opt::optimize_indexed(super::parse(sql).unwrap(), st);
+            execute(&p, st).unwrap();
+        };
+        let build = |exec_gql: &dyn Fn(&mut Store, &str)| -> Store {
+            let mut st = Builder::default().build();
+            exec_gql(
+                &mut st,
+                "INSERT (:P {id:'a', age: 10, city:'oslo', vip: true}), \
+                 (:P {id:'b', age: 20, city:'bergen', vip: false}), \
+                 (:P {id:'c', age: 30, city:'oslo', vip: true}), \
+                 (:P {id:'d', age: 20, city:'oslo', vip: false})",
+            );
+            // A STORED PRESENT NULL on each typed column — with the `nulls` side map the
+            // column stays typed, so the typed-vs-Gen agreement must hold WITH nulls in
+            // the mix (a present-null reads NULL, is skipped by aggregates, doesn't match
+            // a value, but IS present for `PROPERTY_EXISTS`).
+            exec_gql(&mut st, "MATCH (n:P {id:'c'}) SET n.age = null");
+            exec_gql(&mut st, "MATCH (n:P {id:'b'}) SET n.city = null");
+            exec_gql(&mut st, "MATCH (n:P {id:'d'}) SET n.vip = null");
+            st.create_index("age");
+            st.create_index("city");
+            st
+        };
+        // One query per typed read fast-path the change could break.
+        let queries = [
+            "MATCH (n:P) RETURN n.age AS x, n.id AS t ORDER BY x, t", // materialize + order
+            "MATCH (n:P) WHERE n.age > 15 RETURN n.id AS x ORDER BY x", // vectorized compare
+            "MATCH (n:P) WHERE n.age = 20 RETURN n.id AS x ORDER BY x", // numeric index seek
+            "MATCH (n:P) WHERE n.city = 'oslo' RETURN n.id AS x ORDER BY x", // string index seek
+            "MATCH (n:P) WHERE n.city STARTS WITH 'os' RETURN n.id AS x ORDER BY x", // string search
+            "MATCH (n:P) WHERE n.vip = true RETURN n.id AS x ORDER BY x", // bool
+            "MATCH (n:P) RETURN min(n.age) AS a, max(n.age) AS b, sum(n.age) AS c, count(n.age) AS d",
+            "MATCH (n:P) RETURN n.city AS x, count(*) AS c GROUP BY n.city ORDER BY x", // group by
+            "MATCH (n:P) RETURN DISTINCT n.age AS x ORDER BY x", // distinct
+            "MATCH (n:P) WHERE n.age IS NULL RETURN n.id AS x ORDER BY x", // present-null + absent
+            "MATCH (n:P) WHERE PROPERTY_EXISTS(n, age) RETURN n.id AS x ORDER BY x", // presence
+        ];
+        for keys in [
+            &["age"][..],
+            &["city"][..],
+            &["vip"][..],
+            &["age", "city", "vip"][..],
+        ] {
+            let typed = build(&exec_gql);
+            let mut boxed = build(&exec_gql);
+            for k in keys {
+                boxed.force_gen(k);
+            }
+            let repr = |r: &Rows| -> Vec<Vec<String>> {
+                r.rows
+                    .iter()
+                    .map(|row| row.iter().map(|c| format!("{c:?}")).collect())
+                    .collect()
+            };
+            for query in queries {
+                let tp = crate::opt::optimize_indexed(super::parse(query).unwrap(), &typed);
+                let bp = crate::opt::optimize_indexed(super::parse(query).unwrap(), &boxed);
+                assert_eq!(
+                    repr(&run(&tp, &typed)),
+                    repr(&run(&bp, &boxed)),
+                    "typed vs Gen diverged on `{query}` (Gen-forced keys: {keys:?})"
+                );
+            }
+        }
+    }
+
     fn social() -> Store {
         let mut b = Builder::default();
         let a = b.node(&["Person"], &[("name", s("alice")), ("age", n(30.0))]);

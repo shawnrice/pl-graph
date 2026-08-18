@@ -8,7 +8,7 @@
 //! than retrofitted.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::value::Value;
@@ -871,6 +871,14 @@ pub struct Store {
     by_label: HashMap<String, Vec<u32>>,
     /// property name -> its typed column (length == node_count).
     props: HashMap<String, Column>,
+    /// Node ids carrying a STORED PRESENT NULL per property key — a `SET k = null`,
+    /// distinct from an absent key. Keeping it here (rather than as a typed-column value)
+    /// means a null NEVER de-opts a typed column to `Gen`: the column keeps the node's
+    /// slot absent, and this side map records that the absence is a *present* null. Only
+    /// `has_prop`/`PropertyExists` consult it (present-null and absent both READ null), so
+    /// the column read fast paths are untouched. Empty for the overwhelming null-free
+    /// majority; a key with no present-nulls holds no entry.
+    present_nulls: HashMap<String, crate::exec::fnv::Set<u32>>,
     /// Cached SORTED property-key list for element-map materialization. Property keys
     /// are only ever ADDED to `props` (a removed value keeps its column), so `props.len()`
     /// changing is exactly the key SET changing — the cache self-invalidates on a length
@@ -1007,6 +1015,13 @@ pub struct Store {
     csr_in_off: Vec<u32>,
     csr_in: Vec<Adj>,
     csr_fresh: bool,
+    /// When true, `rebuild_csr` is a no-op and the overlay stays stale, so every
+    /// adjacency read falls back to the per-node `Vec`s — i.e. the engine runs WITHOUT
+    /// the CSR cache. A measurement knob (see the `cache_is_never_a_net_loss` guard): it
+    /// lets a test time the SAME workload with and without the cache to prove the caching
+    /// machinery never costs more than not having it. Not exposed on the public/FFI
+    /// surface; defaults to false (cache on).
+    csr_disabled: bool,
     /// PER-TYPE CSR partition of the adjacency, indexed by etype id: `csr_out_typed[t]`
     /// is `(off, adj)` where node `v`'s type-`t` OUT edges are `adj[off[v]..off[v+1]]`,
     /// in the SAME order as they appear in `out_adj[v]` (so a single-type hop iterates a
@@ -1055,6 +1070,7 @@ impl Clone for Store {
             limits: self.limits,
             by_label: self.by_label.clone(),
             props: self.props.clone(),
+            present_nulls: self.present_nulls.clone(),
             prop_keys_cache: std::sync::RwLock::new(
                 self.prop_keys_cache
                     .read()
@@ -1104,6 +1120,7 @@ impl Clone for Store {
             csr_in_off: self.csr_in_off.clone(),
             csr_in: self.csr_in.clone(),
             csr_fresh: self.csr_fresh,
+            csr_disabled: self.csr_disabled,
             csr_out_typed: self.csr_out_typed.clone(),
             csr_in_typed: self.csr_in_typed.clone(),
             edge_num: self.edge_num.clone(),
@@ -1279,6 +1296,12 @@ impl Store {
     /// — called once after a load, and on demand after a batch of writes. Marks the
     /// overlay fresh, so subsequent `out`/`inc` use the contiguous arrays.
     pub fn rebuild_csr(&mut self) {
+        // Cache disabled (a measurement mode): leave the overlay stale so every read
+        // falls back to the per-node `Vec`s — the engine's behaviour WITHOUT the CSR.
+        if self.csr_disabled {
+            self.csr_fresh = false;
+            return;
+        }
         let n = self.out_adj.len();
         self.csr_out_off.clear();
         self.csr_out.clear();
@@ -1323,6 +1346,34 @@ impl Store {
         self.csr_out_typed = build_typed(&self.out_adj);
         self.csr_in_typed = build_typed(&self.in_adj);
         self.csr_fresh = true;
+    }
+
+    /// Turn the CSR adjacency cache on or off (a measurement knob — see the
+    /// `cache_is_never_a_net_loss` guard). Disabling drops the overlay so every read uses
+    /// the per-node `Vec`s; enabling rebuilds it. Test-only: not a public/FFI setting.
+    #[cfg(test)]
+    pub(crate) fn set_csr_enabled(&mut self, on: bool) {
+        self.csr_disabled = !on;
+        if on {
+            self.rebuild_csr();
+        } else {
+            self.csr_fresh = false;
+        }
+    }
+
+    /// Force property `key`'s column to the boxed `Gen` representation, preserving every
+    /// present value. Test-only reference oracle: `Gen` is the always-correct slow path,
+    /// so a typed column and its `force_gen` twin must give byte-identical query results.
+    /// The equivalence harness (`typed_and_gen_columns_agree`) runs a query battery over
+    /// both — the single check that catches a typed fast-path mishandling a value (e.g. a
+    /// future `nulls` bit surfacing the placeholder instead of NULL).
+    #[cfg(test)]
+    pub(crate) fn force_gen(&mut self, key: &str) {
+        if let Some(col) = self.props.get_mut(key) {
+            if !matches!(col, Column::Gen { .. }) {
+                *col = col.to_gen();
+            }
+        }
     }
 
     /// Node `v`'s OUT edges of type `etype`, a contiguous slice in out_adj order — the
@@ -1747,8 +1798,14 @@ impl Store {
     }
 
     fn check_label_unique(&self, label: &str, keys: &[String]) -> Result<(), String> {
-        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut seen: crate::exec::fnv::Set<Vec<u8>> = crate::exec::fnv::Set::default();
         for &id in self.nodes_with_label(label) {
+            // A tuple with ANY non-indexable value (null/list/record) is EXEMPT (SQL/core
+            // semantics: `null != null`), so it never collides — including two stored
+            // present-nulls. Matches the edge-unique check. Skip it entirely.
+            if keys.iter().any(|k| !is_indexable(&self.prop(id, k))) {
+                continue;
+            }
             let mut buf = Vec::new();
             for k in keys {
                 crate::value::group_key_into(&self.prop(id, k), &mut buf);
@@ -1766,8 +1823,9 @@ impl Store {
     // --- Required-property constraints ------------------------------------
     //
     // A required constraint declares that every live node with `label` carries a
-    // PRESENT value for `key` (present-null counts — only absence violates).
-    // Enforced by the write statements after a mutation, like `unique`.
+    // PRESENT, NON-NULL value for `key` — both an absent key and a stored present-null
+    // violate (core's rule). Enforced by the write statements after a mutation, like
+    // `unique`.
 
     /// The declared required constraints as `(label, key)` — for snapshot/schema.
     #[must_use]
@@ -1797,7 +1855,10 @@ impl Store {
 
     fn check_label_required(&self, label: &str, key: &str) -> Result<(), String> {
         for &id in self.nodes_with_label(label) {
-            if !self.has_prop(id, key) {
+            // A required value must be PRESENT and NON-NULL (core's rule). `prop` reads
+            // NULL for both an absent key AND a stored present-null, so this rejects both
+            // — a `SET k = null` no longer slips past a required constraint.
+            if self.prop(id, key).is_null() {
                 return Err(format!(
                     "E_REQUIRED: required constraint on {label}({key}) violated"
                 ));
@@ -1916,7 +1977,7 @@ impl Store {
     }
 
     fn check_etype_unique(&self, etype: &str, keys: &[String]) -> Result<(), String> {
-        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut seen: crate::exec::fnv::Set<Vec<u8>> = crate::exec::fnv::Set::default();
         for eid in self.edges_of_type(etype) {
             let vals: Vec<Value> = keys.iter().map(|k| self.edge_prop(eid, k)).collect();
             // A null/list/record value is exempt (not part of the uniqueness set).
@@ -1966,7 +2027,9 @@ impl Store {
 
     fn check_etype_required(&self, etype: &str, key: &str) -> Result<(), String> {
         for eid in self.edges_of_type(etype) {
-            if !self.has_edge_prop(eid, key) {
+            // Present AND non-null (core's rule): `edge_prop` reads NULL for an absent key
+            // and for a stored present-null, so both violate.
+            if self.edge_prop(eid, key).is_null() {
                 return Err(format!(
                     "E_REQUIRED: edge required constraint on {etype}({key}) violated"
                 ));
@@ -2636,9 +2699,22 @@ impl Store {
     /// present `Null`, which `prop` cannot tell from absence).
     #[must_use]
     pub fn has_prop(&self, node: u32, key: &str) -> bool {
+        // Present iff the column holds a value OR the node carries a stored present-null.
         self.props
             .get(key)
             .is_some_and(|c| c.present_at(node as usize))
+            || self
+                .present_nulls
+                .get(key)
+                .is_some_and(|set| set.contains(&node))
+    }
+
+    /// The set of node ids carrying a stored present-null for `key`, or `None` if none —
+    /// so a presence-filter hot loop can fetch it ONCE and test `contains` per row
+    /// alongside the column's `present_at` (see the `PropertyExists` filter fast path).
+    #[must_use]
+    pub fn present_null_set(&self, key: &str) -> Option<&crate::exec::fnv::Set<u32>> {
+        self.present_nulls.get(key).filter(|s| !s.is_empty())
     }
 
     /// Set node `node`'s `key` to `value`, creating the column if new and
@@ -2662,13 +2738,46 @@ impl Store {
         });
     }
 
+    /// The value stored in the node's typed/`Gen` COLUMN (ignoring the present-null side
+    /// map) — the value that participates in the property indexes. `None` when the column
+    /// slot is absent (including a present-null, which lives in the side map, not the
+    /// column, and is deliberately NOT seek-indexed).
+    fn column_value(&self, node: u32, key: &str) -> Option<Value> {
+        self.props
+            .get(key)
+            .and_then(|c| c.present_at(node as usize).then(|| c.read(node as usize)))
+    }
+
     fn apply_set_prop(&mut self, node: u32, key: &str, value: Value) {
-        // Index upkeep: capture the OLD base value before writing, and a copy of
-        // the new one (reads first, then the column write, then the index writes —
-        // distinct fields, no borrow clash). A hash index may be dotted, so it is
-        // keyed by the BASE property `key`; the range index is single-key.
+        // A STORED PRESENT NULL never touches a typed column: clear any typed value (and
+        // its index entry), then record the node in the side map. This is what makes
+        // `SET k = null` non-de-opting — the column stays typed. `apply_remove_prop`
+        // already drops the side-map entry, so re-insert after.
+        if matches!(value, Value::Null) {
+            self.apply_remove_prop(node, key);
+            // Keep the key in `props` (an all-absent column if brand-new) so key
+            // enumeration — `prop_keys`, element maps, NDJSON — still sees a key that so
+            // far has ONLY present-nulls. A pre-existing typed column is left untouched
+            // (the node's slot just stays absent), which is the whole point: no de-opt.
+            let n = self.node_count;
+            self.props
+                .entry(key.to_string())
+                .or_insert_with(|| Column::new_absent(&Value::Null, n));
+            self.present_nulls
+                .entry(key.to_string())
+                .or_default()
+                .insert(node);
+            return;
+        }
+        // A real value overwrites any prior present-null for this node.
+        if let Some(set) = self.present_nulls.get_mut(key) {
+            set.remove(&node);
+        }
+        // Index upkeep: capture the OLD base value (from the COLUMN — a present-null was
+        // never indexed) before writing, and a copy of the new one. A hash index may be
+        // dotted, so it is keyed by the BASE property `key`; the range index is single-key.
         let care = self.index_on_base(key) || self.is_range_indexed(key);
-        let old = (care && self.has_prop(node, key)).then(|| self.prop(node, key));
+        let old = care.then(|| self.column_value(node, key)).flatten();
         let new_for_index = care.then(|| value.clone());
 
         let n = self.node_count;
@@ -2714,10 +2823,16 @@ impl Store {
     }
 
     fn apply_remove_prop(&mut self, node: u32, key: &str) {
-        // Drop the node from the index(es) for its OLD value, if indexed.
+        // A REMOVE makes the key ABSENT — drop a present-null too, so it is distinct from
+        // a stored null (which `has('k')` still sees).
+        if let Some(set) = self.present_nulls.get_mut(key) {
+            set.remove(&node);
+        }
+        // Drop the node from the index(es) for its OLD (column) value, if indexed.
         let old = ((self.index_on_base(key) || self.is_range_indexed(key))
-            && self.has_prop(node, key))
-        .then(|| self.prop(node, key));
+            && self.column_value(node, key).is_some())
+        .then(|| self.column_value(node, key))
+        .flatten();
         if let Some(col) = self.props.get_mut(key) {
             col.set_absent(node as usize);
         }
@@ -3483,7 +3598,7 @@ impl Store {
     /// (the engine derives, it does not mint one). Scopes are `cmp_total`-sorted.
     #[must_use]
     pub fn touched_scopes(&self, scope_key: &str) -> (Vec<Value>, bool) {
-        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut seen: crate::exec::fnv::Set<Vec<u8>> = crate::exec::fnv::Set::default();
         let mut scopes: Vec<Value> = Vec::new();
         let mut open = false;
         for ch in &self.last_commit {
@@ -3813,6 +3928,7 @@ impl Builder {
             limits: GraphLimits::default(),
             by_label: self.by_label,
             props,
+            present_nulls: HashMap::new(),
             prop_keys_cache: std::sync::RwLock::default(),
             min_label_cache: std::sync::RwLock::default(),
             etype_ids: self.etype_ids,
@@ -3857,6 +3973,7 @@ impl Builder {
             csr_in_off: Vec::new(),
             csr_in: Vec::new(),
             csr_fresh: false,
+            csr_disabled: false,
             csr_out_typed: Vec::new(),
             csr_in_typed: Vec::new(),
             edge_num: HashMap::new(),
@@ -4227,6 +4344,35 @@ mod tests {
         st.delete_node(a); // cascades the edge — reported as one NodeDeleted
         st.commit();
         assert_eq!(st.last_commit_changes(), &[Change::NodeDeleted(a)]);
+    }
+
+    #[test]
+    fn set_null_no_longer_de_opts_the_column() {
+        use crate::value::Value;
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[("age", n(30.0))]);
+        let _b = st.add_node(&["P"], &[("age", n(40.0))]);
+        assert!(
+            matches!(st.column("age"), Some(Column::Num { .. })),
+            "starts Num"
+        );
+        st.set_prop(a, "age", Value::Null); // present-null
+        assert!(
+            matches!(st.column("age"), Some(Column::Num { .. })),
+            "SET null keeps the column TYPED (no Gen de-opt) — the footgun is gone"
+        );
+        assert!(
+            st.has_prop(a, "age") && st.prop(a, "age").is_null(),
+            "present-null"
+        );
+        assert!(
+            matches!(st.prop(_b, "age"), Value::Num(x) if x == 40.0),
+            "sibling value intact + typed"
+        );
+        // remove the null -> column stays Num, node absent
+        st.remove_prop(a, "age");
+        assert!(!st.has_prop(a, "age"));
+        assert!(matches!(st.column("age"), Some(Column::Num { .. })));
     }
 
     #[test]

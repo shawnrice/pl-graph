@@ -38,7 +38,7 @@ impl Mulberry32 {
 /// materialized keys — do not need; FNV-1a is several times faster on the short
 /// byte/integer keys grouping produces. It never escapes the executor, so hash
 /// quality only affects speed, never results.
-mod fnv {
+pub(crate) mod fnv {
     use std::collections::{HashMap, HashSet};
     use std::hash::{BuildHasherDefault, Hasher};
 
@@ -16364,13 +16364,20 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
         let Col::Nodes(ids) = batch.slot(*slot) else {
             return None;
         };
-        let Some(column) = store.column(key) else {
+        // Present = a column value OR a stored present-null. Fetch both once, test per
+        // row — a present-null is column-absent, so a raw `present[]` pass would drop it.
+        let column = store.column(key);
+        let nulls = store.present_null_set(key);
+        if column.is_none() && nulls.is_none() {
             return Some(Vec::new());
-        };
+        }
         return Some(
             ids.iter()
                 .enumerate()
-                .filter(|&(_, &id)| column.present_at(id as usize))
+                .filter(|&(_, &id)| {
+                    column.is_some_and(|c| c.present_at(id as usize))
+                        || nulls.is_some_and(|s| s.contains(&id))
+                })
                 .map(|(row, _)| row)
                 .collect(),
         );
