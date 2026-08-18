@@ -6,8 +6,13 @@
 # INTENTIONAL strict-typing divergence: a string function / `||` given a non-string,
 # non-null argument is a data exception in the engine (ISO/Cypher behavior), where core
 # JS-coerces it. See engine `call_scalar_checked`. This is a deliberate contract, not a
-# gap to close — pure-TS is being made strict to match.
+# gap to close — pure-TS is being made strict to match. Extends to the numeric
+# functions and aggregates: sum/avg already faulted; stddev/percentile now fault too
+# (were null), and a non-numeric arg to any numeric function is not coerced.
 tests_a.jsonl::concat_coerces_number
+tests_f.jsonl::stddev_nonnum_1
+tests_f.jsonl::stddev_nonnum_2
+tests_f.jsonl::stddev_nonnum_3
 hardening.jsonl::h_rejects_literal_overflowing_exponent
 hardening.jsonl::h_rejects_literal_oversized_integer_literal
 tests_b.jsonl::cast_int_null

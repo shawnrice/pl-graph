@@ -4957,11 +4957,13 @@ fn fold_grouped(
             let mut sum_sq = vec![0f64; n_groups];
             let mut cnt = vec![0u64; n_groups];
             for (i, &g) in group_of.iter().enumerate() {
-                let v = col.value_at(i);
-                if v.is_null() {
-                    continue;
-                }
-                let x = value::num_of(&v).unwrap_or(f64::NAN);
+                let x = match col.value_at(i) {
+                    Value::Null => continue,
+                    Value::Num(x) => x,
+                    // A non-null non-numeric value is a data exception — stddev never
+                    // coerces, matching sum()/avg() and the numeric scalar functions.
+                    _ => return Err("stddev() requires numeric values".into()),
+                };
                 let g = g as usize;
                 sum[g] += x;
                 sum_sq[g] += x * x;
@@ -4979,10 +4981,13 @@ fn fold_grouped(
             let frac = agg.frac.unwrap_or(0.0);
             let mut per_group: Vec<Vec<f64>> = vec![Vec::new(); n_groups];
             for (i, &g) in group_of.iter().enumerate() {
-                if let Some(x) = value::num_of(&col.value_at(i)) {
-                    if x.is_finite() {
-                        per_group[g as usize].push(x);
-                    }
+                match col.value_at(i) {
+                    Value::Null => {}
+                    // A non-null non-numeric value is a data exception — percentile never
+                    // coerces, matching sum()/avg() and the numeric scalar functions.
+                    Value::Num(x) if x.is_finite() => per_group[g as usize].push(x),
+                    Value::Num(_) => {}
+                    _ => return Err("percentile() requires numeric values".into()),
                 }
             }
             per_group

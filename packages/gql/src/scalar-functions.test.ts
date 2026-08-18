@@ -282,14 +282,14 @@ describe('GQL: byte-identity regressions from the differential fuzzer', () => {
     expect(val(`RETURN (to_float('1e300') IS NULL) AS x`)).toBe(false);
   });
 
-  test('percentile coerces with the engine rule, not raw Number()', () => {
-    // `Number('0x10')` is 16, but the engine reads hex as non-numeric everywhere
-    // else (to_float, sum, avg) and so does the native percentile.
-    expect(val(`RETURN percentile_cont('0x10', 0.5) AS x`)).toBe(null);
-    expect(val(`RETURN percentile_disc('0x10', 0.5) AS x`)).toBe(null);
-    // Ordinary numeric strings and numbers still work.
-    expect(val(`RETURN percentile_cont('5', 0.5) AS x`)).toBe(5);
+  test('percentile requires numeric values, not coerced strings', () => {
+    // A non-numeric value is a data exception now (strict typing) — no string is coerced,
+    // not even a numeric-looking one, matching the native percentile / sum / avg.
+    expect(() => val(`RETURN percentile_cont('0x10', 0.5) AS x`)).toThrow();
+    expect(() => val(`RETURN percentile_cont('5', 0.5) AS x`)).toThrow();
+    // Numbers still work.
     expect(val(`RETURN percentile_cont(3, 0.5) AS x`)).toBe(3);
+    expect(val(`RETURN percentile_disc(3, 0.5) AS x`)).toBe(3);
   });
 
   test('range is bounded, and terminates past the float-step stall', () => {
@@ -349,12 +349,11 @@ describe('GQL: byte-identity regressions from the differential fuzzer', () => {
     );
   });
 
-  test('stddev over non-numeric values is NaN (→ null), like avg', () => {
-    // NaN is the in-engine spelling of "no value" and serializes to JSON null;
-    // the bug was that the native side clamped it to a real 0.
-    expect(val(`MATCH (p:Person) RETURN stddev_pop(p.name) AS x`)).toBeNaN();
-    expect(val(`MATCH (p:Person) RETURN stddev_samp(p.name) AS x`)).toBeNaN();
-    expect(JSON.stringify(val(`MATCH (p:Person) RETURN stddev_pop(p.name) AS x`))).toBe('null');
+  test('stddev over non-numeric values is a data exception, like sum/avg', () => {
+    // A non-numeric value is NOT coerced — stddev faults (strict typing), matching the
+    // native engine's stddev / sum / avg.
+    expect(() => val(`MATCH (p:Person) RETURN stddev_pop(p.name) AS x`)).toThrow();
+    expect(() => val(`MATCH (p:Person) RETURN stddev_samp(p.name) AS x`)).toThrow();
   });
 });
 

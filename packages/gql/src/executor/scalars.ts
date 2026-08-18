@@ -331,10 +331,8 @@ export const percentileOf = (
   frac: number,
   cont: boolean,
 ): number | null => {
-  // `numArg`, not `Number` — the engine's numeric coercion, which the native
-  // side uses here too. Raw `Number` accepts spellings the engine rejects
-  // everywhere else (`Number('0x10')` is 16, while `to_float`/`sum`/`avg` and
-  // the native `percentile` all read '0x10' as non-numeric).
+  // `numArg` (strict) — a non-null non-numeric value is a data exception, matching the
+  // native `percentile` and `sum`/`avg`; values are already null-filtered by the caller.
   const nums = values
     .map(numArg)
     .filter((x) => Number.isFinite(x))
@@ -620,30 +618,12 @@ export const numArg = (v: unknown): number => {
     return v;
   }
 
-  if (typeof v === 'boolean') {
-    return v ? 1 : 0;
-  }
-
-  if (typeof v === 'string') {
-    const t = v.trim();
-
-    if (t === '') {
-      return 0;
-    }
-
-    if (!FINITE_NUMERIC.test(t)) {
-      return Number.NaN;
-    }
-
-    // A syntactically-valid literal can still overflow ('1e1000' → Infinity).
-    // Native filters non-finite parses to NaN, so this must too — otherwise
-    // `sqrt('1e1000')` is Infinity here and null there.
-    const parsed = Number(t);
-
-    return Number.isFinite(parsed) ? parsed : Number.NaN;
-  }
-
-  return Number.NaN;
+  // Numbers are NOT coerced from booleans or strings — a non-number where a number is
+  // required is a data exception, matching the native engine (which faults identically
+  // for its numeric functions and aggregates). The only conversion path is an explicit
+  // CAST / to_integer / to_float. A NULL never reaches here: every caller guards null
+  // and short-circuits to NULL first, and the aggregates filter null out of the group.
+  return dataException(`a number is required, ${typeName(v)} is not coerced`);
 };
 
 // Strict argument typing for the string / byte functions and the polymorphic
