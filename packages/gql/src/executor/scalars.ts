@@ -34,7 +34,24 @@ import { compareSort, isEdge, isElement, isVertex } from '../executor.js';
 // predicate evaluates to exactly `true` (see callers comparing `=== true`).
 export type Truth = boolean | null;
 export const isNullish = (v: unknown): boolean => v === null || v === undefined;
-export const asTruth = (v: unknown): Truth => (isNullish(v) ? null : Boolean(v));
+export const asTruth = (v: unknown): Truth => {
+  if (isNullish(v)) {
+    return null;
+  }
+
+  if (typeof v === 'boolean') {
+    return v;
+  }
+
+  // A non-boolean in a truth context (WHERE / FILTER / CASE WHEN / AND / OR / NOT / XOR)
+  // is a data exception — NOT coerced to a truth value (strict typing, matching the native
+  // engine and SQL/ISO-GQL). The only path to a boolean is an explicit CAST AS BOOLEAN /
+  // to_boolean. `Boolean(v)` used to JS-truthiness-coerce here (a number was "truthy").
+  return dataException(
+    'a boolean is required — a non-boolean value is not coerced to a truth value ' +
+      '(use CAST(x AS BOOLEAN) or to_boolean(x))',
+  );
+};
 export const not3 = (t: Truth): Truth => (t === null ? null : !t);
 export const and3 = (a: Truth, b: Truth): Truth => {
   if (a === false || b === false) {

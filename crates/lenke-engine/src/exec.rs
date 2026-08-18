@@ -12586,7 +12586,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
         }
         Expr::Not(inner) => {
             let c = eval(inner, store, batch)?;
-            map_bool(&c, |b| b.map(|x| !x))
+            map_bool(&c, |b| b.map(|x| !x))?
         }
         Expr::And(l, r) => zip_bool(store, batch, l, r, |a, b| match (a, b) {
             (Some(false), _) | (_, Some(false)) => Some(false),
@@ -13446,15 +13446,19 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             let n = batch.rows();
             let out: Vec<Value> = (0..n)
                 .map(|i| {
-                    // First branch whose condition is literally TRUE (three-valued).
-                    conds
-                        .iter()
-                        .position(|c| matches!(c.value_at(i), Value::Bool(true)))
-                        .map(|bi| vals[bi].value_at(i))
-                        .or_else(|| else_col.as_ref().map(|c| c.value_at(i)))
-                        .unwrap_or(Value::Null)
+                    // First branch whose condition is TRUE (three-valued). A non-null
+                    // non-boolean condition is a data exception — it is NOT coerced to a
+                    // truth value (a WHEN must be a boolean, like WHERE / AND / OR).
+                    for (bi, c) in conds.iter().enumerate() {
+                        match c.value_at(i) {
+                            Value::Bool(true) => return Ok(vals[bi].value_at(i)),
+                            Value::Bool(false) | Value::Null => {}
+                            _ => return Err(TRUTH_TYPE_ERR.to_string()),
+                        }
+                    }
+                    Ok(else_col.as_ref().map_or(Value::Null, |c| c.value_at(i)))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, String>>()?;
             Col::Gen(out)
         }
         Expr::Cast { target, expr } => {
@@ -16838,25 +16842,30 @@ fn compare(op: CompareOp, l: &Col, r: &Col) -> Col {
 /// non-empty; NULL is unknown (`None`); any other non-null value (temporal, list,
 /// record, element) is true. (A bare `WHERE <number>` / `WHERE <string>` is thus a
 /// truthiness test, not a no-match — the engine used to drop every non-bool row.)
-fn as_truth(col: &Col) -> Vec<Option<bool>> {
-    let num = |n: f64| Some(n != 0.0 && !n.is_nan());
+/// The message for a non-boolean used where a truth value is required (WHERE / FILTER /
+/// CASE WHEN / AND / OR / NOT / XOR). A number or string is NOT coerced to a truth value
+/// (SQL / ISO-GQL); the only path to a boolean is an explicit CAST AS BOOLEAN / to_boolean.
+const TRUTH_TYPE_ERR: &str =
+    "E_INVALID_VALUE: a boolean is required — a non-boolean value is not coerced to a truth \
+     value (use CAST(x AS BOOLEAN) or to_boolean(x))";
+
+/// Three-valued truth of each cell in a boolean context. A present non-null NON-boolean
+/// is a data exception (strict typing — no truthiness coercion); NULL is UNKNOWN (`None`).
+fn as_truth(col: &Col) -> Result<Vec<Option<bool>>, String> {
     match col {
-        Col::Bool(bs) => bs.iter().map(|&b| Some(b)).collect(),
-        Col::Num(ns) => ns.iter().map(|&n| num(n)).collect(),
+        Col::Bool(bs) => Ok(bs.iter().map(|&b| Some(b)).collect()),
         other => (0..other.len())
             .map(|i| match other.value_at(i) {
-                Value::Null => None,
-                Value::Bool(b) => Some(b),
-                Value::Num(n) => num(n),
-                Value::Str(s) => Some(!s.is_empty()),
-                _ => Some(true),
+                Value::Null => Ok(None),
+                Value::Bool(b) => Ok(Some(b)),
+                _ => Err(TRUTH_TYPE_ERR.to_string()),
             })
             .collect(),
     }
 }
 
-fn map_bool(col: &Col, f: impl Fn(Option<bool>) -> Option<bool>) -> Col {
-    truth_to_col(as_truth(col).into_iter().map(f).collect())
+fn map_bool(col: &Col, f: impl Fn(Option<bool>) -> Option<bool>) -> Result<Col, String> {
+    Ok(truth_to_col(as_truth(col)?.into_iter().map(f).collect()))
 }
 
 /// A vectorized three-valued predicate mask over `batch` (`Some(true)`/`Some(false)`/
@@ -16911,14 +16920,14 @@ fn eval_mask(expr: &Expr, store: &Store, batch: &Batch) -> Result<Vec<Option<boo
             } else if let Some(m) = typed_str_mask(*op, left, right, store, batch) {
                 m
             } else {
-                as_truth(&eval(expr, store, batch)?)
+                as_truth(&eval(expr, store, batch)?)?
             }
         }
         Expr::Call { name, args } => match typed_strsearch_mask(name, args, store, batch) {
             Some(m) => m,
-            None => as_truth(&eval(expr, store, batch)?),
+            None => as_truth(&eval(expr, store, batch)?)?,
         },
-        _ => as_truth(&eval(expr, store, batch)?),
+        _ => as_truth(&eval(expr, store, batch)?)?,
     })
 }
 
@@ -17102,8 +17111,8 @@ fn zip_bool(
     r: &Expr,
     f: impl Fn(Option<bool>, Option<bool>) -> Option<bool>,
 ) -> Result<Col, String> {
-    let lc = as_truth(&eval(l, store, batch)?);
-    let rc = as_truth(&eval(r, store, batch)?);
+    let lc = as_truth(&eval(l, store, batch)?)?;
+    let rc = as_truth(&eval(r, store, batch)?)?;
     let n = lc.len().min(rc.len());
     Ok(truth_to_col((0..n).map(|i| f(lc[i], rc[i])).collect()))
 }
@@ -20914,32 +20923,24 @@ mod tests {
     /// non-zero number and a non-empty string keep the row; zero / "" / null drop it.
     /// The engine used to treat every non-bool as no-match.
     #[test]
-    fn where_coerces_non_boolean_to_truth() {
+    fn where_rejects_a_non_boolean_condition() {
         let mut b = Builder::default();
         b.node(&["T"], &[("n", n(1.0)), ("s", s("x"))]);
         b.node(&["T"], &[("n", n(0.0)), ("s", s(""))]);
         let st = b.build();
+        // A non-boolean WHERE condition is a data exception — a number / string is NOT
+        // coerced to a truth value (strict typing; CAST AS BOOLEAN / to_boolean converts).
+        let errs = |q: &str| {
+            try_run(&crate::gql::parse(q).unwrap(), &st)
+                .unwrap_err()
+                .contains("E_INVALID_VALUE")
+        };
+        assert!(errs("MATCH (n:T) WHERE n.n RETURN n.n AS x"));
+        assert!(errs("MATCH (n:T) WHERE n.s RETURN n.s AS x"));
+        assert!(errs("MATCH (n:T) WHERE 5 RETURN n.n AS x"));
+        // A proper boolean condition still works.
         let count = |q: &str| run(&crate::gql::parse(q).unwrap(), &st).rows.len();
-        assert_eq!(
-            count("MATCH (n:T) WHERE n.n RETURN n.n AS x"),
-            1,
-            "nonzero number is true"
-        );
-        assert_eq!(
-            count("MATCH (n:T) WHERE n.s RETURN n.s AS x"),
-            1,
-            "non-empty string is true"
-        );
-        assert_eq!(
-            count("MATCH (n:T) WHERE 5 RETURN n.n AS x"),
-            2,
-            "constant nonzero → all"
-        );
-        assert_eq!(
-            count("MATCH (n:T) WHERE 0 RETURN n.n AS x"),
-            0,
-            "zero → none"
-        );
+        assert_eq!(count("MATCH (n:T) WHERE n.n > 0 RETURN n.n AS x"), 1);
     }
 
     /// A temporal renders TAGGED in a query result (`{"@duration":"P1D"}`), matching

@@ -547,13 +547,17 @@ export const compileExpr = (expr: Expr): CompiledExpr => {
       };
     }
     case 'isTruth': {
-      // `x IS [NOT] TRUE|FALSE|UNKNOWN` collapses three-valued logic to a
-      // definite boolean: it tests whether x's truth value equals the target.
+      // `x IS [NOT] TRUE|FALSE|UNKNOWN` is an EXACT three-valued test, not a truthiness
+      // coercion: a non-boolean x is simply not equal to TRUE/FALSE (the test is false),
+      // and UNKNOWN tests for null — mirroring the native engine's `coalesce(x = <truth>,
+      // false)`. Unlike a boolean CONTEXT (WHERE / AND / CASE …), it does NOT fault on a
+      // non-boolean; it just reports "no". `null IS UNKNOWN` is true.
       const fn = compileExpr(expr.expr);
       const { truth, negated } = expr;
 
       return (env) => {
-        const matches = asTruth(fn(env)) === truth;
+        const v = fn(env);
+        const matches = truth === null ? isNullish(v) : v === truth;
 
         return negated ? !matches : matches;
       };

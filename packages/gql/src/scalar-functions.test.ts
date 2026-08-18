@@ -360,21 +360,18 @@ describe('GQL: byte-identity regressions from the differential fuzzer', () => {
 describe('GQL: clause-level conditions use three-valued truth', () => {
   const g3 = createTestSocialGraph();
 
-  test('a non-boolean WHERE / FILTER coerces the same way IS TRUE does', () => {
-    // The clause boundary compared the raw value to `true`, so `WHERE 1` dropped
-    // every row — contradicting this same engine's `1 IS TRUE` and `CASE WHEN 1`,
-    // and disagreeing with the native engine.
-    const all = query(g3, `MATCH (p:Person) RETURN p.name AS x`).length;
-
-    expect(all).toBeGreaterThan(0);
-    expect(query(g3, `MATCH (p:Person) WHERE 1 RETURN p.name AS x`)).toHaveLength(all);
-    expect(query(g3, `MATCH (p:Person) FILTER 1 RETURN p.name AS x`)).toHaveLength(all);
-    expect(query(g3, `MATCH (p:Person) WHERE 'abc' RETURN p.name AS x`)).toHaveLength(all);
-    // Falsy and UNKNOWN conditions still drop every row.
-    expect(query(g3, `MATCH (p:Person) WHERE 0 RETURN p.name AS x`)).toHaveLength(0);
-    expect(query(g3, `MATCH (p:Person) WHERE '' RETURN p.name AS x`)).toHaveLength(0);
+  test('a non-boolean WHERE / FILTER condition is a type error, not truthiness', () => {
+    // Strict typing: a number/string condition is NOT coerced to truthy — it faults,
+    // matching the native engine and SQL/ISO-GQL. Only a boolean (or null → UNKNOWN) is a
+    // valid condition. (Previously `WHERE 1` kept every row via JS `Boolean(v)` truthiness.)
+    expect(() => query(g3, `MATCH (p:Person) WHERE 1 RETURN p.name AS x`)).toThrow();
+    expect(() => query(g3, `MATCH (p:Person) FILTER 1 RETURN p.name AS x`)).toThrow();
+    expect(() => query(g3, `MATCH (p:Person) WHERE 'abc' RETURN p.name AS x`)).toThrow();
+    expect(() => query(g3, `MATCH (p:Person) WHERE 0 RETURN p.name AS x`)).toThrow();
+    expect(() => query(g3, `MATCH (p:Person) WHERE '' RETURN p.name AS x`)).toThrow();
+    // A NULL condition is UNKNOWN (three-valued), not an error — it drops every row.
     expect(query(g3, `MATCH (p:Person) WHERE null RETURN p.name AS x`)).toHaveLength(0);
-    // And an ordinary predicate is unaffected.
+    // And an ordinary boolean predicate is unaffected.
     expect(query(g3, `MATCH (p:Person) WHERE p.name = 'marko' RETURN p.name AS x`)).toHaveLength(1);
   });
 });
