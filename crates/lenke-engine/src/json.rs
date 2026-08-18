@@ -144,6 +144,39 @@ pub(crate) fn js_number(x: f64) -> String {
     out
 }
 
+/// Stringify a value like JS `String(v)` / core's `js_str` — the coercion behind
+/// `to_string` and `CAST(x AS STRING)` for the COMPOSITE types (a scalar's own arm in
+/// `to_string_fn` is the fast path). A LIST joins its elements with "," (a null element →
+/// "", matching JS `Array.prototype.join`, NOT the top-level "null"); a RECORD/MAP renders
+/// as its canonical JSON (byte-identical to how it serializes in a result). Numbers use
+/// `js_number`, with non-finite ones spelled "NaN"/"Infinity"/"-Infinity" (JS `String`).
+pub(crate) fn js_str(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Num(x) if x.is_nan() => "NaN".to_string(),
+        Value::Num(x) if x.is_infinite() => {
+            if *x > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+        }
+        Value::Num(x) => js_number(*x),
+        Value::Str(s) => s.to_string(),
+        Value::Temporal(t) => t.format(),
+        Value::List(items) => items
+            .iter()
+            .map(|x| match x {
+                Value::Null => String::new(),
+                other => js_str(other),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Record(_) | Value::Map(_) => {
+            let mut s = String::new();
+            write_value(&mut s, v);
+            s
+        }
+    }
+}
+
 /// A JSON string literal (RFC 8259 escaping).
 pub(crate) fn write_string(out: &mut String, s: &str) {
     out.push('"');

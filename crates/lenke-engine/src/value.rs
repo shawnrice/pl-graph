@@ -284,9 +284,10 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
                 Value::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
                 // A temporal casts to its ISO-8601 string.
                 Value::Temporal(t) => t.format(),
-                Value::List(_) => return bad("list", "string"),
-                Value::Record(_) => return bad("record", "string"),
-                Value::Map(_) => return bad("map", "string"),
+                // A composite serializes rather than faulting: a list joins its elements
+                // with "," and a record/map renders as JSON — same as `to_string` and
+                // core's `js_str`.
+                Value::List(_) | Value::Record(_) | Value::Map(_) => crate::json::js_str(v),
                 Value::Null => unreachable!("null handled above"),
             }
             .as_str(),
@@ -305,7 +306,12 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
         },
         CastTarget::Boolean => match v {
             Value::Bool(b) => Ok(Value::Bool(*b)),
-            // Numeric truthiness: zero is false, every other (incl. NaN) is true.
+            // Numeric truthiness: zero is false, any other FINITE number is true. A NaN is
+            // a data exception — it is a live value in GQL (only nulled at JSON egress), so
+            // casting it to a boolean is an invalid cast that faults HERE (at the cast),
+            // not a null that trips a type error at some later consumer. (`Inf` is nonzero
+            // → true, matching the fn form.)
+            Value::Num(x) if x.is_nan() => bad("NaN", "boolean"),
             Value::Num(x) => Ok(Value::Bool(*x != 0.0)),
             // The SQL boolean spellings (case-insensitive, trimmed); an unrecognized
             // string is a data exception (strict CAST — `CAST('1' AS INT)` throws too).
@@ -653,9 +659,25 @@ mod tests {
             &cast(&s("hi"), CastTarget::String).unwrap(),
             &s("hi")
         ));
-        // Non-finite numbers and lists have no textual form here → throw.
+        // A non-finite NUMBER still has no textual form here → throw.
         assert!(cast(&n(f64::NAN), CastTarget::String).is_err());
-        assert!(cast(&Value::List(vec![n(1.0)]), CastTarget::String).is_err());
+        // A list / record now SERIALIZES (matching `to_string` and core's `js_str`),
+        // not throws: a list joins its elements with "," and a record renders as JSON.
+        assert!(equals(
+            &cast(&Value::List(vec![n(1.0), n(2.0)]), CastTarget::String).unwrap(),
+            &s("1,2")
+        ));
+    }
+
+    #[test]
+    fn cast_nan_to_boolean_is_an_invalid_cast() {
+        // A NaN is a live value in GQL (only nulled at JSON egress), so casting it to a
+        // boolean faults at the cast rather than yielding a null; an `Inf` is nonzero → true.
+        assert!(cast(&n(f64::NAN), CastTarget::Boolean).is_err());
+        assert!(equals(
+            &cast(&n(f64::INFINITY), CastTarget::Boolean).unwrap(),
+            &b(true)
+        ));
     }
 
     #[test]

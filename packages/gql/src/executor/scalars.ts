@@ -986,7 +986,14 @@ export const toBooleanScalar = (a: unknown): boolean | null => {
   }
 
   if (typeof a === 'number') {
-    return Number.isNaN(a) ? null : a !== 0;
+    // A NaN is a live value in GQL (only nulled at JSON egress), so converting it to a
+    // boolean is an invalid conversion that faults HERE — not a null that trips a type
+    // error at a later consumer. (`Infinity` is nonzero → true.)
+    if (Number.isNaN(a)) {
+      return dataException('cannot convert NaN to a boolean');
+    }
+
+    return a !== 0;
   }
 
   // Boolean, number, or string only — see the note in `toIntScalar`.

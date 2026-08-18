@@ -14250,6 +14250,14 @@ fn call_scalar_checked(name: &str, args: &[Value]) -> Result<Value, String> {
             }
         }
     }
+    // `to_boolean(NaN)` / `CAST(NaN AS BOOLEAN)` is an invalid conversion — a NaN is a live
+    // value in GQL (only nulled at JSON egress), so it faults at the conversion rather than
+    // becoming a null that trips a type error at a later consumer. (`Inf` → true, nonzero.)
+    if matches!(name, "to_boolean" | "toboolean")
+        && matches!(args.first(), Some(Value::Num(x)) if x.is_nan())
+    {
+        return Err("E_INVALID_VALUE: cannot convert NaN to a boolean".into());
+    }
     Ok(call_scalar(name, args))
 }
 
@@ -15095,6 +15103,12 @@ fn to_string_fn(v: &Value) -> Value {
         // at all magnitudes and would give a different STRING for e.g. 1e-7).
         Value::Num(x) if x.is_finite() => Value::Str(crate::json::js_number(*x).into()),
         Value::Temporal(t) => Value::Str(t.format().into()),
+        // A LIST joins its elements' string form (a null element → "", like JS
+        // `Array.join`); a RECORD/MAP renders as its canonical JSON — matching core's
+        // `js_str`, which serializes composites rather than returning NULL.
+        Value::List(_) | Value::Record(_) | Value::Map(_) => {
+            Value::Str(crate::json::js_str(v).into())
+        }
         _ => Value::Null,
     }
 }
@@ -18560,7 +18574,7 @@ mod tests {
         assert_eq!(num("mod(7, 3)"), 1.0);
         assert!((num("ln(e())") - 1.0).abs() < 1e-12);
         assert_eq!(num("degrees(pi())").round(), 180.0);
-        // casts (NULL on failure; no bool→number coercion)
+        // casts (NULL on a non-convertible input; a BOOLEAN converts to 1/0)
         assert_eq!(num("to_integer('7')"), 7.0);
         assert_eq!(num("to_integer(4.9)"), 4.0);
         assert_eq!(num("to_float('2.5')"), 2.5);
@@ -18568,8 +18582,8 @@ mod tests {
         assert!(matches!(val("to_boolean('true')"), Value::Bool(true)));
         assert!(matches!(val("to_boolean(0)"), Value::Bool(false)));
         assert!(val("to_integer('nope')").is_null());
-        assert!(val("to_integer(true)").is_null()); // fn form does NOT coerce bool
-                                                    // nullif
+        assert_eq!(num("to_integer(true)"), 1.0); // explicit conversion coerces bool → 1/0
+                                                  // nullif
         assert!(val("nullif(n.a, 4)").is_null());
         assert_eq!(num("nullif(n.a, 5)"), 4.0);
         // size / char_length on a string (K5)
