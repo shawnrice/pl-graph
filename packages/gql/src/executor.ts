@@ -488,10 +488,28 @@ export const compileExpr = (expr: Expr): CompiledExpr => {
       const parts = expr.items.map(compileExpr);
 
       return (env) => {
-        let acc = parts[0](env);
+        const vals = parts.map((p) => p(env));
+        // `||` no longer JS-coerces. The NON-NULL operands must be homogeneous and
+        // concatenable — all strings OR all lists — checked first and order-independently,
+        // matching the native engine: a number/bool/temporal operand, or a string/list
+        // mix, is a data exception even when a NULL is also present. A NULL operand then
+        // makes the whole result NULL (propagation), handled by `concatStep`.
+        const nonNull = vals.filter((v) => !isNullish(v));
 
-        for (let i = 1; i < parts.length; i++) {
-          acc = concatStep(acc, parts[i](env));
+        if (
+          nonNull.length > 0 &&
+          !nonNull.every((v) => typeof v === 'string') &&
+          !nonNull.every((v) => Array.isArray(v))
+        ) {
+          return dataException(
+            '|| requires all operands to be strings or all lists (values are not coerced)',
+          );
+        }
+
+        let [acc] = vals;
+
+        for (let i = 1; i < vals.length; i++) {
+          acc = concatStep(acc, vals[i]);
         }
 
         return acc;

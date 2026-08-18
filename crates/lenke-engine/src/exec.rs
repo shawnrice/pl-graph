@@ -14188,7 +14188,7 @@ fn call_scalar_checked(name: &str, args: &[Value]) -> Result<Value, String> {
     // `cardinality` are polymorphic over a string OR a list, so they fault only on neither.
     {
         let (str_pos, num_pos): (&[usize], &[usize]) = match name {
-            "upper" | "lower" | "length" | "char_length" | "character_length" | "byte_length"
+            "upper" | "lower" | "char_length" | "character_length" | "byte_length"
             | "octet_length" => (&[0], &[]),
             "trim" | "btrim" | "ltrim" | "rtrim" => (&[0, 1], &[]),
             "split" | "starts_with" | "ends_with" | "contains" | "regex_match" => (&[0, 1], &[]),

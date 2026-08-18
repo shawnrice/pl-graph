@@ -210,9 +210,12 @@ describe('GQL: byte-identity regressions from the differential fuzzer', () => {
     // and a path have debug `toString`s. All of them render through `str` now.
     expect(val(`RETURN to_string({b: 2, a: 1}) AS x`)).toBe('{"a":1,"b":2}');
     expect(val(`RETURN CAST({a: 1} AS STRING) AS x`)).toBe('{"a":1}');
-    expect(val(`RETURN upper({a: 'q'}) AS x`)).toBe('{"A":"Q"}');
-    expect(val(`RETURN char_length({a: 1}) AS x`)).toBe('{"a":1}'.length);
-    expect(val(`RETURN ({a: 1} || 'x') AS x`)).toBe('{"a":1}x');
+    // upper()/char_length()/|| of a non-string (here a record) NO LONGER coerce — they
+    // are type errors now (strict typing), matching the native engine — the explicit
+    // to_string()/CAST above are the only stringification path.
+    expect(() => val(`RETURN upper({a: 'q'}) AS x`)).toThrow();
+    expect(() => val(`RETURN char_length({a: 1}) AS x`)).toThrow();
+    expect(() => val(`RETURN ({a: 1} || 'x') AS x`)).toThrow();
     // A record nested in a list goes through `str` too — `Array.join` would have
     // re-entered `String` and reproduced "[object Map]".
     expect(val(`RETURN to_string([{a: 1}]) AS x`)).toBe('{"a":1}');
@@ -232,8 +235,10 @@ describe('GQL: byte-identity regressions from the differential fuzzer', () => {
     // `slice(len - n)` with a fractional n moved the START index, taking one char
     // too many; with NaN it became `slice(0)` — the whole string.
     expect(val(`RETURN right('abcdef', 2.9) AS x`)).toBe('ef');
-    expect(val(`RETURN right('abcdef', 'nan') AS x`)).toBe('');
-    expect(val(`RETURN right('abcdef', 'inf') AS x`)).toBe('');
+    // A NON-numeric length is now a type error (strict typing), not a coerced-to-NaN
+    // empty string — the number position of right() is not JS-coerced.
+    expect(() => val(`RETURN right('abcdef', 'nan') AS x`)).toThrow();
+    expect(() => val(`RETURN right('abcdef', 'inf') AS x`)).toThrow();
     // The ordinary cases are unchanged.
     expect(val(`RETURN right('abcdef', 3) AS x`)).toBe('def');
     expect(val(`RETURN right('abcdef', 0) AS x`)).toBe('');

@@ -85,11 +85,13 @@ const canonNdjson = (nd: string): string[] =>
     .filter(Boolean)
     .map((line) => {
       const r = JSON.parse(line) as { properties?: Record<string, unknown> };
+
       if (r.properties) {
         r.properties = Object.fromEntries(
           Object.entries(r.properties).sort(([x], [y]) => x.localeCompare(y)),
         );
       }
+
       return JSON.stringify(r);
     })
     .sort();
@@ -105,6 +107,7 @@ describe('present-null: engine ⟷ core agree', () => {
     for (let i = 0; i < QUERIES.length; i++) {
       expect(engine.rows[i], `query diverged: ${QUERIES[i]}`).toBe(core.rows[i]);
     }
+
     expect(canonNdjson(engine.ndjson), 'NDJSON round-trip diverged').toEqual(
       canonNdjson(core.ndjson),
     );

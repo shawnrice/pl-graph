@@ -646,6 +646,78 @@ export const numArg = (v: unknown): number => {
   return Number.NaN;
 };
 
+// Strict argument typing for the string / byte functions and the polymorphic
+// string|list functions — mirrors the native engine's `call_scalar_checked`. A non-null
+// argument of the wrong type is a data exception (never JS-coerced); a NULL argument
+// still propagates to NULL. The mixed-arity fns (left/right/substring) type their first
+// position as the string and the rest as numbers.
+const STR_ARG_POSITIONS: Record<string, readonly number[]> = {
+  upper: [0],
+  lower: [0],
+  char_length: [0],
+  character_length: [0],
+  byte_length: [0],
+  octet_length: [0],
+  trim: [0, 1],
+  btrim: [0, 1],
+  ltrim: [0, 1],
+  rtrim: [0, 1],
+  split: [0, 1],
+  starts_with: [0, 1],
+  ends_with: [0, 1],
+  contains: [0, 1],
+  regex_match: [0, 1],
+  replace: [0, 1, 2],
+  left: [0],
+  right: [0],
+  substring: [0],
+};
+const NUM_ARG_POSITIONS: Record<string, readonly number[]> = {
+  left: [1],
+  right: [1],
+  substring: [1, 2],
+};
+const POLY_STR_LIST = new Set(['reverse', 'size', 'cardinality']);
+
+/**
+ * Raise a data exception if a string/byte/polymorphic function is given an argument of
+ * the wrong type — the strict typing the native engine enforces in `call_scalar_checked`.
+ * A NULL argument passes (it propagates to NULL downstream).
+ */
+const assertScalarArgTypes = (name: string, args: readonly unknown[]): void => {
+  const strPos = STR_ARG_POSITIONS[name];
+
+  if (strPos) {
+    for (const i of strPos) {
+      const v = args[i];
+
+      if (v !== undefined && !isNullish(v) && typeof v !== 'string') {
+        dataException(`${name}() requires a string (a number is not coerced)`);
+      }
+    }
+  }
+
+  const numPos = NUM_ARG_POSITIONS[name];
+
+  if (numPos) {
+    for (const i of numPos) {
+      const v = args[i];
+
+      if (v !== undefined && !isNullish(v) && typeof v !== 'number') {
+        dataException(`${name}() requires a number (a string is not coerced)`);
+      }
+    }
+  }
+
+  if (POLY_STR_LIST.has(name)) {
+    const [v] = args;
+
+    if (v !== undefined && !isNullish(v) && typeof v !== 'string' && !Array.isArray(v)) {
+      dataException(`${name}() requires a string or list`);
+    }
+  }
+};
+
 export const callScalar = (
   name: string,
   args: readonly unknown[],
@@ -653,6 +725,8 @@ export const callScalar = (
   // complexity budget, and every real call site has a graph in hand anyway.
   limits: GraphLimits,
 ): unknown => {
+  assertScalarArgTypes(name, args);
+
   const [a, b] = args;
   const unaryNum = UNARY_NUM[name];
 

@@ -16,11 +16,13 @@ const enc = new TextEncoder();
 const N = 100_000;
 const ndjson = (): Uint8Array => {
   const lines: string[] = [];
+
   for (let i = 0; i < N; i++) {
     lines.push(
       `{"type":"node","id":"n${i}","labels":["P"],"properties":{"id":"n${i}","age":${i % 1000},"city":"c${i % 50}"}}`,
     );
   }
+
   return enc.encode(lines.join('\n'));
 };
 const DOC = ndjson();
@@ -29,11 +31,17 @@ const REPS = 9;
 // Rebuild the graph fresh for each timed op so writes don't accumulate across reps.
 const time = (label: string, setup: string[], query: string): void => {
   let best = Infinity;
+
   for (let r = 0; r < REPS; r++) {
     const h = backend.graphFromNdjson(DOC, false);
+
     try {
       backend.createIndex(h, 'vertex', 'hash', ['age']);
-      for (const s of setup) backend.queryRows(h, s, '{}');
+
+      for (const s of setup) {
+        backend.queryRows(h, s, '{}');
+      }
+
       const t = performance.now();
       backend.queryRows(h, query, '{}');
       best = Math.min(best, performance.now() - t);
@@ -41,14 +49,17 @@ const time = (label: string, setup: string[], query: string): void => {
       backend.graphFree(h);
     }
   }
+
   console.log(`  ${label.padEnd(46)} ${best.toFixed(2)} ms`);
 };
 
 // A batch-write throughput: time applying `writes` (already the timed op).
 const timeWrite = (label: string, write: string): void => {
   let best = Infinity;
+
   for (let r = 0; r < REPS; r++) {
     const h = backend.graphFromNdjson(DOC, false);
+
     try {
       const t = performance.now();
       backend.queryRows(h, write, '{}');
@@ -57,6 +68,7 @@ const timeWrite = (label: string, write: string): void => {
       backend.graphFree(h);
     }
   }
+
   console.log(`  ${label.padEnd(46)} ${best.toFixed(2)} ms`);
 };
 
