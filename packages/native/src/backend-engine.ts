@@ -330,7 +330,13 @@ export const buildEngineBackend = (abi: EngineAbi): Backend => {
     // Arrow IPC: format 2 = FILE (Feather), 3 = STREAM. Honor the caller's `file`
     // flag — dropping it silently emitted the file framing for a stream request.
     queryArrowIpc: (handle, query, file, params) =>
-      abi.query(handle, LANG_GQL, query, params ?? null, file ? FMT_ARROW_IPC : FMT_ARROW_IPC_STREAM),
+      abi.query(
+        handle,
+        LANG_GQL,
+        query,
+        params ?? null,
+        file ? FMT_ARROW_IPC : FMT_ARROW_IPC_STREAM,
+      ),
     gremlinJson: (handle, query) => abi.query(handle, LANG_GREMLIN, query, null, FMT_JSON),
 
     // Run a native algorithm directly (also reachable via a GQL `CALL` query).

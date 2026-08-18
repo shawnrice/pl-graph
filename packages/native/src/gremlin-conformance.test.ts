@@ -83,7 +83,9 @@ import { nativeBackend, NATIVE_LIB, nativeReady } from './conformance-harness.js
 const hasLib = nativeReady;
 
 if (!hasLib) {
-  console.warn(`[gremlin-conformance] skipping: ${NATIVE_LIB} not found — run \`bun run build:rust\`.`);
+  console.warn(
+    `[gremlin-conformance] skipping: ${NATIVE_LIB} not found — run \`bun run build:rust\`.`,
+  );
 }
 
 const suite = hasLib ? describe : describe.skip;

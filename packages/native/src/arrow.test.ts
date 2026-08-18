@@ -15,7 +15,9 @@ import { graphFromNdjson } from './graph.js';
 const hasLib = nativeReady;
 
 if (!hasLib) {
-  console.warn(`[arrow.test] skipping: ${NATIVE_LIB} not found — run \`bun run build:rust\` first.`);
+  console.warn(
+    `[arrow.test] skipping: ${NATIVE_LIB} not found — run \`bun run build:rust\` first.`,
+  );
 }
 
 const suite = hasLib ? describe : describe.skip;
