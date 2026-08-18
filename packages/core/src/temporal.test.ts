@@ -140,9 +140,35 @@ describe('temporal: ordering', () => {
     expect(temporalCmpTotal(d1, t1)).toBe(-1); // date kind-rank < datetime
 
     const du = parseDuration('P1M');
-    expect(temporalRelCmp(du, du)).toBeNull(); // durations not relationally ordered
+    expect(temporalRelCmp(du, du)).toBe(0); // a duration equals itself (determinate)
     expect(temporalCmpTotal(du, du)).toBe(0);
     expect(temporalCmpTotal(t1, du)).toBe(-1); // datetime kind-rank < duration
+  });
+
+  // W3C XML Schema Part 2: Datatypes §3.2.6.2 "order relation on duration": comparable
+  // only when the four reference dateTimes agree; a month vs a spanning day-count is null.
+  test('durations follow the W3C XML Schema partial order', () => {
+    const cmp = (a: string, b: string): number | null =>
+      temporalRelCmp(parseDuration(a), parseDuration(b));
+
+    // Determinate — day/time only, or ranges that cannot overlap.
+    expect(cmp('P1D', 'P2D')).toBe(-1);
+    expect(cmp('P1D', 'PT25H')).toBe(-1); // 24h < 25h
+    expect(cmp('PT25H', 'P1D')).toBe(1);
+    expect(cmp('P1M', 'P27D')).toBe(1); // a month is >= 28 days > 27
+    expect(cmp('P1M', 'P32D')).toBe(-1); // a month is <= 31 days < 32
+    expect(cmp('P1Y', 'P360D')).toBe(1); // a year is >= 365 days
+    expect(cmp('P1Y', 'P400D')).toBe(-1);
+
+    // Indeterminate — the spec's own examples (a month is 28-31 days; a year 365-366).
+    for (const days of ['P28D', 'P29D', 'P30D', 'P31D']) {
+      expect(cmp('P1M', days)).toBeNull();
+    }
+
+    expect(cmp('P1Y', 'P365D')).toBeNull();
+    expect(cmp('P1Y', 'P366D')).toBeNull();
+    // The total order stays defined for every pair (ORDER BY), even indeterminate ones.
+    expect(temporalCmpTotal(parseDuration('P1M'), parseDuration('P30D'))).not.toBe(0);
   });
 
   test('instances expose Rust-identical fields', () => {

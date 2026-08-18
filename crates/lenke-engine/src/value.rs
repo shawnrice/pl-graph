@@ -421,7 +421,10 @@ pub fn cmp_partial(a: &Value, b: &Value) -> Option<Ordering> {
         (Value::Num(x), Value::Num(y)) => x.partial_cmp(y), // None iff a NaN operand
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
         (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
-        (Value::Temporal(x), Value::Temporal(y)) if x.kind() == y.kind() => Some(x.cmp_total(y)),
+        // Same-kind temporals order chronologically — EXCEPT two durations, which are only
+        // PARTIALLY ordered (W3C XML Schema): an incomparable pair (month vs spanning days)
+        // is UNKNOWN. `partial_cmp_pred` handles the split (sort/min/max still use cmp_total).
+        (Value::Temporal(x), Value::Temporal(y)) if x.kind() == y.kind() => x.partial_cmp_pred(y),
         // Different types (incl. cross-kind temporals), collections, or null:
         // incomparable via an ordering operator → UNKNOWN.
         _ => None,

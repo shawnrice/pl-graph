@@ -39,8 +39,9 @@ pub struct DateTime {
 
 /// An ISO-8601 calendar duration. Months and days are kept SEPARATE from seconds
 /// (a month is not a fixed number of seconds), matching the Cypher/GQL model.
-/// Relationally unordered (like SQL intervals), but given a deterministic TOTAL
-/// order for `ORDER BY` (lexicographic over the components).
+/// PARTIALLY ordered for relational comparison (`partial_cmp_spec`, per W3C XML
+/// Schema — a month vs a spanning day-count is incomparable → UNKNOWN), but given a
+/// deterministic TOTAL order for `ORDER BY` (`total_key`, lexicographic over components).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Duration {
     pub months: i64,
@@ -528,6 +529,36 @@ impl Duration {
         (self.months, self.days, self.secs, self.nanos)
     }
 
+    /// The 3-valued PREDICATE order (`< > <= >=`) on two durations, per W3C XML Schema
+    /// Part 2: Datatypes §3.2.6.2 ("order relation on duration"): `self < other` iff
+    /// `s + self < s + other` for EACH of the four reference dateTimes the spec fixes. If
+    /// the four do not all agree, the pair is INDETERMINATE (`None`) — durations are only
+    /// PARTIALLY ordered because a month is 28-31 days (so `P1M` vs `P30D` is indeterminate,
+    /// while `P1D` vs `P2D`, and `P1M` vs `P27D`, are determinate). `None` also on a date
+    /// overflow. The TOTAL order for `ORDER BY` / min / max is separate (`total_key`).
+    #[must_use]
+    pub fn partial_cmp_spec(&self, other: &Self) -> Option<Ordering> {
+        // The spec's four reference instants: a non-leap and a leap February, and months
+        // of 31 and 30 days — enough to expose any month-length ambiguity between the two.
+        const REFS: [(i64, i64, i64); 4] = [(1696, 9, 1), (1697, 2, 1), (1903, 3, 1), (1903, 7, 1)];
+        let mut acc: Option<Ordering> = None;
+        for (y, m, d) in REFS {
+            let base = Temporal::DateTime(DateTime {
+                secs: days_from_civil(y, m, d) * SECS_PER_DAY,
+                nanos: 0,
+            });
+            let ord = base
+                .add_duration(self)?
+                .cmp_total(&base.add_duration(other)?);
+            match acc {
+                None => acc = Some(ord),
+                Some(prev) if prev != ord => return None, // references disagree → indeterminate
+                Some(_) => {}
+            }
+        }
+        acc
+    }
+
     /// Negate the whole span, keeping `nanos` in `[0, 1e9)`.
     #[must_use]
     pub fn negate(&self) -> Self {
@@ -732,6 +763,20 @@ impl Temporal {
         }
     }
 
+    /// The 3-valued PREDICATE order (`< > <= >=` in an expression / WHERE) for two
+    /// temporals of the SAME kind (the caller checks `kind()`). Date/time/datetime kinds
+    /// are totally ordered chronologically; two DURATIONS follow the W3C partial order
+    /// (`Duration::partial_cmp_spec`), so an incomparable pair (a month vs a spanning
+    /// day-count) is `None` → UNKNOWN. This is DISTINCT from `cmp_total`, which forces a
+    /// total order for `ORDER BY` / min / max determinism.
+    #[must_use]
+    pub fn partial_cmp_pred(&self, other: &Self) -> Option<Ordering> {
+        match (self, other) {
+            (Self::Duration(a), Self::Duration(b)) => a.partial_cmp_spec(b),
+            _ => Some(self.cmp_total(other)),
+        }
+    }
+
     /// `self + duration` for a date/time/datetime (and their zoned forms): apply
     /// calendar months (clamped), then days, then the sub-day part. A bare `Time`
     /// wraps within the day (months/days ignored); a zoned value applies it to the
@@ -806,6 +851,43 @@ impl Temporal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W3C XML Schema Part 2: Datatypes §3.2.6.2 "order relation on duration". A duration
+    /// pair is comparable only when the four reference dateTimes all agree; a month vs a
+    /// day-count that spans a month's 28-31-day range is INDETERMINATE.
+    #[test]
+    fn duration_partial_order_follows_w3c_xml_schema() {
+        use Ordering::{Equal, Greater, Less};
+        let d = |s: &str| Duration::parse(s).unwrap();
+        let cmp = |a: &str, b: &str| d(a).partial_cmp_spec(&d(b));
+
+        // Determinate — day/time only, or ranges that cannot overlap.
+        assert_eq!(cmp("P1D", "P2D"), Some(Less));
+        assert_eq!(cmp("P2D", "P1D"), Some(Greater));
+        assert_eq!(cmp("P1D", "P1D"), Some(Equal));
+        assert_eq!(cmp("P1D", "PT25H"), Some(Less)); // 24h < 25h (the old compare got this backwards)
+        assert_eq!(cmp("PT25H", "P1D"), Some(Greater));
+        assert_eq!(cmp("P1M", "P27D"), Some(Greater)); // a month is >= 28 days > 27
+        assert_eq!(cmp("P1M", "P32D"), Some(Less)); // a month is <= 31 days < 32
+        assert_eq!(cmp("P1Y", "P360D"), Some(Greater)); // a year is >= 365 days
+        assert_eq!(cmp("P1Y", "P400D"), Some(Less)); // a year is <= 366 days
+
+        // Indeterminate — the spec's own examples (a month is 28-31 days; a year 365-366).
+        for days in ["P28D", "P29D", "P30D", "P31D"] {
+            assert_eq!(
+                cmp("P1M", days),
+                None,
+                "P1M vs {days} must be indeterminate"
+            );
+        }
+        assert_eq!(cmp("P1Y", "P365D"), None);
+        assert_eq!(cmp("P1Y", "P366D"), None);
+        // The total order (ORDER BY) stays defined for every pair, even indeterminate ones.
+        assert_eq!(
+            Temporal::Duration(d("P1M")).cmp_total(&Temporal::Duration(d("P30D"))),
+            Greater
+        );
+    }
 
     #[test]
     fn civil_round_trips_the_epoch_and_neighbours() {

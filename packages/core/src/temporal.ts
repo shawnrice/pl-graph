@@ -879,6 +879,11 @@ export function temporalRelCmp(a: Temporal, b: Temporal): number | null {
     return cmpTuple([a.secs, a.nanos, a.offset], [b.secs, b.nanos, b.offset]);
   }
 
+  // Two DURATIONS are only PARTIALLY ordered (W3C XML Schema) — incomparable → null.
+  if (a instanceof Duration && b instanceof Duration) {
+    return durationPartialCmp(a, b);
+  }
+
   return null;
 }
 
@@ -1057,6 +1062,48 @@ const addDurationTo = (t: Temporal, d: Duration): Temporal | null => {
   }
 
   return null;
+};
+
+// The four reference dateTimes W3C XML Schema Part 2 §3.2.6.2 fixes for the duration
+// order — a non-leap and a leap February, and months of 31 and 30 days, enough to expose
+// any month-length ambiguity between two durations.
+const DURATION_REFS: LocalDateTime[] = (
+  [
+    [1696, 9, 1],
+    [1697, 2, 1],
+    [1903, 3, 1],
+    [1903, 7, 1],
+  ] as const
+).map(([y, m, d]) => new LocalDateTime(daysFromCivil(y, m, d) * SECS_PER_DAY, 0));
+
+/**
+ * The 3-valued PREDICATE order on two durations, per W3C XML Schema §3.2.6.2: `a < b` iff
+ * `s + a < s + b` for EACH of the four reference dateTimes; if the four do not all agree,
+ * the pair is INDETERMINATE (`null`) — durations are only partially ordered because a
+ * month is 28-31 days (so `P1M` vs `P30D` is null, while `P1D` vs `P2D` orders). `null`
+ * also on a date overflow. The TOTAL order for `ORDER BY` / min / max is separate.
+ */
+const durationPartialCmp = (a: Duration, b: Duration): number | null => {
+  let acc: number | null = null;
+
+  for (const s of DURATION_REFS) {
+    const sa = addDurationTo(s, a);
+    const sb = addDurationTo(s, b);
+
+    if (sa === null || sb === null) {
+      return null; // out of representable range → cannot determine
+    }
+
+    const ord = temporalRelCmp(sa, sb);
+
+    if (acc === null) {
+      acc = ord;
+    } else if (acc !== ord) {
+      return null; // references disagree → indeterminate
+    }
+  }
+
+  return acc;
 };
 
 /**
