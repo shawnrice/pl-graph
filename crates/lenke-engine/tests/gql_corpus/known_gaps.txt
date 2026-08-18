@@ -2,6 +2,12 @@
 # lenke-core. The corpus gate is green as long as no case OUTSIDE this list
 # mismatches. As gaps are fixed, their keys are reported as now-passing and
 # should be removed. Regenerate with CORPUS_BASELINE=1.
+#
+# INTENTIONAL strict-typing divergence: a string function / `||` given a non-string,
+# non-null argument is a data exception in the engine (ISO/Cypher behavior), where core
+# JS-coerces it. See engine `call_scalar_checked`. This is a deliberate contract, not a
+# gap to close — pure-TS is being made strict to match.
+tests_a.jsonl::concat_coerces_number
 hardening.jsonl::h_rejects_literal_overflowing_exponent
 hardening.jsonl::h_rejects_literal_oversized_integer_literal
 tests_b.jsonl::cast_int_null

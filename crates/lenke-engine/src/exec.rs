@@ -14181,6 +14181,66 @@ fn call_scalar_checked(name: &str, args: &[Value]) -> Result<Value, String> {
             "E_INVALID_VALUE: {name}() requires a number (a string is not coerced)"
         ));
     }
+    // String / byte scalar functions take strings — a non-null, non-string argument is a
+    // data exception, never coerced (the same rule as the numeric functions above; only a
+    // NULL arg propagates to NULL). Mixed-arity fns type each position: `left`/`right`/
+    // `substring` take a string then number(s); the rest are all-string. `reverse`/`size`/
+    // `cardinality` are polymorphic over a string OR a list, so they fault only on neither.
+    {
+        let (str_pos, num_pos): (&[usize], &[usize]) = match name {
+            "upper" | "lower" | "length" | "char_length" | "character_length" | "byte_length"
+            | "octet_length" => (&[0], &[]),
+            "trim" | "btrim" | "ltrim" | "rtrim" => (&[0, 1], &[]),
+            "split" | "starts_with" | "ends_with" | "contains" | "regex_match" => (&[0, 1], &[]),
+            "replace" => (&[0, 1, 2], &[]),
+            "left" | "right" => (&[0], &[1]),
+            "substring" => (&[0], &[1, 2]),
+            _ => (&[], &[]),
+        };
+        for &i in str_pos {
+            if let Some(a) = args.get(i) {
+                if !a.is_null() && !matches!(a, Value::Str(_)) {
+                    return Err(format!(
+                        "E_INVALID_VALUE: {name}() requires a string (a number is not coerced)"
+                    ));
+                }
+            }
+        }
+        for &i in num_pos {
+            if let Some(a) = args.get(i) {
+                if !a.is_null() && !matches!(a, Value::Num(_)) {
+                    return Err(format!(
+                        "E_INVALID_VALUE: {name}() requires a number (a string is not coerced)"
+                    ));
+                }
+            }
+        }
+        if matches!(name, "reverse" | "size" | "cardinality")
+            && args
+                .first()
+                .is_some_and(|a| !a.is_null() && !matches!(a, Value::Str(_) | Value::List(_)))
+        {
+            return Err(format!(
+                "E_INVALID_VALUE: {name}() requires a string or list"
+            ));
+        }
+        // `||` concatenation (lowered to `concat`): operands must be homogeneous and
+        // concatenable — all strings OR all lists. A NULL operand makes the whole result
+        // NULL (handled in the fold); a non-null operand that is neither a string nor a
+        // list, or a string/list mix, is a data exception — never JS-string-coerced.
+        if name == "concat" {
+            let non_null: Vec<&Value> = args.iter().filter(|a| !a.is_null()).collect();
+            let all_str = non_null.iter().all(|a| matches!(a, Value::Str(_)));
+            let all_list = non_null.iter().all(|a| matches!(a, Value::List(_)));
+            if !non_null.is_empty() && !all_str && !all_list {
+                return Err(
+                    "E_INVALID_VALUE: || requires all operands to be strings or all lists \
+                     (values are not coerced)"
+                        .into(),
+                );
+            }
+        }
+    }
     Ok(call_scalar(name, args))
 }
 
@@ -16273,24 +16333,13 @@ fn try_keep_strsearch(
         // column that a null or type-mixed write promoted to `Gen`. Test each string
         // cell; a non-string or absent cell is UNKNOWN → dropped (both directions),
         // matching `str_bool`. (Skipping this returned NO rows for a de-opted column.)
-        Some(Column::Gen { data, present }) => {
-            for (row, &id) in ids.iter().enumerate() {
-                let i = id as usize;
-                if present[i] {
-                    if let Value::Str(str_val) = &data[i] {
-                        if f(str_val.as_ref(), sub) != negate {
-                            keep.push(row);
-                        }
-                    }
-                }
-            }
-            Some(keep)
-        }
-        // Column absent everywhere → every cell UNKNOWN → dropped (both directions).
+        // Column absent everywhere → every cell null → dropped, no error (both directions).
         None => Some(Vec::new()),
-        // A genuinely non-string typed column (Num/Bool/…): `str_bool` yields NULL → no
-        // match (both directions).
-        _ => Some(Vec::new()),
+        // A Gen (mixed) or non-string typed column (Num/Bool/…) may hold a non-null
+        // non-string value, on which STARTS/ENDS/CONTAINS now FAULTS (a type error, not a
+        // silent no-match). Defer to the general evaluator so it raises the exception — an
+        // all-string/null column yields the same rows there, only without this fast path.
+        _ => None,
     }
 }
 
@@ -17008,44 +17057,37 @@ fn typed_strsearch_mask(
         return None;
     };
     let sub = sub.as_ref();
-    Some(match store.column(key) {
-        Some(Column::Str { data, present, .. }) => ids
-            .iter()
-            .map(|&id| {
-                let i = id as usize;
-                present[i].then(|| f(data[i].as_ref(), sub))
-            })
-            .collect(),
+    // Only a pure Str/Dict column (every present cell is a string) can be vectorized here.
+    // An ABSENT column is NULL for every row → null-propagation, no error (matches the
+    // general evaluator). A Gen (mixed) or a non-string typed column may hold a non-null
+    // non-string cell, on which the predicate now FAULTS — return None so `eval_mask`
+    // falls to the general `eval`, which raises the type error per row (identical to the
+    // function-form `starts_with(...)`).
+    match store.column(key) {
+        None => Some(vec![None; ids.len()]),
+        Some(Column::Str { data, present, .. }) => Some(
+            ids.iter()
+                .map(|&id| {
+                    let i = id as usize;
+                    present[i].then(|| f(data[i].as_ref(), sub))
+                })
+                .collect(),
+        ),
         Some(Column::Dict {
             dict,
             codes,
             present,
             ..
-        }) => ids
-            .iter()
-            .map(|&id| {
-                let i = id as usize;
-                present[i].then(|| f(dict[codes[i] as usize].as_ref(), sub))
-            })
-            .collect(),
-        // A de-opted (`Gen`) column may still hold string cells — test each; a
-        // non-string/absent cell is UNKNOWN (`None`), matching `str_bool`.
-        Some(Column::Gen { data, present }) => ids
-            .iter()
-            .map(|&id| {
-                let i = id as usize;
-                if !present[i] {
-                    return None;
-                }
-                match &data[i] {
-                    Value::Str(str_val) => Some(f(str_val.as_ref(), sub)),
-                    _ => None,
-                }
-            })
-            .collect(),
-        // Missing or genuinely non-string column → `str_bool` yields NULL for every row.
-        _ => vec![None; ids.len()],
-    })
+        }) => Some(
+            ids.iter()
+                .map(|&id| {
+                    let i = id as usize;
+                    present[i].then(|| f(dict[codes[i] as usize].as_ref(), sub))
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 fn zip_bool(

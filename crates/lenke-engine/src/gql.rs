@@ -8437,16 +8437,21 @@ mod tests {
         );
         let st = b.build();
         let one = |q: &str| -> Value { run(&super::parse(q).unwrap(), &st).rows[0][0].clone() };
-        // string || string, chain, num coercion (7 → "7"), null propagation, list concat.
+        // string || string, chain, null propagation, list concat.
         assert!(
             matches!(one("MATCH (p:P) RETURN p.name || '!' AS x"), Value::Str(ref s) if &**s == "ab!")
         );
         assert!(
             matches!(one("MATCH (p:P) RETURN 'a' || 'b' || 'c' AS x"), Value::Str(ref s) if &**s == "abc")
         );
-        assert!(
-            matches!(one("MATCH (p:P) RETURN p.name || '-' || p.age AS x"), Value::Str(ref s) if &**s == "ab-7")
-        );
+        // `||` no longer JS-coerces a numeric operand — mixing a string with a number is a
+        // type error (use to_string()), never "ab-7".
+        assert!(crate::exec::try_run(
+            &super::parse("MATCH (p:P) RETURN p.name || '-' || p.age AS x").unwrap(),
+            &st
+        )
+        .unwrap_err()
+        .contains("E_INVALID_VALUE"));
         assert!(matches!(
             one("MATCH (p:P) RETURN p.missing || 'x' AS x"),
             Value::Null
@@ -8458,10 +8463,21 @@ mod tests {
         assert!(
             matches!(one("MATCH (p:P) RETURN [1, 2] || [3] AS x"), Value::List(ref v) if v.len() == 3)
         );
-        // Precedence: `||` binds looser than `+`, tighter than `=`. `1 + 2 || 3` is
-        // `(1+2) || 3` = "33"; used in WHERE it is a concat operand of the comparison.
+        // Precedence: `||` binds looser than `+`. Strict typing means `(1+2) || 3`
+        // (num||num) can no longer COERCE to "33" — but the PARSE still groups `+` under
+        // `||`, which is what precedence is about. Assert the structure, not a coerced
+        // value: the projected expr is a `concat` whose FIRST operand is the `1 + 2` add.
+        let plan = super::parse("MATCH (p:P) RETURN 1 + 2 || 3 AS x").unwrap();
+        let crate::ir::Plan::Project { items, .. } = &plan else {
+            panic!("expected a Project: {plan:?}")
+        };
+        let crate::ir::Expr::Call { name, args } = &items[0].1 else {
+            panic!("expected a concat call: {plan:?}")
+        };
+        assert_eq!(name, "concat");
         assert!(
-            matches!(one("MATCH (p:P) RETURN 1 + 2 || 3 AS x"), Value::Str(ref s) if &**s == "33")
+            matches!(&args[0], crate::ir::Expr::Arith { .. }),
+            "`+` must bind tighter than `||`: {plan:?}"
         );
         // A lone `|` is not an operator.
         assert!(super::parse("MATCH (p:P) RETURN p.age | 1 AS x").is_err());
@@ -9829,14 +9845,20 @@ mod tests {
         let out = run(
             &super::parse(
                 "MATCH (p:Person) WHERE p.name='alice' \
-                 RETURN starts_with(p.name,'al') AS s, contains(p.name,'zz') AS c, upper(p.age) AS bad",
+                 RETURN starts_with(p.name,'al') AS s, contains(p.name,'zz') AS c",
             )
             .unwrap(),
             &store,
         );
         assert!(matches!(col(&out, 0, "s"), Value::Bool(true)));
         assert!(matches!(col(&out, 0, "c"), Value::Bool(false)));
-        assert!(col(&out, 0, "bad").is_null()); // upper of a number → NULL
+        // upper() of a number is now a TYPE ERROR (not a silent NULL) — no implicit coercion.
+        assert!(crate::exec::try_run(
+            &super::parse("MATCH (p:Person) RETURN upper(p.age) AS bad").unwrap(),
+            &store
+        )
+        .unwrap_err()
+        .contains("E_INVALID_VALUE"));
     }
 
     /// substring past the end clamps; a negative index is NULL.
@@ -10197,14 +10219,20 @@ mod tests {
         let out = run(
             &super::parse(
                 "MATCH (p:Person) WHERE p.name='alice' \
-                 RETURN size([]) AS z, head([]) AS h, size(p.age) AS bad",
+                 RETURN size([]) AS z, head([]) AS h",
             )
             .unwrap(),
             &store,
         );
         assert_eq!(num(&col(&out, 0, "z")), 0.0);
         assert!(col(&out, 0, "h").is_null());
-        assert!(col(&out, 0, "bad").is_null()); // size of a number → NULL
+        // size() of a number is now a TYPE ERROR — it is polymorphic over string|list only.
+        assert!(crate::exec::try_run(
+            &super::parse("MATCH (p:Person) RETURN size(p.age) AS bad").unwrap(),
+            &store
+        )
+        .unwrap_err()
+        .contains("E_INVALID_VALUE"));
     }
 
     /// Parsed `[p.age, 1]` matches the hand-built `Expr::List`.
