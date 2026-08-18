@@ -4019,7 +4019,7 @@ fn try_scan_top_k(
     let Plan::Scan { label } = input else {
         return None;
     };
-    let Some(Column::Num { data, present }) = store.column(key) else {
+    let Some(Column::Num { data, present, .. }) = store.column(key) else {
         return None; // numeric, unboxed key only (matches order_page's Col::Num path)
     };
     let kcap = skip.unwrap_or(0).checked_add(limit)?;
@@ -4271,7 +4271,7 @@ fn aggregate(
         // eval-then-fold on the compact column.
         if matches!(agg.func, AggFn::Min | AggFn::Max) && n >= FRONTIER_FOLD_MIN {
             if let Some(Expr::Prop { slot, key }) = &agg.arg {
-                if let (Col::Nodes(frontier), Some(Column::Num { data, present })) =
+                if let (Col::Nodes(frontier), Some(Column::Num { data, present, .. })) =
                     (batch.slot(*slot), store.column(key))
                 {
                     slots.push(Col::Gen(fold_num_minmax(
@@ -4351,7 +4351,7 @@ fn frontier_group_by(
         }};
     }
     match col {
-        Column::Str { data, present } => {
+        Column::Str { data, present, .. } => {
             let mut seen: FnvMap<&str, u32> = FnvMap::default();
             for &node in frontier {
                 let g = if node != u32::MAX && present[node as usize] {
@@ -4374,6 +4374,7 @@ fn frontier_group_by(
             dict,
             codes,
             present,
+            ..
         } => {
             let mut code_to_group: Vec<u32> = vec![u32::MAX; dict.len()];
             for &node in frontier {
@@ -4390,7 +4391,7 @@ fn frontier_group_by(
                 group_of.push(g);
             }
         }
-        Column::Num { data, present } => {
+        Column::Num { data, present, .. } => {
             let mut seen: FnvMap<u64, u32> = FnvMap::default();
             for &node in frontier {
                 let g = if node != u32::MAX && present[node as usize] {
@@ -4409,7 +4410,7 @@ fn frontier_group_by(
                 group_of.push(g);
             }
         }
-        Column::Bool { data, present } => {
+        Column::Bool { data, present, .. } => {
             let mut slot: [Option<u32>; 2] = [None, None];
             for &node in frontier {
                 let g = if node != u32::MAX && present[node as usize] {
@@ -4500,7 +4501,7 @@ fn try_frontier_group_fold(
         // which the diagnostics showed is the whole remaining cost over a big frontier.
         if matches!(agg.func, AggFn::Min | AggFn::Max) {
             if let Some(Expr::Prop { key, .. }) = &agg.arg {
-                if let Some(Column::Num { data, present }) = store.column(key) {
+                if let Some(Column::Num { data, present, .. }) = store.column(key) {
                     slots.push(Col::Gen(fold_num_minmax(
                         &frontier,
                         &group_of,
@@ -4594,6 +4595,7 @@ fn try_dict_grouping(
         dict,
         codes,
         present,
+        ..
     }) = store.column(key)
     else {
         return None;
@@ -5961,7 +5963,7 @@ fn index_seek_ids(store: &Store, label: &str, key: &str, value: &Value) -> Vec<u
             // literal's type; a NULL cell — `present == false` — never equals).
             if !key.contains('.') {
                 match (store.column(key), value) {
-                    (Some(Column::Str { data, present }), Value::Str(t)) => {
+                    (Some(Column::Str { data, present, .. }), Value::Str(t)) => {
                         let t: &str = t;
                         return ids
                             .iter()
@@ -5974,6 +5976,7 @@ fn index_seek_ids(store: &Store, label: &str, key: &str, value: &Value) -> Vec<u
                             dict,
                             codes,
                             present,
+                            ..
                         }),
                         Value::Str(t),
                     ) => {
@@ -5991,7 +5994,7 @@ fn index_seek_ids(store: &Store, label: &str, key: &str, value: &Value) -> Vec<u
                             .filter(|&id| present[id as usize] && codes[id as usize] == want)
                             .collect();
                     }
-                    (Some(Column::Num { data, present }), Value::Num(t)) => {
+                    (Some(Column::Num { data, present, .. }), Value::Num(t)) => {
                         let t = *t;
                         return ids
                             .iter()
@@ -5999,7 +6002,7 @@ fn index_seek_ids(store: &Store, label: &str, key: &str, value: &Value) -> Vec<u
                             .filter(|&id| present[id as usize] && data[id as usize] == t)
                             .collect();
                     }
-                    (Some(Column::Bool { data, present }), Value::Bool(t)) => {
+                    (Some(Column::Bool { data, present, .. }), Value::Bool(t)) => {
                         let t = *t;
                         return ids
                             .iter()
@@ -6103,7 +6106,8 @@ fn range_seek_ids(store: &Store, label: &str, key: &str, op: CompareOp, value: &
             let ids = store.nodes_with_label(label);
             // Typed fast path: a Num column vs a Num bound compares RAW f64 (no
             // per-cell Value boxing) — the no-index scan is the common case.
-            if let (Some(Column::Num { data, present }), Value::Num(t)) = (store.column(key), value)
+            if let (Some(Column::Num { data, present, .. }), Value::Num(t)) =
+                (store.column(key), value)
             {
                 let t = *t;
                 return ids
@@ -6933,7 +6937,7 @@ fn for_each_typed_out(
 fn try_fused_hop_num_count(input: &Plan, store: &Store) -> Option<u64> {
     let (label, w, pred, exp) = fused_hop_shape(input, store)?;
     let (key, bounds) = num_conj_on_slot(pred, 1)?;
-    let Some(Column::Num { data, present }) = store.column(&key) else {
+    let Some(Column::Num { data, present, .. }) = store.column(&key) else {
         return None;
     };
     if reverse_seed_decide(pred, exp, store, false).is_some() {
@@ -6974,7 +6978,7 @@ fn try_fused_hop_project(
         return None;
     }
     let (key, bounds) = num_conj_on_slot(pred, 1)?;
-    let Some(Column::Num { data, present }) = store.column(&key) else {
+    let Some(Column::Num { data, present, .. }) = store.column(&key) else {
         return None;
     };
     if reverse_seed_decide(pred, exp, store, false).is_some() {
@@ -7034,7 +7038,7 @@ fn try_fused_hop_mask_agg(
     // skipped, matching the general aggregate).
     let agg_col: Option<(&[f64], &[bool])> = match arg_key {
         Some(k) => match store.column(k)? {
-            Column::Num { data, present } => Some((data, present)),
+            Column::Num { data, present, .. } => Some((data, present)),
             _ => return None,
         },
         None => None,
@@ -7418,6 +7422,7 @@ fn try_eval_dict_scalar(expr: &Expr, store: &Store, batch: &Batch) -> Option<Col
         dict,
         codes,
         present,
+        ..
     }) = store.column(&key)
     else {
         return None;
@@ -7461,6 +7466,7 @@ fn try_filter_keep_dict(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec
         dict,
         codes,
         present,
+        ..
     }) = store.column(&key)
     else {
         return None;
@@ -7540,6 +7546,7 @@ fn try_stream_dict_pred_count(store: &Store, label: &Option<String>, pred: &Expr
         dict,
         codes,
         present,
+        ..
     }) = store.column(&key)
     else {
         return None;
@@ -7581,6 +7588,7 @@ fn try_stream_membership_count(store: &Store, label: &Option<String>, pred: &Exp
             dict,
             codes,
             present,
+            ..
         } => {
             // Every literal must be a string (else it can't equal a dict value). Resolve
             // to codes; a literal not in the dict contributes no code (never matches).
@@ -7597,7 +7605,7 @@ fn try_stream_membership_count(store: &Store, label: &Option<String>, pred: &Exp
                 }
             });
         }
-        Column::Str { data, present } => {
+        Column::Str { data, present, .. } => {
             let mut targets: Vec<&str> = Vec::with_capacity(vals.len());
             for v in &vals {
                 let Value::Str(s) = v else { return None };
@@ -7630,6 +7638,7 @@ fn try_distinct_dict_col(input: &Plan, store: &Store) -> Option<Batch> {
         dict,
         codes,
         present,
+        ..
     }) = store.column(key)
     else {
         return None;
@@ -7724,10 +7733,12 @@ fn try_edge_cross_count(
         Some(Column::Num {
             data: ld,
             present: lp,
+            ..
         }),
         Some(Column::Num {
             data: rd,
             present: rp,
+            ..
         }),
     ) = (store.column(lk), store.column(rk))
     else {
@@ -7769,16 +7780,25 @@ fn try_edge_cross_count(
 
 fn try_stream_num_count(store: &Store, label: &Option<String>, pred: &Expr) -> Option<u64> {
     let (key, bounds) = num_conj_on_slot(pred, 0)?;
-    let Some(Column::Num { data, present }) = store.column(&key) else {
+    let Some(Column::Num {
+        data,
+        present,
+        nulls,
+    }) = store.column(&key)
+    else {
         return None;
     };
     let mut count = 0u64;
     scan_visit(store, label, |i| {
-        if present[i] {
-            let x = data[i];
-            if bounds.iter().all(|&(op, t)| num_pred(op, x, t)) {
+        // A bare presence gate (`has(k)`, no bounds) counts PRESENCE — a stored
+        // present-null included (`present || nulls`). A bounded compare counts only
+        // typed values (`present`): a null satisfies no numeric predicate.
+        if bounds.is_empty() {
+            if present[i] || nulls[i] {
                 count += 1;
             }
+        } else if present[i] && bounds.iter().all(|&(op, t)| num_pred(op, data[i], t)) {
+            count += 1;
         }
     });
     Some(count)
@@ -8449,7 +8469,7 @@ fn try_varlen_agg(
     };
 
     let val = match (agg.func, column) {
-        (AggFn::Sum | AggFn::Avg, Column::Num { data, present }) => {
+        (AggFn::Sum | AggFn::Avg, Column::Num { data, present, .. }) => {
             let mut total = 0.0f64;
             let mut cnt = 0u64;
             dfs(&mut |v| {
@@ -8467,7 +8487,7 @@ fn try_varlen_agg(
                 Value::Num(total / cnt as f64)
             }
         }
-        (AggFn::Min | AggFn::Max, Column::Num { data, present }) => {
+        (AggFn::Min | AggFn::Max, Column::Num { data, present, .. }) => {
             let want_min = agg.func == AggFn::Min;
             let mut best: Option<f64> = None;
             dfs(&mut |v| {
@@ -8489,7 +8509,7 @@ fn try_varlen_agg(
             });
             best.map_or(Value::Null, Value::Num)
         }
-        (AggFn::Min | AggFn::Max, Column::Str { data, present }) => {
+        (AggFn::Min | AggFn::Max, Column::Str { data, present, .. }) => {
             // Track the best endpoint id (not a borrow into `data`), comparing `&str`
             // directly — the value contract's order for two strings is lexicographic,
             // so this equals the materializing min/max. `<`/`>` on equal keeps the
@@ -8520,6 +8540,7 @@ fn try_varlen_agg(
                 dict,
                 codes,
                 present,
+                ..
             },
         ) => {
             let want_min = agg.func == AggFn::Min;
@@ -8630,7 +8651,7 @@ fn try_frontier_prop_agg(
     if *slot != width - 1 {
         return None; // arg must be a property of the chain frontier
     }
-    let Some(Column::Num { data, present }) = store.column(key) else {
+    let Some(Column::Num { data, present, .. }) = store.column(key) else {
         return None; // non-numeric / absent-everywhere → general path
     };
     let counts = frontier_counts(input, store)?;
@@ -8721,7 +8742,7 @@ fn try_filtered_scan_num_agg(
     let Some(Expr::Prop { slot: 0, key }) = agg.arg.as_ref() else {
         return None; // count(*) is try_filtered_count; only a prop agg here
     };
-    let Some(Column::Num { data, present }) = store.column(key) else {
+    let Some(Column::Num { data, present, .. }) = store.column(key) else {
         return None;
     };
     // Survivor ROWS of the scan frontier (row index == the node id for a bare scan).
@@ -8792,7 +8813,7 @@ fn try_scan_num_agg(
     let Some(Expr::Prop { slot: 0, key }) = agg.arg.as_ref() else {
         return None;
     };
-    let Some(Column::Num { data, present }) = store.column(key) else {
+    let Some(Column::Num { data, present, .. }) = store.column(key) else {
         return None; // non-numeric column: the general path handles poison
     };
     let (mut total, mut cnt) = (0f64, 0u64);
@@ -8923,6 +8944,7 @@ fn try_scan_dict_count(
         dict,
         codes,
         present,
+        ..
     }) = store.column(key)
     else {
         return None;
@@ -8995,6 +9017,7 @@ fn try_frontier_dict_count(
         dict,
         codes,
         present,
+        ..
     }) = store.column(key)
     else {
         return None;
@@ -9062,7 +9085,7 @@ fn try_scan_group_agg(
                 AggFn::Sum | AggFn::Avg | AggFn::Count | AggFn::Min | AggFn::Max,
                 Some(Expr::Prop { slot: 0, key }),
             ) => {
-                let Some(Column::Num { data, present }) = store.column(key) else {
+                let Some(Column::Num { data, present, .. }) = store.column(key) else {
                     return None;
                 };
                 specs.push((Some((data.as_slice(), present.as_slice())), agg.func));
@@ -9146,7 +9169,7 @@ fn try_scan_group_agg(
     // fast — so leave those to the general aggregate (this fused path's per-agg
     // accumulator loop is slightly heavier and would regress them).
     match store.column(gkey)? {
-        Column::Str { data, present } => {
+        Column::Str { data, present, .. } => {
             run!(
                 present,
                 |i: usize| data[i].as_ref(),
@@ -9158,6 +9181,7 @@ fn try_scan_group_agg(
             dict,
             codes,
             present,
+            ..
         } => {
             // Group by CODE, mapped to a dense group id in first-seen (scan) order —
             // a per-code slot, no per-row string hash. First-seen (not dict order) is
@@ -9303,7 +9327,7 @@ fn try_scan_distinct_count(
         return None;
     };
     let count = match store.column(key)? {
-        Column::Str { data, present } => {
+        Column::Str { data, present, .. } => {
             let mut seen: FnvSet<&str> = FnvSet::default();
             scan_visit(store, label, |i| {
                 if present[i] {
@@ -9316,6 +9340,7 @@ fn try_scan_distinct_count(
             dict,
             codes,
             present,
+            ..
         } => {
             // A distinct value == a distinct code: mark a per-code bitset, no hashing.
             let mut seen = vec![false; dict.len()];
@@ -9326,7 +9351,7 @@ fn try_scan_distinct_count(
             });
             seen.iter().filter(|&&b| b).count()
         }
-        Column::Num { data, present } => {
+        Column::Num { data, present, .. } => {
             // Low-cardinality integer fast path: dedup with a bitset (popcount), no
             // hashing. Falls back to the FnvSet when values are wide-ranged or
             // non-integer. The distinct count is identical either way.
@@ -9342,7 +9367,7 @@ fn try_scan_distinct_count(
                 seen.len()
             }
         }
-        Column::Bool { data, present } => {
+        Column::Bool { data, present, .. } => {
             let mut seen = [false; 2];
             scan_visit(store, label, |i| {
                 if present[i] {
@@ -9383,7 +9408,7 @@ fn try_frontier_distinct_count(
     }
     let counts = frontier_counts(input, store)?;
     let count = match store.column(key)? {
-        Column::Str { data, present } => {
+        Column::Str { data, present, .. } => {
             let mut seen: FnvSet<&str> = FnvSet::default();
             counts.for_each(|v, _| {
                 let i = v as usize;
@@ -9397,6 +9422,7 @@ fn try_frontier_distinct_count(
             dict,
             codes,
             present,
+            ..
         } => {
             let mut seen = vec![false; dict.len()];
             counts.for_each(|v, _| {
@@ -9407,7 +9433,7 @@ fn try_frontier_distinct_count(
             });
             seen.iter().filter(|&&b| b).count()
         }
-        Column::Num { data, present } => {
+        Column::Num { data, present, .. } => {
             let mut seen: FnvSet<u64> = FnvSet::default();
             counts.for_each(|v, _| {
                 let i = v as usize;
@@ -9417,7 +9443,7 @@ fn try_frontier_distinct_count(
             });
             seen.len()
         }
-        Column::Bool { data, present } => {
+        Column::Bool { data, present, .. } => {
             let mut seen = [false; 2];
             counts.for_each(|v, _| {
                 let i = v as usize;
@@ -9463,7 +9489,7 @@ fn try_scan_multi_agg(
                 AggFn::Sum | AggFn::Avg | AggFn::Count | AggFn::Min | AggFn::Max,
                 Some(Expr::Prop { slot: 0, key }),
             ) => {
-                let Some(Column::Num { data, present }) = store.column(key) else {
+                let Some(Column::Num { data, present, .. }) = store.column(key) else {
                     return None;
                 };
                 specs.push((Some((data.as_slice(), present.as_slice())), agg.func));
@@ -13563,7 +13589,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                             // Raw-column fast path for a lone numeric neighbour compare:
                             // resolve the column ONCE, not per neighbour via `store.prop`.
                             if let [NbrPred::Cmp(k, op, Value::Num(t))] = preds.as_slice() {
-                                if let Some(Column::Num { data, present }) = store.column(k) {
+                                if let Some(Column::Num { data, present, .. }) = store.column(k) {
                                     return Ok(Col::Bool(
                                         ids.iter()
                                             .map(|&v| {
@@ -15150,14 +15176,15 @@ impl<'a> ColKeyer<'a> {
                 dict,
                 codes,
                 present,
+                ..
             } => Some(Self::Dict {
                 dict,
                 codes,
                 present,
             }),
-            Column::Num { data, present } => Some(Self::Num { data, present }),
-            Column::Str { data, present } => Some(Self::Str { data, present }),
-            Column::Bool { data, present } => Some(Self::Bool { data, present }),
+            Column::Num { data, present, .. } => Some(Self::Num { data, present }),
+            Column::Str { data, present, .. } => Some(Self::Str { data, present }),
+            Column::Bool { data, present, .. } => Some(Self::Bool { data, present }),
             _ => None,
         }
     }
@@ -15588,7 +15615,7 @@ fn try_distinct_frontier_prop(input: &Plan, store: &Store) -> Option<Batch> {
         }
     };
     match col {
-        Column::Str { data, present } => {
+        Column::Str { data, present, .. } => {
             // A hop endpoint repeats (degree-many paths reach it), and string hashing is
             // the cost — so dedup the NODES first with a cheap bitset and hash only each
             // distinct node's string once. Order is unchanged: a node's first occurrence
@@ -15615,6 +15642,7 @@ fn try_distinct_frontier_prop(input: &Plan, store: &Store) -> Option<Batch> {
             dict,
             codes,
             present,
+            ..
         } => {
             let mut seen = vec![false; dict.len()];
             for &node in frontier {
@@ -15628,7 +15656,7 @@ fn try_distinct_frontier_prop(input: &Plan, store: &Store) -> Option<Batch> {
                 }
             }
         }
-        Column::Num { data, present } => {
+        Column::Num { data, present, .. } => {
             let mut seen: FnvSet<u64> = FnvSet::default();
             for &node in frontier {
                 if node != u32::MAX && present[node as usize] {
@@ -15641,7 +15669,7 @@ fn try_distinct_frontier_prop(input: &Plan, store: &Store) -> Option<Batch> {
                 }
             }
         }
-        Column::Bool { data, present } => {
+        Column::Bool { data, present, .. } => {
             let mut seen = [false; 2];
             for &node in frontier {
                 if node != u32::MAX && present[node as usize] {
@@ -15831,7 +15859,7 @@ fn try_distinct_scan_prop(input: &Plan, store: &Store) -> Option<Batch> {
     let mut out: Vec<Value> = Vec::new();
     let mut saw_null = false;
     match store.column(key)? {
-        Column::Str { data, present } => {
+        Column::Str { data, present, .. } => {
             let mut seen: FnvSet<&str> = FnvSet::default();
             scan_visit(store, label, |i| {
                 if present[i] {
@@ -15848,6 +15876,7 @@ fn try_distinct_scan_prop(input: &Plan, store: &Store) -> Option<Batch> {
             dict,
             codes,
             present,
+            ..
         } => {
             // First-seen order is preserved by pushing when a code is first observed
             // during the scan (NOT dict order, which can differ from scan order under
@@ -15865,7 +15894,7 @@ fn try_distinct_scan_prop(input: &Plan, store: &Store) -> Option<Batch> {
                 }
             });
         }
-        Column::Num { data, present } => {
+        Column::Num { data, present, .. } => {
             // Low-card integer fast path: recover the distinct values from a bitset
             // (ascending) instead of hashing every cell. DISTINCT output order is
             // unspecified (compared as a set), so ascending is fine; a NULL is still
@@ -15893,7 +15922,7 @@ fn try_distinct_scan_prop(input: &Plan, store: &Store) -> Option<Batch> {
                 });
             }
         }
-        Column::Bool { data, present } => {
+        Column::Bool { data, present, .. } => {
             let mut seen = [false; 2];
             scan_visit(store, label, |i| {
                 if present[i] {
@@ -16013,7 +16042,7 @@ fn try_num_disjunction(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<
             _ => slot0 = Some(slot),
         }
         let Value::Num(t) = lit else { return None };
-        let Some(Column::Num { data, present }) = store.column(key) else {
+        let Some(Column::Num { data, present, .. }) = store.column(key) else {
             return None;
         };
         specs.push((data, present, op, *t));
@@ -16062,7 +16091,7 @@ fn try_num_conjunction(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<
             _ => slot0 = Some(slot),
         }
         let Value::Num(t) = lit else { return None };
-        let Some(Column::Num { data, present }) = store.column(key) else {
+        let Some(Column::Num { data, present, .. }) = store.column(key) else {
             return None;
         };
         specs.push((data, present, op, *t));
@@ -16183,7 +16212,7 @@ fn try_keep_strsearch(
     let sub = sub.as_ref();
     let mut keep = Vec::new();
     match store.column(key) {
-        Some(Column::Str { data, present }) => {
+        Some(Column::Str { data, present, .. }) => {
             for (row, &id) in ids.iter().enumerate() {
                 let i = id as usize;
                 if present[i] && (f(data[i].as_ref(), sub) != negate) {
@@ -16196,6 +16225,7 @@ fn try_keep_strsearch(
             dict,
             codes,
             present,
+            ..
         }) => {
             for (row, &id) in ids.iter().enumerate() {
                 let i = id as usize;
@@ -16300,7 +16330,7 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
                     }
                     _ => None,
                 };
-                if let (Some((op, t)), Col::Nodes(ids), Some(Column::Num { data, present })) =
+                if let (Some((op, t)), Col::Nodes(ids), Some(Column::Num { data, present, .. })) =
                     (bound, batch.slot(*s1), store.column(k1))
                 {
                     return Some(
@@ -16364,20 +16394,15 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
         let Col::Nodes(ids) = batch.slot(*slot) else {
             return None;
         };
-        // Present = a column value OR a stored present-null. Fetch both once, test per
-        // row — a present-null is column-absent, so a raw `present[]` pass would drop it.
-        let column = store.column(key);
-        let nulls = store.present_null_set(key);
-        if column.is_none() && nulls.is_none() {
+        // Present = `present_at` (a typed value OR a stored present-null via the column's
+        // nulls bit), so a stored null is counted.
+        let Some(column) = store.column(key) else {
             return Some(Vec::new());
-        }
+        };
         return Some(
             ids.iter()
                 .enumerate()
-                .filter(|&(_, &id)| {
-                    column.is_some_and(|c| c.present_at(id as usize))
-                        || nulls.is_some_and(|s| s.contains(&id))
-                })
+                .filter(|&(_, &id)| column.present_at(id as usize))
                 .map(|(row, _)| row)
                 .collect(),
         );
@@ -16411,7 +16436,7 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
     // `Value` boxing (the eval-vs-columnar cost). Semantics match the general
     // `compare`: ordering is 3VL (a NaN cell is unordered → dropped, via `<`/`>`
     // being false on NaN); equality via `==`/`!=`.
-    if let (Column::Num { data, present }, Value::Num(t)) = (column, lit) {
+    if let (Column::Num { data, present, .. }, Value::Num(t)) = (column, lit) {
         let t = *t;
         for (row, &id) in ids.iter().enumerate() {
             let i = id as usize;
@@ -16437,7 +16462,7 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
     // per-cell `Value` boxing. `=`/`<>` are byte equality (== `value::equals`);
     // ordering is lexicographic (== `cmp_partial` for two strings). A NULL cell is
     // gated by `present`; a NULL literal was handled above.
-    if let (Column::Str { data, present }, Value::Str(t)) = (column, lit) {
+    if let (Column::Str { data, present, .. }, Value::Str(t)) = (column, lit) {
         let t = t.as_ref();
         for (row, &id) in ids.iter().enumerate() {
             let i = id as usize;
@@ -16470,6 +16495,7 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
             dict,
             codes,
             present,
+            ..
         },
         Value::Str(t),
     ) = (column, lit)
@@ -16644,20 +16670,21 @@ fn read_property(store: &Store, col: &Col, key: &str) -> Col {
     }
     let general = || Col::Gen(ids.iter().map(|&i| store.prop(i, key)).collect());
     match column {
-        Column::Num { data, present } => {
+        Column::Num { data, present, .. } => {
             gather(ids, present, |i| data[i]).map_or_else(general, Col::Num)
         }
-        Column::Str { data, present } => {
+        Column::Str { data, present, .. } => {
             gather(ids, present, |i| data[i].clone()).map_or_else(general, Col::Str)
         }
         Column::Dict {
             dict,
             codes,
             present,
+            ..
         } => {
             gather(ids, present, |i| dict[codes[i] as usize].clone()).map_or_else(general, Col::Str)
         }
-        Column::Bool { data, present } => {
+        Column::Bool { data, present, .. } => {
             gather(ids, present, |i| data[i]).map_or_else(general, Col::Bool)
         }
         _ => general(),
@@ -16825,7 +16852,7 @@ fn typed_num_mask(
     };
     match batch.slot(slot) {
         Col::Nodes(ids) => {
-            let Some(Column::Num { data, present }) = store.column(key) else {
+            let Some(Column::Num { data, present, .. }) = store.column(key) else {
                 return None;
             };
             Some(
@@ -16875,7 +16902,7 @@ fn typed_str_mask(
     };
     let lit: &str = lit.as_ref();
     match store.column(key)? {
-        Column::Str { data, present } => Some(
+        Column::Str { data, present, .. } => Some(
             ids.iter()
                 .map(|&id| {
                     let i = id as usize;
@@ -16887,6 +16914,7 @@ fn typed_str_mask(
             dict,
             codes,
             present,
+            ..
         } if matches!(op, CompareOp::Eq | CompareOp::Ne) => {
             // Code compare: a present cell matches iff its code equals the literal's; a
             // literal absent from the dict matches nothing (eq→false, ne→true).
@@ -16908,6 +16936,7 @@ fn typed_str_mask(
             dict,
             codes,
             present,
+            ..
         } => Some(
             ids.iter()
                 .map(|&id| {
@@ -16946,7 +16975,7 @@ fn typed_strsearch_mask(
     };
     let sub = sub.as_ref();
     Some(match store.column(key) {
-        Some(Column::Str { data, present }) => ids
+        Some(Column::Str { data, present, .. }) => ids
             .iter()
             .map(|&id| {
                 let i = id as usize;
@@ -16957,6 +16986,7 @@ fn typed_strsearch_mask(
             dict,
             codes,
             present,
+            ..
         }) => ids
             .iter()
             .map(|&id| {

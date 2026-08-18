@@ -113,13 +113,21 @@ struct IntervalIndex {
 /// value type; a heterogeneous property falls to `Gen`.
 #[derive(Clone, Debug)]
 pub enum Column {
+    // Every TYPED variant carries a `nulls` bitset parallel to `present`: a STORED
+    // present-null (`SET k = null`) is `present[i] = false, nulls[i] = true`. So a value
+    // read (`read`, the gather fast path — both gated on `present`) sees NULL exactly as
+    // for an absent slot, but PRESENCE (`present_at` = `present || nulls`) counts it — the
+    // column NEVER de-opts to `Gen` on a null, and `has('k')` still sees it. `Gen` needs
+    // no `nulls` bit: it stores a `Value::Null` in `data` directly (present = true).
     Num {
         data: Vec<f64>,
         present: Vec<bool>,
+        nulls: Vec<bool>,
     },
     Str {
         data: Vec<Arc<str>>,
         present: Vec<bool>,
+        nulls: Vec<bool>,
     },
     /// A DICTIONARY-encoded string column: `codes[i]` indexes `dict` (the distinct
     /// values, in first-appearance order), so a low-cardinality column (a `dept` of
@@ -133,10 +141,12 @@ pub enum Column {
         dict: Vec<Arc<str>>,
         codes: Vec<u32>,
         present: Vec<bool>,
+        nulls: Vec<bool>,
     },
     Bool {
         data: Vec<bool>,
         present: Vec<bool>,
+        nulls: Vec<bool>,
     },
     /// A homogeneous temporal column: every present value is the SAME kind
     /// (`kind`). A temporal of a DIFFERENT kind — or a non-temporal — written to it
@@ -145,6 +155,7 @@ pub enum Column {
         kind: crate::temporal::TemporalKind,
         data: Vec<crate::temporal::Temporal>,
         present: Vec<bool>,
+        nulls: Vec<bool>,
     },
     Gen {
         data: Vec<Value>,
@@ -157,23 +168,26 @@ impl Column {
         Self::Num {
             data: vec![0.0; n],
             present: vec![false; n],
+            nulls: vec![false; n],
         }
     }
 
-    /// Read node `i`'s value from this column (NULL if absent). The per-node
-    /// accessor operators use when they hold a `&Column` directly.
+    /// Read node `i`'s value from this column (NULL if absent OR a stored present-null;
+    /// both gate on `present`, which a present-null clears). The per-node accessor
+    /// operators use when they hold a `&Column` directly.
     #[must_use]
     pub fn read(&self, i: usize) -> Value {
         let idx = i;
         match self {
-            Self::Num { data, present } if present[idx] => Value::Num(data[idx]),
-            Self::Str { data, present } if present[idx] => Value::Str(data[idx].clone()),
+            Self::Num { data, present, .. } if present[idx] => Value::Num(data[idx]),
+            Self::Str { data, present, .. } if present[idx] => Value::Str(data[idx].clone()),
             Self::Dict {
                 dict,
                 codes,
                 present,
+                ..
             } if present[idx] => Value::Str(dict[codes[idx] as usize].clone()),
-            Self::Bool { data, present } if present[idx] => Value::Bool(data[idx]),
+            Self::Bool { data, present, .. } if present[idx] => Value::Bool(data[idx]),
             Self::Temporal { data, present, .. } if present[idx] => Value::Temporal(data[idx]),
             Self::Gen { data, present } if present[idx] => data[idx].clone(),
             _ => Value::Null,
@@ -199,14 +213,17 @@ impl Column {
             Value::Num(_) => Self::Num {
                 data: vec![0.0; n],
                 present: vec![false; n],
+                nulls: vec![false; n],
             },
             Value::Str(_) => Self::Str {
                 data: vec![Arc::from(""); n],
                 present: vec![false; n],
+                nulls: vec![false; n],
             },
             Value::Bool(_) => Self::Bool {
                 data: vec![false; n],
                 present: vec![false; n],
+                nulls: vec![false; n],
             },
             // A temporal seeds a homogeneous typed column of its kind; absent slots
             // hold the value itself as a harmless placeholder (present-gated).
@@ -214,6 +231,7 @@ impl Column {
                 kind: t.kind(),
                 data: vec![*t; n],
                 present: vec![false; n],
+                nulls: vec![false; n],
             },
             // Records/maps (and null/list) have no typed column form yet — Gen.
             Value::Null | Value::List(_) | Value::Record(_) | Value::Map(_) => Self::Gen {
@@ -227,29 +245,52 @@ impl Column {
     /// added, so all columns stay length `node_count`.
     fn push_absent(&mut self) {
         match self {
-            Self::Num { data, present } => {
+            Self::Num {
+                data,
+                present,
+                nulls,
+            } => {
                 data.push(0.0);
                 present.push(false);
+                nulls.push(false);
             }
-            Self::Str { data, present } => {
+            Self::Str {
+                data,
+                present,
+                nulls,
+            } => {
                 data.push(Arc::from(""));
                 present.push(false);
+                nulls.push(false);
             }
-            Self::Dict { codes, present, .. } => {
+            Self::Dict {
+                codes,
+                present,
+                nulls,
+                ..
+            } => {
                 codes.push(0);
                 present.push(false);
+                nulls.push(false);
             }
-            Self::Bool { data, present } => {
+            Self::Bool {
+                data,
+                present,
+                nulls,
+            } => {
                 data.push(false);
                 present.push(false);
+                nulls.push(false);
             }
             Self::Temporal {
                 kind,
                 data,
                 present,
+                nulls,
             } => {
                 data.push(kind.zero());
                 present.push(false);
+                nulls.push(false);
             }
             Self::Gen { data, present } => {
                 data.push(Value::Null);
@@ -258,14 +299,16 @@ impl Column {
         }
     }
 
-    /// Whether this column can store `v` without a type change. A temporal column
-    /// accepts only its OWN kind (a different kind promotes to `Gen`).
+    /// Whether this column can store `v` without a type change. A typed column ACCEPTS a
+    /// `Null` (stored as a present-null via the `nulls` bit — no de-opt). A temporal
+    /// column accepts its OWN kind; a different temporal kind promotes to `Gen`.
     fn accepts(&self, v: &Value) -> bool {
         match (self, v) {
-            (Self::Num { .. }, Value::Num(_))
-            | (Self::Str { .. }, Value::Str(_))
-            | (Self::Dict { .. }, Value::Str(_))
-            | (Self::Bool { .. }, Value::Bool(_))
+            (Self::Num { .. }, Value::Num(_) | Value::Null)
+            | (Self::Str { .. }, Value::Str(_) | Value::Null)
+            | (Self::Dict { .. }, Value::Str(_) | Value::Null)
+            | (Self::Bool { .. }, Value::Bool(_) | Value::Null)
+            | (Self::Temporal { .. }, Value::Null)
             | (Self::Gen { .. }, _) => true,
             (Self::Temporal { kind, .. }, Value::Temporal(t)) => t.kind() == *kind,
             _ => false,
@@ -287,16 +330,19 @@ impl Column {
         Self::Gen { data, present }
     }
 
-    /// Whether node `i` has a present (non-NULL) value in this column.
+    /// Whether node `i` carries a PRESENT property here — a typed value OR a stored
+    /// present-null (`present || nulls`). The SINGLE source of truth for presence, so
+    /// every `has('k')` / `PropertyExists` / `hasKey` counts a stored null. (A VALUE read
+    /// gates on `present` alone, so a present-null reads NULL.)
     #[must_use]
     pub fn present_at(&self, i: usize) -> bool {
         match self {
-            Self::Num { present, .. }
-            | Self::Str { present, .. }
-            | Self::Dict { present, .. }
-            | Self::Bool { present, .. }
-            | Self::Temporal { present, .. }
-            | Self::Gen { present, .. } => present[i],
+            Self::Num { present, nulls, .. }
+            | Self::Str { present, nulls, .. }
+            | Self::Dict { present, nulls, .. }
+            | Self::Bool { present, nulls, .. }
+            | Self::Temporal { present, nulls, .. } => present[i] || nulls[i],
+            Self::Gen { present, .. } => present[i],
         }
     }
 
@@ -309,6 +355,7 @@ impl Column {
             dict,
             codes,
             present,
+            nulls,
         } = self
         else {
             return;
@@ -316,6 +363,7 @@ impl Column {
         let dict = std::mem::take(dict);
         let codes = std::mem::take(codes);
         let present = std::mem::take(present);
+        let nulls = std::mem::take(nulls);
         let data: Vec<Arc<str>> = codes
             .iter()
             .zip(&present)
@@ -327,7 +375,11 @@ impl Column {
                 }
             })
             .collect();
-        *self = Self::Str { data, present };
+        *self = Self::Str {
+            data,
+            present,
+            nulls,
+        };
     }
 
     /// Dictionary-encode this column in place if it is a low-cardinality `Str`
@@ -338,11 +390,22 @@ impl Column {
     /// code-based encoding the `materialize` path already gives, which turns GROUP BY
     /// / DISTINCT / equality over them into `u32`-code work instead of string hashing.
     fn try_dict_encode(&mut self) {
-        if let Self::Str { data, present } = self {
+        if let Self::Str {
+            data,
+            present,
+            nulls,
+        } = self
+        {
             let data = std::mem::take(data);
             let present = std::mem::take(present);
-            *self = dict_encode(data, present)
-                .unwrap_or_else(|(data, present)| Self::Str { data, present });
+            let nulls = std::mem::take(nulls);
+            *self = dict_encode(data, present, nulls).unwrap_or_else(|(data, present, nulls)| {
+                Self::Str {
+                    data,
+                    present,
+                    nulls,
+                }
+            });
         }
     }
 
@@ -352,22 +415,75 @@ impl Column {
         // A dictionary column is a read encoding — decode to `Str` before mutating,
         // so it never has to grow its dict on the write path.
         self.decode_dict();
+        // A stored NULL keeps a typed column TYPED: clear the value bit, set the null
+        // bit (so `read` yields NULL but `present_at` still counts it). `Gen` stores the
+        // `Value::Null` in `data` directly.
+        if matches!(v, Value::Null) {
+            match self {
+                Self::Num { present, nulls, .. }
+                | Self::Str { present, nulls, .. }
+                | Self::Bool { present, nulls, .. }
+                | Self::Temporal { present, nulls, .. } => {
+                    present[i] = false;
+                    nulls[i] = true;
+                }
+                Self::Gen { data, present } => {
+                    data[i] = Value::Null;
+                    present[i] = true;
+                }
+                Self::Dict { .. } => unreachable!("decoded to Str above"),
+            }
+            return;
+        }
         match (self, v) {
-            (Self::Num { data, present }, Value::Num(x)) => {
+            (
+                Self::Num {
+                    data,
+                    present,
+                    nulls,
+                },
+                Value::Num(x),
+            ) => {
                 data[i] = x;
                 present[i] = true;
+                nulls[i] = false;
             }
-            (Self::Str { data, present }, Value::Str(s)) => {
+            (
+                Self::Str {
+                    data,
+                    present,
+                    nulls,
+                },
+                Value::Str(s),
+            ) => {
                 data[i] = s;
                 present[i] = true;
+                nulls[i] = false;
             }
-            (Self::Bool { data, present }, Value::Bool(b)) => {
+            (
+                Self::Bool {
+                    data,
+                    present,
+                    nulls,
+                },
+                Value::Bool(b),
+            ) => {
                 data[i] = b;
                 present[i] = true;
+                nulls[i] = false;
             }
-            (Self::Temporal { data, present, .. }, Value::Temporal(t)) => {
+            (
+                Self::Temporal {
+                    data,
+                    present,
+                    nulls,
+                    ..
+                },
+                Value::Temporal(t),
+            ) => {
                 data[i] = t;
                 present[i] = true;
+                nulls[i] = false;
             }
             (Self::Gen { data, present }, v) => {
                 data[i] = v;
@@ -377,15 +493,19 @@ impl Column {
         }
     }
 
-    /// Mark node `i` absent — a removed property reads as NULL again.
+    /// Mark node `i` absent — a removed property reads as NULL AND stops being present
+    /// (distinct from a stored present-null, which stays present).
     fn set_absent(&mut self, i: usize) {
         match self {
-            Self::Num { present, .. }
-            | Self::Str { present, .. }
-            | Self::Dict { present, .. }
-            | Self::Bool { present, .. }
-            | Self::Temporal { present, .. }
-            | Self::Gen { present, .. } => present[i] = false,
+            Self::Num { present, nulls, .. }
+            | Self::Str { present, nulls, .. }
+            | Self::Dict { present, nulls, .. }
+            | Self::Bool { present, nulls, .. }
+            | Self::Temporal { present, nulls, .. } => {
+                present[i] = false;
+                nulls[i] = false;
+            }
+            Self::Gen { present, .. } => present[i] = false,
         }
     }
 
@@ -393,25 +513,52 @@ impl Column {
     /// transaction rolls back the node that a logged `add_node` appended.
     fn pop_last(&mut self) {
         match self {
-            Self::Num { data, present } => {
+            Self::Num {
+                data,
+                present,
+                nulls,
+            } => {
                 data.pop();
                 present.pop();
+                nulls.pop();
             }
-            Self::Str { data, present } => {
+            Self::Str {
+                data,
+                present,
+                nulls,
+            } => {
                 data.pop();
                 present.pop();
+                nulls.pop();
             }
-            Self::Dict { codes, present, .. } => {
+            Self::Dict {
+                codes,
+                present,
+                nulls,
+                ..
+            } => {
                 codes.pop();
                 present.pop();
+                nulls.pop();
             }
-            Self::Bool { data, present } => {
+            Self::Bool {
+                data,
+                present,
+                nulls,
+            } => {
                 data.pop();
                 present.pop();
+                nulls.pop();
             }
-            Self::Temporal { data, present, .. } => {
+            Self::Temporal {
+                data,
+                present,
+                nulls,
+                ..
+            } => {
                 data.pop();
                 present.pop();
+                nulls.pop();
             }
             Self::Gen { data, present } => {
                 data.pop();
@@ -875,14 +1022,6 @@ pub struct Store {
     by_label: HashMap<String, Vec<u32>>,
     /// property name -> its typed column (length == node_count).
     props: HashMap<String, Column>,
-    /// Node ids carrying a STORED PRESENT NULL per property key — a `SET k = null`,
-    /// distinct from an absent key. Keeping it here (rather than as a typed-column value)
-    /// means a null NEVER de-opts a typed column to `Gen`: the column keeps the node's
-    /// slot absent, and this side map records that the absence is a *present* null. Only
-    /// `has_prop`/`PropertyExists` consult it (present-null and absent both READ null), so
-    /// the column read fast paths are untouched. Empty for the overwhelming null-free
-    /// majority; a key with no present-nulls holds no entry.
-    present_nulls: HashMap<String, crate::exec::fnv::Set<u32>>,
     /// Cached SORTED property-key list for element-map materialization. Property keys
     /// are only ever ADDED to `props` (a removed value keeps its column), so `props.len()`
     /// changing is exactly the key SET changing — the cache self-invalidates on a length
@@ -1074,7 +1213,6 @@ impl Clone for Store {
             limits: self.limits,
             by_label: self.by_label.clone(),
             props: self.props.clone(),
-            present_nulls: self.present_nulls.clone(),
             prop_keys_cache: std::sync::RwLock::new(
                 self.prop_keys_cache
                     .read()
@@ -2703,22 +2841,11 @@ impl Store {
     /// present `Null`, which `prop` cannot tell from absence).
     #[must_use]
     pub fn has_prop(&self, node: u32, key: &str) -> bool {
-        // Present iff the column holds a value OR the node carries a stored present-null.
+        // Presence is `present_at` — a typed value OR a stored present-null (the column's
+        // `nulls` bit). Single source of truth, so every presence check counts a null.
         self.props
             .get(key)
             .is_some_and(|c| c.present_at(node as usize))
-            || self
-                .present_nulls
-                .get(key)
-                .is_some_and(|set| set.contains(&node))
-    }
-
-    /// The set of node ids carrying a stored present-null for `key`, or `None` if none —
-    /// so a presence-filter hot loop can fetch it ONCE and test `contains` per row
-    /// alongside the column's `present_at` (see the `PropertyExists` filter fast path).
-    #[must_use]
-    pub fn present_null_set(&self, key: &str) -> Option<&crate::exec::fnv::Set<u32>> {
-        self.present_nulls.get(key).filter(|s| !s.is_empty())
     }
 
     /// Set node `node`'s `key` to `value`, creating the column if new and
@@ -2753,36 +2880,14 @@ impl Store {
     }
 
     fn apply_set_prop(&mut self, node: u32, key: &str, value: Value) {
-        // A STORED PRESENT NULL never touches a typed column: clear any typed value (and
-        // its index entry), then record the node in the side map. This is what makes
-        // `SET k = null` non-de-opting — the column stays typed. `apply_remove_prop`
-        // already drops the side-map entry, so re-insert after.
-        if matches!(value, Value::Null) {
-            self.apply_remove_prop(node, key);
-            // Keep the key in `props` (an all-absent column if brand-new) so key
-            // enumeration — `prop_keys`, element maps, NDJSON — still sees a key that so
-            // far has ONLY present-nulls. A pre-existing typed column is left untouched
-            // (the node's slot just stays absent), which is the whole point: no de-opt.
-            let n = self.node_count;
-            self.props
-                .entry(key.to_string())
-                .or_insert_with(|| Column::new_absent(&Value::Null, n));
-            self.present_nulls
-                .entry(key.to_string())
-                .or_default()
-                .insert(node);
-            return;
-        }
-        // A real value overwrites any prior present-null for this node.
-        if let Some(set) = self.present_nulls.get_mut(key) {
-            set.remove(&node);
-        }
-        // Index upkeep: capture the OLD base value (from the COLUMN — a present-null was
-        // never indexed) before writing, and a copy of the new one. A hash index may be
-        // dotted, so it is keyed by the BASE property `key`; the range index is single-key.
+        // Index upkeep: capture the OLD indexed value (from the COLUMN — `column_value`
+        // reads NULL for absent AND a present-null, so neither is treated as an old index
+        // entry) before writing, and the new one. A NULL is never seek-indexed
+        // (`WHERE k = null` matches nothing), so it is excluded from both indexes — but a
+        // NULL that REPLACES a value still drops that value's old entry.
         let care = self.index_on_base(key) || self.is_range_indexed(key);
         let old = care.then(|| self.column_value(node, key)).flatten();
-        let new_for_index = care.then(|| value.clone());
+        let new_for_index = (care && !value.is_null()).then(|| value.clone());
 
         let n = self.node_count;
         let col = self
@@ -2792,16 +2897,28 @@ impl Store {
         if !col.accepts(&value) {
             *col = col.to_gen();
         }
+        // A typed column ACCEPTS a NULL (via `accepts`), so this stores a present-null in
+        // its `nulls` bit — no de-opt. `Gen` stores the `Value::Null` in `data` directly.
         col.set(node as usize, value);
 
-        if let Some(nv) = new_for_index {
-            self.reindex_node(key, node, old.as_ref(), Some(&nv));
-            if self.is_range_indexed(key) {
-                if let Some(old) = &old {
+        match (new_for_index, &old) {
+            (Some(nv), _) => {
+                self.reindex_node(key, node, old.as_ref(), Some(&nv));
+                if self.is_range_indexed(key) {
+                    if let Some(old) = &old {
+                        self.range_remove(key, old, node);
+                    }
+                    self.range_add(key, &nv, node);
+                }
+            }
+            // A NULL replacing a value: remove the old entry, add nothing.
+            (None, Some(old)) => {
+                self.reindex_node(key, node, Some(old), None);
+                if self.is_range_indexed(key) {
                     self.range_remove(key, old, node);
                 }
-                self.range_add(key, &nv, node);
             }
+            (None, None) => {}
         }
     }
 
@@ -2827,11 +2944,8 @@ impl Store {
     }
 
     fn apply_remove_prop(&mut self, node: u32, key: &str) {
-        // A REMOVE makes the key ABSENT — drop a present-null too, so it is distinct from
-        // a stored null (which `has('k')` still sees).
-        if let Some(set) = self.present_nulls.get_mut(key) {
-            set.remove(&node);
-        }
+        // A REMOVE makes the key ABSENT — `set_absent` clears BOTH the value bit and the
+        // null bit, so it is distinct from a stored present-null (which `has('k')` sees).
         // Drop the node from the index(es) for its OLD (column) value, if indexed.
         let old = ((self.index_on_base(key) || self.is_range_indexed(key))
             && self.column_value(node, key).is_some())
@@ -3940,7 +4054,6 @@ impl Builder {
             limits: GraphLimits::default(),
             by_label: self.by_label,
             props,
-            present_nulls: HashMap::new(),
             prop_keys_cache: std::sync::RwLock::default(),
             min_label_cache: std::sync::RwLock::default(),
             etype_ids: self.etype_ids,
@@ -4007,10 +4120,12 @@ impl Builder {
 /// `Str` column when the cardinality is too high for the encoding to pay (`name`, an
 /// id, free text). The probe aborts the moment the dict crosses the cap, so a
 /// high-cardinality column costs only the capped prefix, not a full scan.
+#[allow(clippy::type_complexity)]
 fn dict_encode(
     data: Vec<Arc<str>>,
     present: Vec<bool>,
-) -> Result<Column, (Vec<Arc<str>>, Vec<bool>)> {
+    nulls: Vec<bool>,
+) -> Result<Column, (Vec<Arc<str>>, Vec<bool>, Vec<bool>)> {
     const CAP: usize = 4096;
     let mut dict: Vec<Arc<str>> = Vec::new();
     let mut lookup: HashMap<Arc<str>, u32> = HashMap::new();
@@ -4023,7 +4138,7 @@ fn dict_encode(
             c
         } else {
             if dict.len() >= CAP {
-                return Err((data, present));
+                return Err((data, present, nulls));
             }
             let c = dict.len() as u32;
             dict.push(s.clone());
@@ -4037,12 +4152,13 @@ fn dict_encode(
     // per row AND a full dict for no dedup benefit and a slower indirected read, so
     // it stays `Str`. `dept`/`city`/`status`-shaped columns clear this easily.
     if dict.is_empty() || dict.len() * 2 > data.len() {
-        return Err((data, present));
+        return Err((data, present, nulls));
     }
     Ok(Column::Dict {
         dict,
         codes,
         present,
+        nulls,
     })
 }
 
@@ -4052,7 +4168,7 @@ fn materialize(pairs: Vec<(u32, Value)>, n: usize) -> Column {
     let all = |f: &dyn Fn(&Value) -> bool| pairs.iter().all(|(_, v)| f(v));
     if all(&|v| matches!(v, Value::Num(_))) {
         let mut col = Column::with_capacity_num(n);
-        if let Column::Num { data, present } = &mut col {
+        if let Column::Num { data, present, .. } = &mut col {
             for (i, v) in pairs {
                 if let Value::Num(x) = v {
                     data[i as usize] = x;
@@ -4070,7 +4186,13 @@ fn materialize(pairs: Vec<(u32, Value)>, n: usize) -> Column {
                 present[i as usize] = true;
             }
         }
-        dict_encode(data, present).unwrap_or_else(|(data, present)| Column::Str { data, present })
+        dict_encode(data, present, vec![false; n]).unwrap_or_else(|(data, present, nulls)| {
+            Column::Str {
+                data,
+                present,
+                nulls,
+            }
+        })
     } else if all(&|v| matches!(v, Value::Bool(_))) {
         let mut data = vec![false; n];
         let mut present = vec![false; n];
@@ -4080,7 +4202,11 @@ fn materialize(pairs: Vec<(u32, Value)>, n: usize) -> Column {
                 present[i as usize] = true;
             }
         }
-        Column::Bool { data, present }
+        Column::Bool {
+            data,
+            present,
+            nulls: vec![false; n],
+        }
     } else if let Some(kind) = homogeneous_temporal_kind(&pairs) {
         let mut data = vec![kind.zero(); n];
         let mut present = vec![false; n];
@@ -4094,6 +4220,7 @@ fn materialize(pairs: Vec<(u32, Value)>, n: usize) -> Column {
             kind,
             data,
             present,
+            nulls: vec![false; n],
         }
     } else {
         let mut data = vec![Value::Null; n];
