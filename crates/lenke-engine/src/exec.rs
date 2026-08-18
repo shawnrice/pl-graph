@@ -495,6 +495,40 @@ pub(crate) fn enforce_read_only(store: &Store) -> Result<(), String> {
     Ok(())
 }
 
+/// The outcome of [`run_query`]: either rows already materialized (a transaction
+/// -control command or a write), or a read whose optimized plan is handed back so
+/// the caller can take its language-specific STREAMING JSON path (the perf-critical
+/// route we must not collapse into a materialized batch).
+pub enum Executed {
+    /// A `TxControl` result or a write's returned rows — already produced.
+    Rows(Rows),
+    /// A read: the optimized plan, for the caller to stream.
+    Read(Plan),
+}
+
+/// The single query entry point for a parsed plan against a MUTABLE store. In one
+/// place — so every embedder (the C ABI, a future in-process host) gets identical
+/// semantics — it dispatches ISO transaction control (`START TRANSACTION`/`COMMIT`/
+/// `ROLLBACK`), enforces `READ ONLY`, and splits writes from reads. This mirrors
+/// core, whose eval layer (not its ABI) owns transaction dispatch; previously the
+/// engine duplicated this decision at each FFI language arm.
+///
+/// A `TxControl` command yields no rows and is neither optimized nor planned. Every
+/// other plan is optimized here; a write is rejected under a READ ONLY transaction,
+/// then executed; a read is returned as [`Executed::Read`] for the caller to stream.
+pub fn run_query(plan: Plan, store: &mut Store) -> Result<Executed, String> {
+    if let Plan::TxControl { kind, read_only } = plan {
+        return run_tx_control(store, kind, read_only).map(Executed::Rows);
+    }
+    let plan = crate::opt::optimize_indexed(plan, store);
+    if is_write(&plan) {
+        enforce_read_only(store)?;
+        execute(&plan, store).map(Executed::Rows)
+    } else {
+        Ok(Executed::Read(plan))
+    }
+}
+
 /// The `FAULT_ID_DUP` message, matching core: a string `id` is an element's unique
 /// external identity. The `E_UNIQUE:` prefix maps to `E_CONSTRAINT_VIOLATION`.
 const ID_DUP_ERR: &str = "E_UNIQUE: an element with this id already exists — a string `id` \
@@ -20974,20 +21008,16 @@ mod tests {
 
     // ---- ISO transaction-control keywords (START TRANSACTION / COMMIT / ROLLBACK) ----
 
-    /// Run one GQL statement exactly as `lnk_query`'s GQL path does: route a
-    /// transaction-control command to `run_tx_control`, reject a write under a READ
-    /// ONLY transaction, else run the query. Reads go through `run`, writes through
-    /// `execute` — so these tests exercise the real integration, not the pieces.
+    /// Run one GQL statement exactly as `lnk_query`'s GQL path does — through the
+    /// shared [`run_query`] dispatcher (transaction control, READ ONLY enforcement,
+    /// write/read split), materializing a returned read the way the FFI read path
+    /// streams it. So these tests exercise the real integration, not the pieces.
     fn stmt(store: &mut Store, q: &str) -> Result<Rows, String> {
         let plan = crate::gql::parse(q)?;
-        if let Plan::TxControl { kind, read_only } = plan {
-            return run_tx_control(store, kind, read_only);
+        match run_query(plan, store)? {
+            Executed::Rows(rows) => Ok(rows),
+            Executed::Read(plan) => Ok(run(&plan, store)),
         }
-        if is_write(&plan) {
-            enforce_read_only(store)?;
-            return execute(&plan, store);
-        }
-        Ok(run(&plan, store))
     }
 
     /// Parse `q` and extract the `(kind, read_only)` of the resulting `TxControl`

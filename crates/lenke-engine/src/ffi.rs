@@ -562,29 +562,13 @@ pub unsafe extern "C" fn lnk_query(
                     return std::ptr::null_mut();
                 }
             };
-            // An ISO transaction-control command (`START TRANSACTION`/`COMMIT`/
-            // `ROLLBACK`) drives the session's transaction frame and yields no rows —
-            // it is neither optimized nor run as a query plan.
-            if let crate::ir::Plan::TxControl { kind, read_only } = plan {
-                guarded(|| {
-                    crate::exec::run_tx_control(store, kind, read_only)
-                        .map(|rows| crate::json::gql_rows_json(&rows))
-                })
-            } else {
-                let plan = crate::opt::optimize_indexed(plan, store);
-                // A write query (SET/INSERT/_MERGE/…) runs through the mutable executor
-                // and renders its result rows — but is rejected first if the active
-                // transaction is READ ONLY; a read takes the streaming JSON path.
-                if crate::exec::is_write(&plan) {
-                    guarded(|| {
-                        crate::exec::enforce_read_only(store)
-                            .and_then(|()| crate::exec::execute(&plan, store))
-                            .map(|rows| crate::json::gql_rows_json(&rows))
-                    })
-                } else {
-                    guarded(|| crate::exec::try_run_gql_json(&plan, store))
-                }
-            }
+            // The shared dispatcher handles transaction control, READ ONLY enforcement
+            // and the write/read split (see `exec::run_query`); a returned read takes
+            // the GQL streaming JSON path, everything else renders its materialized rows.
+            guarded(|| match crate::exec::run_query(plan, store)? {
+                crate::exec::Executed::Rows(rows) => Ok(crate::json::gql_rows_json(&rows)),
+                crate::exec::Executed::Read(plan) => crate::exec::try_run_gql_json(&plan, store),
+            })
         }
         1 => {
             // Gremlin bindings are a distinct mechanism (bytecode bindings); the engine
@@ -597,27 +581,24 @@ pub unsafe extern "C" fn lnk_query(
                 return std::ptr::null_mut();
             }
             let plan = match crate::gremlin::parse(q) {
-                Ok(plan) => crate::opt::optimize_indexed(plan, store),
+                Ok(plan) => plan,
                 Err(e) => {
                     crate::ffi_error::set("E_SYNTAX", &e);
                     return std::ptr::null_mut();
                 }
             };
-            // A Gremlin write (`addV`/`property`/`drop`/`addE`, or a
-            // `property(k,v).values(k)` read-after-write UpdateReturn) runs through the
-            // mutable executor — like the GQL path — then renders its rows as the bare
-            // Gremlin value array. Previously EVERY Gremlin query took the read-only
-            // `try_run_gremlin_json` path, so a bare write faulted (a write plan pulls to
-            // an empty batch). A read takes the streaming JSON path.
-            if crate::exec::is_write(&plan) {
-                guarded(|| {
-                    crate::exec::enforce_read_only(store)
-                        .and_then(|()| crate::exec::execute(&plan, store))
-                        .map(|rows| crate::json::gremlin_results_json(&rows))
-                })
-            } else {
-                guarded(|| crate::exec::try_run_gremlin_json(&plan, store))
-            }
+            // Same shared dispatcher as GQL (see `exec::run_query`): a Gremlin write
+            // (`addV`/`property`/`drop`/`addE`, or a `property(k,v).values(k)`
+            // read-after-write) runs through the mutable executor and renders its rows
+            // as the bare Gremlin value array; a read takes the streaming JSON path.
+            // (Gremlin has no transaction-control syntax, so the `TxControl` arm of the
+            // dispatcher never fires here — host-driven transactions come via `lnk_tx`.)
+            guarded(|| match crate::exec::run_query(plan, store)? {
+                crate::exec::Executed::Rows(rows) => Ok(crate::json::gremlin_results_json(&rows)),
+                crate::exec::Executed::Read(plan) => {
+                    crate::exec::try_run_gremlin_json(&plan, store)
+                }
+            })
         }
         _ => {
             crate::ffi_error::set("E_FFI", "unknown query language");
