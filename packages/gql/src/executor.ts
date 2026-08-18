@@ -31,6 +31,7 @@ import type {
   Projection,
   PropertyConstraint,
   Quantifier,
+  ReturnItem,
   Query,
   RelPattern,
   Segment,
@@ -2595,6 +2596,341 @@ const patternVars = (patterns: readonly PathPattern[]): string[] => {
   return vars;
 };
 
+// --- compile-time scope validation ------------------------------------------
+// A reference to a variable that no clause has bound (in the scope at that point) is an
+// ERROR, matching the native engine (which rejects it while parsing) and ISO GQL / Cypher
+// ("variable not defined") — NOT a silent null (which would hide a typo'd name). Runs over
+// the AST at compile time, so `compile(parse(q))` / `query(...)` faults identically
+// regardless of row count.
+
+const scopeError = (name: string): never => {
+  throw new LenkeError(`variable \`${name}\` is not defined`, { code: ErrorCode.Syntax });
+};
+
+// The name a projection item publishes: its explicit alias, or — for a bare variable /
+// property access — that variable / key; a complex unaliased item names nothing here.
+const itemOutputName = (item: ReturnItem): string | undefined => {
+  if (item.alias !== undefined) {
+    return item.alias;
+  }
+
+  if (item.expr.kind === 'var') {
+    return item.expr.name;
+  }
+
+  if (item.expr.kind === 'prop') {
+    return item.expr.key;
+  }
+
+  return undefined;
+};
+
+// The output column names a projection publishes (the scope AFTER a `WITH`): `*` carries
+// the incoming scope forward, plus each item's published name.
+const projectionNames = (proj: Projection, incoming: ReadonlySet<string>): Set<string> => {
+  const out = new Set<string>(proj.star ? incoming : []);
+
+  for (const item of proj.items) {
+    const name = itemOutputName(item);
+
+    if (name !== undefined) {
+      out.add(name);
+    }
+  }
+
+  return out;
+};
+
+// A copy of `scope` with `extra` added.
+const extendedScope = (scope: ReadonlySet<string>, extra: Iterable<string>): Set<string> => {
+  const out = new Set(scope);
+
+  for (const v of extra) {
+    out.add(v);
+  }
+
+  return out;
+};
+
+// The direct sub-expressions of `expr` — the generic recursion for kinds that only
+// CONTAIN expressions. The reference kinds (`var`/`prop`/…) and the scope-introducing
+// kinds (subqueries, `letIn`) are handled explicitly in `checkExprScope`.
+const childExprs = (expr: Expr): readonly Expr[] => {
+  switch (expr.kind) {
+    case 'list':
+    case 'concat':
+    case 'and':
+    case 'or':
+    case 'xor':
+      return expr.items;
+    case 'record':
+      return expr.fields.map((f) => f.value);
+    case 'func':
+    case 'graphPred':
+      return expr.args;
+    case 'index':
+      return [expr.base, expr.index];
+    case 'field':
+      return [expr.base];
+    case 'neg':
+    case 'not':
+    case 'isNull':
+    case 'isTruth':
+    case 'isLabeled':
+    case 'isTyped':
+      return [expr.expr];
+    case 'compare':
+      return [expr.left, expr.right];
+    case 'arith':
+      return [expr.head, ...expr.tail.map(([, e]) => e)];
+    case 'in':
+      return [expr.expr, expr.list];
+    case 'case':
+      return [
+        ...(expr.subject ? [expr.subject] : []),
+        ...expr.whens.flatMap((w) => [w.when, w.then]),
+        ...(expr.elseExpr ? [expr.elseExpr] : []),
+      ];
+    default:
+      return [];
+  }
+};
+
+// Throw on any variable / property reference in `expr` whose base name is not in `scope`.
+// Sub-queries (`EXISTS`/`COUNT`/`VALUE {…}`) are correlated — the outer scope stays visible
+// and their own pattern variables are added; `letIn` binds its locals for the body.
+const checkExprScope = (expr: Expr, scope: ReadonlySet<string>): void => {
+  switch (expr.kind) {
+    case 'var':
+      if (!scope.has(expr.name)) {
+        scopeError(expr.name);
+      }
+
+      return;
+    case 'prop':
+    case 'property_exists':
+      if (!scope.has(expr.variable)) {
+        scopeError(expr.variable);
+      }
+
+      return;
+    case 'exists':
+    case 'countSubquery': {
+      const inner = extendedScope(scope, patternVars(expr.patterns));
+
+      if (expr.where) {
+        checkExprScope(expr.where, inner);
+      }
+
+      return;
+    }
+    case 'valueSubquery': {
+      const inner = extendedScope(scope, patternVars(expr.patterns));
+
+      if (expr.where) {
+        checkExprScope(expr.where, inner);
+      }
+
+      checkExprScope(expr.ret, inner);
+
+      return;
+    }
+    case 'letIn': {
+      const inner = new Set(scope);
+
+      for (const b of expr.bindings) {
+        checkExprScope(b.expr, inner);
+        inner.add(b.var);
+      }
+
+      checkExprScope(expr.body, inner);
+
+      return;
+    }
+    default:
+      for (const child of childExprs(expr)) {
+        checkExprScope(child, scope);
+      }
+  }
+};
+
+// Validate a projection's expressions; its HAVING / ORDER BY may also reference the
+// projection's OUTPUT aliases (`RETURN a + b AS c ORDER BY c`), so those see `scope` plus
+// the published names.
+const checkProjection = (proj: Projection, scope: ReadonlySet<string>): void => {
+  for (const item of proj.items) {
+    checkExprScope(item.expr, scope);
+  }
+
+  if (proj.groupBy) {
+    for (const g of proj.groupBy) {
+      checkExprScope(g, scope);
+    }
+  }
+
+  const withOut = new Set(scope);
+
+  for (const n of projectionNames(proj, scope)) {
+    withOut.add(n);
+  }
+
+  if (proj.having) {
+    checkExprScope(proj.having, withOut);
+  }
+
+  if (proj.orderBy) {
+    for (const s of proj.orderBy) {
+      checkExprScope(s.expr, withOut);
+    }
+  }
+};
+
+// A write / call clause: validates its expressions and updates `scope` in place. Returns
+// 'stop' when the rest of the linear part must NOT be scope-enforced — a subquery / bare
+// CALL introduces output columns this pass cannot enumerate, so a later reference to one
+// must not be a false positive.
+const checkWriteClauseScope = (clause: Clause, scope: Set<string>): 'stop' | 'continue' => {
+  switch (clause.kind) {
+    case 'callInline':
+      for (const part of clause.body.parts) {
+        checkLinearScope(part.clauses, new Set(clause.scope));
+      }
+
+      return 'stop';
+    case 'callNamed':
+      for (const c of clause.config) {
+        checkExprScope(c.value, scope);
+      }
+
+      if (!clause.yields) {
+        return 'stop';
+      }
+
+      for (const y of clause.yields) {
+        scope.add(y.alias ?? y.name);
+      }
+
+      return 'continue';
+    case 'insert':
+    case 'merge': {
+      const pats = clause.kind === 'insert' ? clause.patterns : [clause.pattern];
+
+      for (const v of patternVars(pats)) {
+        scope.add(v);
+      }
+
+      return 'continue';
+    }
+    case 'set':
+      for (const item of clause.items) {
+        if (!scope.has(item.variable)) {
+          scopeError(item.variable);
+        }
+
+        if ('value' in item) {
+          checkExprScope(item.value, scope);
+        }
+      }
+
+      return 'continue';
+    case 'remove':
+      for (const item of clause.items) {
+        if (!scope.has(item.variable)) {
+          scopeError(item.variable);
+        }
+      }
+
+      return 'continue';
+    case 'delete':
+      for (const t of clause.targets) {
+        checkExprScope(t, scope);
+      }
+
+      return 'continue';
+    default:
+      return 'continue';
+  }
+};
+
+// Walk one linear query, evolving the bound-variable scope clause by clause, validating
+// each clause's expressions against the scope visible to it.
+const checkLinearScope = (clauses: readonly Clause[], initial: ReadonlySet<string>): void => {
+  const scope = new Set(initial);
+
+  for (const clause of clauses) {
+    switch (clause.kind) {
+      case 'match': {
+        const withPat = new Set(scope);
+
+        for (const v of patternVars(clause.patterns)) {
+          withPat.add(v);
+        }
+
+        if (clause.where) {
+          checkExprScope(clause.where, withPat);
+        }
+
+        for (const v of withPat) {
+          scope.add(v);
+        }
+
+        break;
+      }
+      case 'for':
+        checkExprScope(clause.list, scope);
+        scope.add(clause.alias);
+
+        if (clause.ordinality) {
+          scope.add(clause.ordinality.var);
+        }
+
+        break;
+      case 'let':
+        for (const item of clause.items) {
+          checkExprScope(item.expr, scope);
+          scope.add(item.var);
+        }
+
+        break;
+      case 'filter':
+        checkExprScope(clause.where, scope);
+        break;
+      case 'with': {
+        checkProjection(clause.projection, scope);
+        const next = projectionNames(clause.projection, scope);
+
+        if (clause.where) {
+          checkExprScope(clause.where, next);
+        }
+
+        scope.clear();
+
+        for (const v of next) {
+          scope.add(v);
+        }
+
+        break;
+      }
+      case 'return':
+        checkProjection(clause.projection, scope);
+        break;
+      case 'page':
+        if (clause.orderBy) {
+          for (const s of clause.orderBy) {
+            checkExprScope(s.expr, scope);
+          }
+        }
+
+        break;
+      default:
+        // Write / call clauses (and a subquery whose columns this pass can't enumerate).
+        if (checkWriteClauseScope(clause, scope) === 'stop') {
+          return;
+        }
+    }
+  }
+};
+
 /** A compiled SET assignment: a label add, or a property set with a value closure. */
 export type CSetItem =
   | { variable: string; label: string }
@@ -3192,6 +3528,13 @@ const reviveParams = (params: Params): Params => {
  * params; it never re-parses or re-analyzes.
  */
 export const compile = <R extends Row = Row>(query: Query): Plan<R> => {
+  // Eager scope validation: a reference to an unbound variable faults NOW (at compile),
+  // matching the native engine and ISO GQL / Cypher — not a silent null at run time. Each
+  // set-op part is its own scope (starts empty).
+  for (const part of query.parts) {
+    checkLinearScope(part.clauses, new Set());
+  }
+
   const referenced = new Set<string>();
   const unknownFns = new Set<string>();
   const countParams = new Set<string>();

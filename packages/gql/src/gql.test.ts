@@ -1180,3 +1180,37 @@ describe('GQL: ISO reserved words', () => {
     expect((rows[0].names as string[]).sort()).toEqual(['josh', 'marko', 'peter', 'vadas']);
   });
 });
+
+describe('GQL: unbound variables are a compile-time error', () => {
+  const g = createTestSocialGraph();
+
+  test('a reference to a variable no clause binds faults (not a silent null)', () => {
+    // The native engine rejects this while parsing; ISO GQL / Cypher call it "variable
+    // not defined". Previously pure-TS resolved it to null, hiding the typo.
+    expect(() => query(g, `RETURN n.x AS y`)).toThrow();
+    expect(() => query(g, `RETURN unknownVar AS y`)).toThrow();
+    expect(() => query(g, `FOR v IN [n.x] RETURN v AS x`)).toThrow();
+    expect(() => query(g, `MATCH (m:Person) WHERE n.age > 0 RETURN m.name AS y`)).toThrow();
+    // A variable dropped by a WITH projection is out of scope afterwards.
+    expect(() => query(g, `MATCH (p:Person) WITH p.name AS nm RETURN p.age AS a`)).toThrow();
+  });
+
+  test('every binding form puts its variable in scope', () => {
+    // MATCH pattern var, LET, FOR alias (+ ordinality), WITH alias, and a correlated
+    // subquery seeing the outer variable — none of these should fault.
+    expect(query(g, `MATCH (p:Person) RETURN p.name AS n`).length).toBeGreaterThan(0);
+    expect(query(g, `LET x = 1 RETURN x AS y`)).toEqual([{ y: 1 }]);
+    expect(query(g, `FOR v IN [1, 2] WITH ORDINALITY i RETURN v AS a, i AS b`)).toEqual([
+      { a: 1, b: 1 },
+      { a: 2, b: 2 },
+    ]);
+    expect(query(g, `MATCH (p:Person) WITH p.name AS nm RETURN nm AS out`).length).toBeGreaterThan(
+      0,
+    );
+    expect(
+      query(g, `MATCH (p:Person) WHERE EXISTS { (p)-[:KNOWS]->(f) } RETURN p.name AS n`).length,
+    ).toBeGreaterThan(0);
+    // ORDER BY may reference an output alias.
+    expect(query(g, `MATCH (p:Person) RETURN p.age AS a ORDER BY a`).length).toBeGreaterThan(0);
+  });
+});
