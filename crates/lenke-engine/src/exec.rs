@@ -16205,9 +16205,27 @@ fn try_keep_strsearch(
             }
             Some(keep)
         }
+        // A boxed (de-opted) column may still hold STRING cells per row — a Str/Dict
+        // column that a null or type-mixed write promoted to `Gen`. Test each string
+        // cell; a non-string or absent cell is UNKNOWN → dropped (both directions),
+        // matching `str_bool`. (Skipping this returned NO rows for a de-opted column.)
+        Some(Column::Gen { data, present }) => {
+            for (row, &id) in ids.iter().enumerate() {
+                let i = id as usize;
+                if present[i] {
+                    if let Value::Str(str_val) = &data[i] {
+                        if f(str_val.as_ref(), sub) != negate {
+                            keep.push(row);
+                        }
+                    }
+                }
+            }
+            Some(keep)
+        }
         // Column absent everywhere → every cell UNKNOWN → dropped (both directions).
         None => Some(Vec::new()),
-        // A non-string column: `str_bool` yields NULL → no match (both directions).
+        // A genuinely non-string typed column (Num/Bool/…): `str_bool` yields NULL → no
+        // match (both directions).
         _ => Some(Vec::new()),
     }
 }
@@ -16939,7 +16957,22 @@ fn typed_strsearch_mask(
                 present[i].then(|| f(dict[codes[i] as usize].as_ref(), sub))
             })
             .collect(),
-        // Missing or non-string column → `str_bool` yields NULL for every row.
+        // A de-opted (`Gen`) column may still hold string cells — test each; a
+        // non-string/absent cell is UNKNOWN (`None`), matching `str_bool`.
+        Some(Column::Gen { data, present }) => ids
+            .iter()
+            .map(|&id| {
+                let i = id as usize;
+                if !present[i] {
+                    return None;
+                }
+                match &data[i] {
+                    Value::Str(str_val) => Some(f(str_val.as_ref(), sub)),
+                    _ => None,
+                }
+            })
+            .collect(),
+        // Missing or genuinely non-string column → `str_bool` yields NULL for every row.
         _ => vec![None; ids.len()],
     })
 }
