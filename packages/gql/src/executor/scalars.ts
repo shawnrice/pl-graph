@@ -1010,6 +1010,124 @@ export const toBooleanScalar = (a: unknown): boolean | null => {
   return t === 'false' || t === 'no' || t === '0' ? false : null;
 };
 
+// Parse a string to a number the way Rust's `str::parse::<f64>()` does — what the engine's
+// CAST uses: finite decimals / exponents, plus the case-insensitive "inf"/"infinity"/"nan"
+// spellings, with overflow → ±Infinity. `null` when the string is not a number at all (a
+// data exception for CAST). DISTINCT from `numericStringToFloat` (the lenient function
+// forms), which rejects the non-finite spellings.
+const rustParseF64 = (s: string): number | null => {
+  const t = s.trim().toLowerCase();
+  const body = t.replace(/^[+-]/, '');
+
+  if (body === 'inf' || body === 'infinity') {
+    return t.startsWith('-') ? -Infinity : Infinity;
+  }
+
+  if (body === 'nan') {
+    return Number.NaN;
+  }
+
+  return FINITE_NUMERIC.test(t) ? Number.parseFloat(t) : null;
+};
+
+// A number / boolean / numeric string coerced to a number for CAST — a boolean is 1/0, a
+// string parses by Rust rules, anything else faults.
+const numFromCastable = (v: unknown): number => {
+  if (typeof v === 'number') {
+    return v;
+  }
+
+  if (typeof v === 'boolean') {
+    return v ? 1 : 0;
+  }
+
+  if (typeof v === 'string') {
+    const parsed = rustParseF64(v);
+
+    return parsed ?? dataException(`cannot cast string ${JSON.stringify(v)} to number`);
+  }
+
+  return dataException(`cannot cast ${typeName(v)} to number`);
+};
+
+// Strict CAST to a number (`value::cast`'s INTEGER / FLOAT arm). INTEGER additionally
+// truncates and rejects a non-finite value.
+const castToNumber = (v: unknown, integer: boolean): number => {
+  const n = numFromCastable(v);
+
+  if (!integer) {
+    return n;
+  }
+
+  return Number.isFinite(n)
+    ? Math.trunc(n)
+    : dataException('cannot cast a non-finite number to integer');
+};
+
+// Strict CAST to boolean (`value::cast`'s BOOLEAN arm): the FULL SQL spelling set (wider
+// than the `to_boolean` function's true/false), NaN faults, a nonzero finite number is
+// true, everything else (unrecognized string, list, temporal, …) faults.
+const castToBoolean = (v: unknown): boolean => {
+  if (typeof v === 'boolean') {
+    return v;
+  }
+
+  if (typeof v === 'number') {
+    if (Number.isNaN(v)) {
+      dataException('cannot cast NaN to boolean');
+    }
+
+    return v !== 0;
+  }
+
+  if (typeof v === 'string') {
+    const t = v.trim().toLowerCase();
+
+    if (t === 't' || t === 'true' || t === 'y' || t === 'yes' || t === 'on' || t === '1') {
+      return true;
+    }
+
+    if (t === 'f' || t === 'false' || t === 'n' || t === 'no' || t === 'off' || t === '0') {
+      return false;
+    }
+
+    dataException(`cannot cast string ${JSON.stringify(v)} to boolean`);
+  }
+
+  return dataException(`cannot cast ${typeName(v)} to boolean`);
+};
+
+// The STRICT `CAST(x AS <scalar type>)` — mirrors the engine's `value::cast`. A NULL casts
+// to NULL; otherwise a failed conversion is a data exception (unlike the lenient
+// to_integer/to_float/to_boolean function forms, which return null). LIST never fails, so
+// it reuses `toListScalar`.
+export const castValue = (v: unknown, category: string): unknown => {
+  if (isNullish(v)) {
+    return null;
+  }
+
+  switch (category) {
+    case 'integer':
+      return castToNumber(v, true);
+    case 'float':
+      return castToNumber(v, false);
+    case 'boolean':
+      return castToBoolean(v);
+    case 'list':
+      return toListScalar(v);
+    case 'string':
+      // A finite number / bool / temporal / composite stringifies (via `str`, matching the
+      // engine's `js_str`); a NON-finite number has no textual form and faults.
+      if (typeof v === 'number' && !Number.isFinite(v)) {
+        dataException('cannot cast a non-finite number to string');
+      }
+
+      return str(v);
+    default:
+      return dataException(`CAST to unsupported type '${category}'`);
+  }
+};
+
 // ISO GQL `to_list`: a string → its UTF-16 code-unit characters (same unit
 // model as `split('')`); a list → itself; any other value → a singleton list.
 export const toListScalar = (a: unknown): unknown[] | null => {
@@ -1536,6 +1654,12 @@ export const callExtendedScalar = (
   limits: GraphLimits = DEFAULT_CONFIG.limits,
 ): unknown => {
   const [a, b] = args;
+
+  // The STRICT scalar `CAST(a AS <b>)` (`b` is the target category literal) — faults on a
+  // failed conversion, unlike the lenient to_integer/… forms the parser used to desugar to.
+  if (name === 'cast') {
+    return castValue(a, b as string);
+  }
 
   // Short-circuit on the first handler. (The previous array-literal form invoked
   // ALL seven before the `!== UNHANDLED` check, so the early-return was dead and

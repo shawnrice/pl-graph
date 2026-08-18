@@ -81,14 +81,21 @@ describe('GQL: ISO graph / conversion / string-list scalar functions', () => {
     expect(names).toEqual(['marko']);
   });
 
-  test('CAST(value AS type) desugars to the conversion functions', () => {
+  test('CAST(value AS type) converts strictly, faulting on a failed conversion', () => {
     expect(one(`RETURN CAST('42' AS INTEGER) AS x`)).toBe(42);
     expect(one(`RETURN CAST(3.7 AS INT) AS x`)).toBe(3);
     expect(one(`RETURN CAST('3.5' AS FLOAT) AS x`)).toBe(3.5);
     expect(one(`RETURN CAST(42 AS STRING) AS x`)).toBe('42');
     expect(one(`RETURN CAST('yes' AS BOOL) AS x`)).toBe(true);
+    expect(one(`RETURN CAST('on' AS BOOL) AS x`)).toBe(true); // the full SQL spelling set
     expect(one(`RETURN CAST('ab' AS LIST) AS x`)).toEqual(['a', 'b']);
-    expect(one(`RETURN CAST('nope' AS INT) AS x`)).toBeNull();
+    // A failed CAST is a data exception (ISO GQL), NOT a silent null — unlike the lenient
+    // `to_integer`/`to_boolean` function forms.
+    expect(() => one(`RETURN CAST('nope' AS INT) AS x`)).toThrow();
+    expect(() => one(`RETURN CAST('nope' AS BOOLEAN) AS x`)).toThrow();
+    expect(() => one(`RETURN CAST('Infinity' AS INTEGER) AS x`)).toThrow();
+    expect(one(`RETURN to_integer('nope') AS x`)).toBeNull();
+    expect(one(`RETURN to_boolean('nope') AS x`)).toBeNull();
   });
 
   test('temporal CAST targets desugar to the temporal constructor functions', () => {

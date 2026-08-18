@@ -169,30 +169,32 @@ const typeTestCategory = (typeName: string): string | null => {
   return t === 'any' ? 'any' : null;
 };
 
-const castTargetFn = (typeName: string): string | null => {
+// The scalar CAST target category (`CAST(x AS INTEGER)` etc.). Unlike the lenient
+// `to_integer`/`to_float`/… function forms (which return null on a failed conversion), a
+// scalar CAST is STRICT — a failed conversion is a data exception — so it lowers to the
+// dedicated `cast` op rather than the conversion function. `null` for a temporal / unknown
+// target (temporal casts to its constructor; unknown is a parse error).
+type CastCategory = 'integer' | 'float' | 'string' | 'boolean' | 'list';
+const castScalarCategory = (typeName: string): CastCategory | null => {
   const t = typeName.toLowerCase();
 
   if (CAST_INT.has(t)) {
-    return 'to_integer';
+    return 'integer';
   }
 
   if (CAST_FLOAT.has(t)) {
-    return 'to_float';
+    return 'float';
   }
 
   if (CAST_STRING.has(t)) {
-    return 'to_string';
+    return 'string';
   }
 
   if (CAST_BOOL.has(t)) {
-    return 'to_boolean';
+    return 'boolean';
   }
 
-  if (CAST_LIST.has(t)) {
-    return 'to_list';
-  }
-
-  return CAST_TEMPORAL.get(t) ?? null;
+  return CAST_LIST.has(t) ? 'list' : null;
 };
 
 /** Map the surrounding-arrow booleans to a relationship direction. */
@@ -1705,15 +1707,35 @@ export const parse = (
 
     advance();
     const typeName = readTypeName();
-    const fn = castTargetFn(typeName);
+    const t = typeName.toLowerCase();
 
-    if (fn === null) {
+    // A temporal CAST desugars to its constructor (`date()`/`datetime()`/…), which already
+    // faults on bad input.
+    const temporal = CAST_TEMPORAL.get(t);
+
+    if (temporal !== undefined) {
+      expect('rparen', "')' to close CAST");
+
+      return { kind: 'func', name: temporal, args: [value], distinct: false, star: false };
+    }
+
+    // A scalar CAST lowers to the STRICT `cast` op (a failed conversion faults, unlike the
+    // lenient to_integer/to_float/… function forms), carrying its target category.
+    const category = castScalarCategory(typeName);
+
+    if (category === null) {
       throw new GqlSyntaxError(`CAST to unsupported type '${typeName}'`, peek().pos);
     }
 
     expect('rparen', "')' to close CAST");
 
-    return { kind: 'func', name: fn, args: [value], distinct: false, star: false };
+    return {
+      kind: 'func',
+      name: 'cast',
+      args: [value, { kind: 'lit', value: category }],
+      distinct: false,
+      star: false,
+    };
   };
 
   // EXISTS is a reserved word; it only introduces a braced subquery.
