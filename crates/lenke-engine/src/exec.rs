@@ -15087,16 +15087,10 @@ fn to_string_fn(v: &Value) -> Value {
         Value::Null => Value::Null,
         Value::Str(s) => Value::Str(s.clone()),
         Value::Bool(b) => Value::Str((if *b { "true" } else { "false" }).into()),
-        // Finite number as text; -0.0 renders as "0" (matches core — the sign of
-        // zero is dropped on string egress).
-        Value::Num(x) if x.is_finite() => {
-            let s = if *x == 0.0 {
-                "0".to_string()
-            } else {
-                x.to_string()
-            };
-            Value::Str(s.into())
-        }
+        // Finite number as text, formatted like JS `Number.toString` (`-0` → "0",
+        // exponential past the 1e21 / 1e-6 thresholds) — NOT Rust's `{}` (which is decimal
+        // at all magnitudes and would give a different STRING for e.g. 1e-7).
+        Value::Num(x) if x.is_finite() => Value::Str(crate::json::js_number(*x).into()),
         Value::Temporal(t) => Value::Str(t.format().into()),
         _ => Value::Null,
     }

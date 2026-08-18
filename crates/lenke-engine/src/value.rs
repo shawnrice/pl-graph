@@ -271,11 +271,12 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
         CastTarget::String => Ok(Value::Str(Arc::from(
             match v {
                 Value::Str(s) => return Ok(Value::Str(s.clone())),
-                // Numbers render as they do on egress (`f64::to_string`); a non-finite
-                // number has no textual form here.
+                // Numbers render exactly as they do on JSON egress — JS `Number.toString`
+                // (`crate::json::js_number`), NOT Rust's decimal-at-all-magnitudes `{}`; a
+                // non-finite number has no textual form here.
                 Value::Num(x) => {
                     if x.is_finite() {
-                        x.to_string()
+                        crate::json::js_number(*x)
                     } else {
                         return bad("non-finite number", "string");
                     }
