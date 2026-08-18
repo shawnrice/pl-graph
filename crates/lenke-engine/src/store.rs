@@ -41,6 +41,10 @@ impl std::hash::Hasher for U32Hasher {
 type U32BuildHasher = std::hash::BuildHasherDefault<U32Hasher>;
 /// One edge-property key's per-eid values, identity-hashed (see [`U32Hasher`]).
 pub type EdgeMap = HashMap<u32, Value, U32BuildHasher>;
+/// A `u32`-keyed map identity-hashed like [`EdgeMap`] — for the per-node edge-type
+/// buckets and edge extra-labels, probed per node/edge on the hot traversal + ingest
+/// paths (the same ~65ns-per-SipHash-probe win the edge-property map already takes).
+type U32Map<V> = HashMap<u32, V, U32BuildHasher>;
 
 /// A `Value` ordered by the value contract's total order (`cmp_total`) — the key
 /// type for a range index's `BTreeMap`. It DELEGATES to `cmp_total`; it does not
@@ -915,7 +919,7 @@ pub struct Store {
     /// edge — `-[:X:Y]->` / an ndjson `"labels":["X","Y"]` — carries the rest here.
     /// SPARSE: empty unless some edge has >1 label, so a single-label graph pays
     /// nothing and `edge_has_label` stays the single `u32` compare it replaced.
-    edge_extra: HashMap<u32, Vec<u32>>,
+    edge_extra: U32Map<Vec<u32>>,
     /// `(src, dst)` node ids per eid (indexed by eid; grows 1:1 with `next_eid` and
     /// never shrinks, like `edge_etype`). Lets an edge be rendered as core's
     /// `{id, from, to, labels, properties}` map from its eid alone, without scanning
@@ -994,8 +998,8 @@ pub struct Store {
     /// a per-node rebuild whenever a node's flat adjacency changes (the flat lists
     /// stay the source of truth), with an O(1) push on the `add_edge` hot path.
     edge_type_index: bool,
-    out_type_idx: Vec<HashMap<u32, Vec<Adj>>>,
-    in_type_idx: Vec<HashMap<u32, Vec<Adj>>>,
+    out_type_idx: Vec<U32Map<Vec<Adj>>>,
+    in_type_idx: Vec<U32Map<Vec<Adj>>>,
     /// OPT-IN edge interval index (`None` unless `create_interval_index` was
     /// called). Built from edge props at creation and maintained through the
     /// mutation primitives; an interval-key edge-prop change triggers a full
@@ -2347,8 +2351,8 @@ impl Store {
         self.out_adj.push(Vec::new());
         self.in_adj.push(Vec::new());
         if self.edge_type_index {
-            self.out_type_idx.push(HashMap::new());
-            self.in_type_idx.push(HashMap::new());
+            self.out_type_idx.push(U32Map::default());
+            self.in_type_idx.push(U32Map::default());
         }
         if let Some(ix) = &mut self.interval {
             ix.by_lo.push(Vec::new());
@@ -2526,8 +2530,8 @@ impl Store {
     /// `examples/expand_bench`). Subsequent writes maintain it.
     pub fn create_edge_type_index(&mut self) {
         self.edge_type_index = true;
-        self.out_type_idx = vec![HashMap::new(); self.node_count];
-        self.in_type_idx = vec![HashMap::new(); self.node_count];
+        self.out_type_idx = vec![U32Map::default(); self.node_count];
+        self.in_type_idx = vec![U32Map::default(); self.node_count];
         for node in 0..self.node_count as u32 {
             self.reindex_node_etypes(node);
         }
@@ -2566,11 +2570,11 @@ impl Store {
             return;
         }
         let i = node as usize;
-        let mut om: HashMap<u32, Vec<Adj>> = HashMap::new();
+        let mut om: U32Map<Vec<Adj>> = U32Map::default();
         for a in &self.out_adj[i] {
             om.entry(a.etype).or_default().push(*a);
         }
-        let mut im: HashMap<u32, Vec<Adj>> = HashMap::new();
+        let mut im: U32Map<Vec<Adj>> = U32Map::default();
         for a in &self.in_adj[i] {
             im.entry(a.etype).or_default().push(*a);
         }
@@ -2996,10 +3000,18 @@ impl Store {
         if let (Some(rec), Some(log)) = (rec, self.undo.as_mut()) {
             log.push(rec);
         }
-        // An interval-axis change moves an edge's interval; the source node isn't
-        // cheaply known from the eid, so rebuild the (opt-in, rarely-mutated) index.
+        // An interval-axis change moves an edge's interval. The index is out-edge /
+        // source-partitioned (`by_lo[node]` holds NODE's out-edges), so ONLY the edge's
+        // source node's buckets change — reindex just that node (O(source degree))
+        // instead of rebuilding the whole index (O(V+E)). `edge_endpoints` gives the
+        // source in O(1), so the write cost tracks the edge's fan-out, not the graph
+        // size — matching `add_edge`, which already reindexes incrementally. (A hot
+        // bitemporal workload updating edge validity intervals no longer repacks the
+        // entire interval index on every write.)
         if self.interval_uses_key(key) {
-            self.rebuild_interval();
+            if let Some((from, _)) = self.edge_endpoints(eid) {
+                self.reindex_node_interval(from);
+            }
         }
         self.record_change(Change::EdgeProp {
             eid,
@@ -3937,7 +3949,7 @@ impl Builder {
             // Incremental edges continue the id sequence the build laid down.
             next_eid: edge_count,
             edge_etype: edge_etypes,
-            edge_extra: HashMap::new(),
+            edge_extra: U32Map::default(),
             // Builder edges are single-label (`edge_extra` empty), so no edge carries
             // secondary labels; a later set_edge_extra_labels flips the bit.
             edge_has_extra: vec![false; edge_count as usize],
@@ -5056,6 +5068,71 @@ mod tests {
             .map(|t| overlap_eids(&st, 0, f64::from(t), f64::from(t)))
             .collect();
         assert_eq!(before, after);
+    }
+
+    /// Updating an edge's interval property must cost the same whether the graph has 2k
+    /// or 32k nodes — the index is source-partitioned, so only the edge's source node is
+    /// reindexed. Guards against the O(V+E) full `rebuild_interval` this path used to do
+    /// on every write (a bitemporal workload that hot-updates edge validity intervals
+    /// would otherwise repack the whole index per write). Timing/scaling guard, so MIN
+    /// over reps and `#[ignore]`d — run isolated in release:
+    ///   cargo test -p lenke-engine --release --lib \
+    ///     interval_edge_write_is_independent_of_graph_size -- --ignored
+    #[test]
+    #[ignore = "timing/scaling guard — run isolated in release (see doc comment)"]
+    fn interval_edge_write_is_independent_of_graph_size() {
+        use std::time::Instant;
+
+        const REPS: usize = 9;
+
+        // A graph of `nnodes` where node 0 has a FIXED small out-degree of interval
+        // edges. The source degree (what an incremental reindex touches) is constant, so
+        // only a full-index rebuild would make the write scale with `nnodes`.
+        let build = |nnodes: u32| -> (Store, u32) {
+            let mut b = Builder::default();
+            for _ in 0..nnodes {
+                b.node(&["P"], &[]);
+            }
+            let mut st = b.build();
+            st.create_interval_index("vf", "vt");
+            let mut first = 0;
+            for d in 0..4u32 {
+                let eid = st.add_edge(0, (d + 1) % nnodes, "HELD");
+                st.set_edge_prop(eid, "vf", n(f64::from(d)));
+                st.set_edge_prop(eid, "vt", n(f64::from(d) + 10.0));
+                if d == 0 {
+                    first = eid;
+                }
+            }
+            (st, first)
+        };
+        let time = |st: &mut Store, eid: u32| {
+            for i in 0..20 {
+                st.set_edge_prop(eid, "vt", n(f64::from(i) + 10.0)); // warm up
+            }
+            let mut best = f64::INFINITY;
+            for _ in 0..REPS {
+                let t = Instant::now();
+                for i in 0..100 {
+                    st.set_edge_prop(eid, "vt", n(f64::from(i) + 10.0));
+                }
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            best
+        };
+
+        let (mut small_st, e_small) = build(2_000);
+        let small = time(&mut small_st, e_small);
+        let (mut large_st, e_large) = build(32_000);
+        let large = time(&mut large_st, e_large);
+
+        let ratio = large / small.max(f64::MIN_POSITIVE);
+        assert!(
+            ratio < 6.0,
+            "interval-key edge write scaled with graph size: 16x more nodes cost {ratio:.1}x \
+             more time ({small:.5}s -> {large:.5}s, min of {REPS}). `set_edge_prop` is \
+             rebuilding the whole interval index instead of reindexing the edge's source node."
+        );
     }
 
     // --- type / cardinality / edge / drop-index constraints ---------------

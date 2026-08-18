@@ -8652,6 +8652,199 @@ mod tests {
         assert_eq!(names(&st), forward);
     }
 
+    /// A write immediately followed by a traversal must NOT cost more as the graph
+    /// grows — the shape that repacked the read-side adjacency snapshot on every write
+    /// in the old engine (the mistake this guards against). Ported from lenke-core's
+    /// `interleaved_write_and_traverse_is_independent_of_graph_size`: run the
+    /// write+traverse cycle at 2k and 32k vertices and assert the cost scales
+    /// sub-linearly (16x more vertices, `< 6x` time). If a read after a write rebuilds
+    /// the whole adjacency instead of reading the delta, the ratio tracks graph size.
+    ///
+    /// Timing-based, so MIN over reps (a single ~1ms sample against a 6x bound is below
+    /// this repo's noise floor); the minimum is the closest thing to an
+    /// interference-free run. `#[ignore]`d because it flakes under the CPU contention of
+    /// the full parallel `cargo test` run (as core's own copy notes: "failed 2 of 8 with
+    /// the box loaded") — a scaling assertion needs an isolated harness. Run it alone:
+    ///   cargo test -p lenke-engine --release --lib \
+    ///     interleaved_write_and_traverse_is_independent_of_graph_size -- --ignored --exact
+    #[test]
+    #[ignore = "timing/scaling guard — run isolated in release (see doc comment)"]
+    fn interleaved_write_and_traverse_is_independent_of_graph_size() {
+        use crate::exec::execute;
+        use std::time::Instant;
+
+        const REPS: usize = 9;
+
+        // Mirror real usage (the FFI's `lnk_query`): optimize the plan against the store
+        // so index seeds are chosen, THEN execute. A raw `execute(parse(q))` skips the
+        // optimizer and scans — which would scale with graph size for reasons unrelated
+        // to the write-side snapshot this test guards.
+        let q = |st: &mut Store, s: &str| {
+            let plan = crate::opt::optimize_indexed(super::parse(s).unwrap(), st);
+            execute(&plan, st).unwrap();
+        };
+        let mut st = Builder::default().build();
+        st.create_index("id");
+        q(&mut st, "INSERT (:Dept {id: 'D0'})");
+
+        let grow_to = |st: &mut Store, upto: usize, from: usize| {
+            for i in from..upto {
+                q(st, &format!("INSERT (:Emp {{id: 'e{i}'}})"));
+                q(
+                    st,
+                    &format!(
+                        "MATCH (s:Emp {{id: 'e{i}'}}), (t:Dept {{id: 'D0'}}) INSERT (s)-[:IN_DEPT]->(t)"
+                    ),
+                );
+            }
+        };
+
+        // One property write, then one traversal off the SAME anchor — the shape that
+        // repacked. The write is a property SET (does not touch adjacency), so a correct
+        // engine reads the unchanged adjacency; a broken one rebuilds it per cycle.
+        let travq = "MATCH (s:Emp {id: 'e0'})-[r:IN_DEPT]->(t) RETURN t.id AS x";
+        let cycle = |st: &mut Store, i: usize| {
+            q(st, &format!("MATCH (s:Emp {{id: 'e0'}}) SET s.w = {i}"));
+            let plan = crate::opt::optimize_indexed(super::parse(travq).unwrap(), st);
+            let _ = run(&plan, st);
+        };
+
+        let time = |st: &mut Store| {
+            for i in 0..20 {
+                cycle(st, i); // warm up
+            }
+            let mut best = f64::INFINITY;
+            for _ in 0..REPS {
+                let t = Instant::now();
+                for i in 0..100 {
+                    cycle(st, i);
+                }
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            best
+        };
+
+        grow_to(&mut st, 2_000, 0);
+        let small = time(&mut st);
+        grow_to(&mut st, 32_000, 2_000);
+        let large = time(&mut st);
+
+        let ratio = large / small.max(f64::MIN_POSITIVE);
+        assert!(
+            ratio < 6.0,
+            "interleaved write+traverse scaled with graph size: 16x more vertices cost \
+             {ratio:.1}x more time ({small:.4}s -> {large:.4}s, min of {REPS}). A read after \
+             a write is rebuilding the whole adjacency snapshot instead of reading the delta."
+        );
+    }
+
+    /// The CSR adjacency cache must PAY FOR ITSELF: the engine WITH the cache must never
+    /// be slower than the engine WITHOUT it. Twin of the scaling guard above — that one
+    /// proves a write does not trigger a rebuild (no churn); this one proves the cache's
+    /// upkeep (building it, and flipping it stale on every write) never costs MORE than
+    /// simply not having a cache and always reading the per-node adjacency `Vec`s.
+    ///
+    /// Runs two serving workloads — a read-heavy full traversal and an interleaved
+    /// write+traverse — each timed with the cache ON and OFF (`set_csr_enabled`), min over
+    /// reps. If the cache were a net loss (its bookkeeping outweighing its read speedup),
+    /// cache-ON would be the slower number. `#[ignore]`d: a timing guard, like its twin —
+    /// run isolated in release:
+    ///   cargo test -p lenke-engine --release --lib cache_is_never_a_net_loss \
+    ///     -- --ignored
+    #[test]
+    #[ignore = "timing guard — run isolated in release (see doc comment)"]
+    fn cache_is_never_a_net_loss() {
+        use crate::exec::execute;
+        use std::time::Instant;
+
+        const REPS: usize = 9;
+
+        // A mesh with real, MULTI-TYPE adjacency: 4k nodes, each with one out-edge of
+        // each of 4 types. A single-type hop (`-[:A]->`) then reads 1/4 of the adjacency —
+        // the shape the typed-CSR partition is built to win (touch only the A edges,
+        // instead of scanning all four per node and filtering). Without the cache the hop
+        // scans every edge and filters, so this is where the cache should pay off.
+        let mut b = Builder::default();
+        const N: u32 = 4_000;
+        const TYPES: [&str; 4] = ["A", "B", "C", "D"];
+        for i in 0..N {
+            b.node(&["P"], &[("id", s(&format!("p{i}"))), ("w", n(0.0))]);
+        }
+        for i in 0..N {
+            for (d, ty) in TYPES.iter().enumerate() {
+                b.edge(i, (i + d as u32 + 1) % N, ty);
+            }
+        }
+        let mut st = b.build();
+        st.create_index("id");
+
+        let readq = crate::opt::optimize_indexed(
+            super::parse("MATCH (a:P)-[:A]->(b) RETURN count(*) AS c").unwrap(),
+            &st,
+        );
+        let setq = "MATCH (s:P {id: 'p0'}) SET s.w = 1";
+        let anchorq = "MATCH (s:P {id: 'p0'})-[:A]->(t) RETURN t.id AS x";
+
+        // Time `f` after a warm-up, min over reps — the interference-free estimate.
+        let bench = |st: &mut Store, f: &dyn Fn(&mut Store)| {
+            for _ in 0..5 {
+                f(st);
+            }
+            let mut best = f64::INFINITY;
+            for _ in 0..REPS {
+                let t = Instant::now();
+                for _ in 0..50 {
+                    f(st);
+                }
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            best
+        };
+        let read_only = |st: &mut Store| {
+            let _ = run(&readq, st);
+        };
+        // Interleaved serving: a property write (does NOT change adjacency, so with the
+        // cache ON the CSR stays fresh and the traversal reads it) then a traversal.
+        let interleave = |st: &mut Store| {
+            let plan = crate::opt::optimize_indexed(super::parse(setq).unwrap(), st);
+            execute(&plan, st).unwrap();
+            let tp = crate::opt::optimize_indexed(super::parse(anchorq).unwrap(), st);
+            let _ = run(&tp, st);
+        };
+
+        let measure = |st: &mut Store, f: &dyn Fn(&mut Store)| {
+            st.set_csr_enabled(true);
+            let on = bench(st, f);
+            st.set_csr_enabled(false);
+            let off = bench(st, f);
+            st.set_csr_enabled(true); // leave it as the default for the next measurement
+            (on, off)
+        };
+
+        let (read_on, read_off) = measure(&mut st, &read_only);
+        let (inter_on, inter_off) = measure(&mut st, &interleave);
+        eprintln!(
+            "read:  on={read_on:.5} off={read_off:.5} ({:.2}x)   interleave: on={inter_on:.5} off={inter_off:.5} ({:.2}x)",
+            read_on / read_off,
+            inter_on / inter_off,
+        );
+
+        // The cache must never make a workload SLOWER than no cache. A small slack absorbs
+        // timing noise; a genuine net-loss cache (e.g. a rebuild churned on every read)
+        // would blow well past it.
+        assert!(
+            read_on <= read_off * 1.10,
+            "CSR cache made the read-heavy traversal SLOWER than no cache: \
+             on={read_on:.5}s vs off={read_off:.5}s (min of {REPS})"
+        );
+        assert!(
+            inter_on <= inter_off * 1.10,
+            "the CSR cache machinery cost MORE than not having it on the interleaved \
+             write+traverse workload: on={inter_on:.5}s vs off={inter_off:.5}s (min of {REPS}). \
+             The cache's upkeep is outweighing its read speedup."
+        );
+    }
+
     /// The raw string-search filter fast path (STARTS WITH / ENDS WITH / CONTAINS)
     /// must match the boxed `str_bool` for a dict-encoded (low-cardinality) column
     /// and for a row missing the property (→ UNKNOWN → dropped).

@@ -15,7 +15,7 @@
  * append-only audit log.
  *
  *   bun run bench:usage
- *   BENCH_ENGINES=ts,ffi bun run bench:usage
+ *   BENCH_ENGINES=ts,ffi,engine bun run bench:usage
  *   BENCH_BUDGET_MS=500 bun run bench:usage  # longer batches, tighter numbers
  *   BENCH_GRAPH=50000 bun run bench:usage    # graph size to serve from
  *
@@ -30,6 +30,7 @@ import { Graph as TsGraph } from '@lenke/core';
 import { query as tsQuery } from '@lenke/gql';
 import { deserialize as tsDeserialize } from '@lenke/serialization';
 
+import { createFfiEngineBackend } from './src/backend-ffi-engine.js';
 import { createFfiBackend } from './src/backend-ffi.js';
 import { createWasmBackend } from './src/backend-wasm.js';
 import type { Backend } from './src/backend.js';
@@ -38,6 +39,14 @@ import { graphFromNdjson } from './src/graph.js';
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB = new URL(
   `../../crates/lenke-core/target/release/liblenke_core.${LIB_EXTENSIONS[process.platform] ?? 'so'}`,
+  import.meta.url,
+).pathname;
+// The from-scratch engine's cdylib (built with `bun run engine:build:rust --features
+// capi`). Included so the interleaved read/write workloads below — the ones that used
+// to repack the adjacency on every write — are measured on the ENGINE too, not just
+// core. `BENCH_ENGINES=engine bun run bench:usage`.
+const ENGINE_LIB = new URL(
+  `../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXTENSIONS[process.platform] ?? 'so'}`,
   import.meta.url,
 ).pathname;
 const WASM = new URL(
@@ -358,6 +367,16 @@ if (WANTED.has('ffi')) {
     engines.push(nativeEngine('ffi', createFfiBackend(LIB)));
   } else {
     console.warn(`skipping ffi: ${LIB} not found — run \`bun run build:rust\``);
+  }
+}
+
+if (WANTED.has('engine')) {
+  if (existsSync(ENGINE_LIB)) {
+    engines.push(nativeEngine('engine', createFfiEngineBackend(ENGINE_LIB)));
+  } else {
+    console.warn(
+      `skipping engine: ${ENGINE_LIB} not found — run \`bun run engine:build:rust\` (--features capi)`,
+    );
   }
 }
 
