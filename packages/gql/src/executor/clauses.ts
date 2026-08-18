@@ -1124,6 +1124,16 @@ export const runLinearClauses = (
         // ISO `<order by and page statement>` in statement position: sort and/or
         // slice the working BINDING table. Because this runs before any
         // projection, a later RETURN only ever projects the surviving rows.
+        const take = resolveCount(clause.limit, params);
+
+        // A zero LIMIT keeps no rows, so the ORDER BY keys are never evaluated —
+        // matching the engine (and the projection's `ORDER BY … LIMIT 0`), which does not
+        // fault on the sort keys of rows it will never emit.
+        if (take === 0) {
+          bindings = [];
+          break;
+        }
+
         let rows = toArray(bindings);
 
         if (clause.orderBy.length > 0) {
@@ -1149,7 +1159,6 @@ export const runLinearClauses = (
         }
 
         const start = resolveCount(clause.skip, params) ?? 0;
-        const take = resolveCount(clause.limit, params);
 
         rows = rows.slice(start, take === undefined ? undefined : start + take);
         bindings = rows;
