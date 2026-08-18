@@ -15039,12 +15039,15 @@ fn scalar_num_fn(name: &str, v: &Value) -> Value {
     Value::Num(r)
 }
 
-/// `to_integer`/`to_float` FUNCTION: Num (truncated for integer) or a parseable
-/// string; anything else — INCLUDING a Bool — is NULL (the fn forms do not coerce
-/// bools, unlike `CAST`). Matches lenke-core.
+/// `to_integer`/`to_float` FUNCTION and the `CAST(x AS INTEGER|FLOAT)` it backs: a Num
+/// (truncated for integer), a BOOLEAN (`true`→1, `false`→0 — the ISO-GQL/Ultipa explicit
+/// conversion), or a parseable finite string. A list/record/temporal is NULL. (These are
+/// EXPLICIT conversions, so a bool converts; the implicit paths — arithmetic, `sum`, … —
+/// still never coerce a bool.)
 fn to_number(v: &Value, integer: bool) -> Value {
     let n = match v {
         Value::Num(x) => *x,
+        Value::Bool(b) => f64::from(u8::from(*b)),
         // A string that parses to a NON-finite value (`'1e1000'` → inf, `'nan'`) is
         // NULL — the fn form never yields inf/NaN, matching core's `.filter(is_finite)`.
         Value::Str(s) => match s.trim().parse::<f64>() {

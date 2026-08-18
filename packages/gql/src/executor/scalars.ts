@@ -848,7 +848,13 @@ export const toIntScalar = (a: unknown): number | null => {
     return Math.trunc(a);
   }
 
-  // Only a number or a STRING converts — mirroring the native arms. Falling back
+  // A boolean converts to 1 / 0 — the ISO-GQL / Ultipa explicit conversion, matching the
+  // native `to_number` and `CAST(x AS INTEGER)` (the implicit paths still never coerce it).
+  if (typeof a === 'boolean') {
+    return a ? 1 : 0;
+  }
+
+  // Only a number, boolean, or STRING converts — mirroring the native arms. Falling back
   // to `str(a)` would convert by stringifying, so a one-element list (`[0]` → "0")
   // or a vertex (whose `str` is its id) would come back as a number instead of the
   // null the native engine returns.
@@ -870,7 +876,12 @@ export const toFloatScalar = (a: unknown): number | null => {
     return a;
   }
 
-  // Number or string only — see the note in `toIntScalar`.
+  // A boolean converts to 1 / 0 (explicit conversion, per the note in `toIntScalar`).
+  if (typeof a === 'boolean') {
+    return a ? 1 : 0;
+  }
+
+  // Number, boolean, or string only — see the note in `toIntScalar`.
   return typeof a === 'string' ? numericStringToFloat(a) : null;
 };
 
