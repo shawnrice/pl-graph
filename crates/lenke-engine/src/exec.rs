@@ -14561,9 +14561,9 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         },
         // substring(s, start[, len]) — ISO 1-based, UTF-16-unit indexed
         "substring" => substring(args),
-        // `size` is polymorphic over a collection OR a string (UTF-16 units), like
-        // lenke-core; a non-collection non-string is NULL.
-        "size" => match &args[0] {
+        // `size` (and its ISO/SQL alias `cardinality`) is polymorphic over a collection OR
+        // a string (UTF-16 units), like lenke-core; a non-collection non-string is NULL.
+        "size" | "cardinality" => match &args[0] {
             Value::List(v) => Value::Num(v.len() as f64),
             Value::Str(s) => Value::Num(utf16_len(s) as f64),
             _ => Value::Null,
@@ -18588,6 +18588,9 @@ mod tests {
         assert_eq!(num("nullif(n.a, 5)"), 4.0);
         // size / char_length on a string (K5)
         assert_eq!(num("size(n.b)"), 5.0);
+        // `cardinality` is the ISO/SQL alias for `size` (a reserved word AND a function).
+        assert_eq!(num("cardinality(n.b)"), 5.0);
+        assert_eq!(num("cardinality([1, 2, 3])"), 3.0);
         assert_eq!(num("char_length(n.b)"), 5.0);
     }
 

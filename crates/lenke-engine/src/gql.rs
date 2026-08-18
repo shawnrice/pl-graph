@@ -5460,7 +5460,7 @@ impl Parser {
             "abs" | "sign" | "floor" | "ceil" | "ceiling" | "sqrt" | "exp" | "ln" | "log10"
             | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh"
             | "cot" | "degrees" | "radians" | "upper" | "lower" | "trim" | "length" | "size"
-            | "head" | "last"
+            | "cardinality" | "head" | "last"
             // Temporal component accessors carry the leading-underscore extension sigil
             // (`_year`), matching core; the bare ISO spellings are NOT in the grammar.
             | "_year" | "_month" | "_day" | "_hour" | "_minute" | "_second" | "date"
