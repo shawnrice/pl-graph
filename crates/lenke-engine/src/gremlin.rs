@@ -44,6 +44,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         all_labels: std::collections::HashMap::new(),
         sack_slot: None,
         subgraph_caps: std::collections::HashMap::new(),
+        pending_write: None,
     };
     p.traversal()
 }
@@ -658,6 +659,12 @@ struct Parser {
     /// Named subgraph bags (`subgraph('sg')` → snapshot plan + the edge slot), revealed
     /// by `cap('sg')` as a `{vertices, edges}` Map.
     subgraph_caps: std::collections::HashMap<String, (Plan, usize)>,
+    /// A `property()`-Update whose read tail we are now building — TinkerPop's
+    /// `property(k, v).values(k)` (read-after-write). Set when a read step first follows
+    /// a `property()` write: the write `(input, ops)` is stashed here and the working
+    /// plan resets to `Row` (the seeded frontier) so the tail builds over it; `traversal`
+    /// wraps the finished tail back into a [`Plan::UpdateReturn`].
+    pending_write: Option<(Box<Plan>, Vec<crate::ir::SetOp>)>,
 }
 
 impl Parser {
@@ -740,6 +747,27 @@ impl Parser {
                 false
             };
             return Ok((e, descending));
+        }
+        // A `select('k')` sub-traversal: the sort key is the entry `k` of the current
+        // Map traverser (a `project()`/`group()` row). `select` on a Map projects the
+        // entry — so `project(...).order().by(select('k'))` sorts by that field rather
+        // than erroring. Byte-identical to core's `evalBy(select('k'))` on the Map.
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("select")) {
+            self.bump();
+            self.expect(&Tok::LParen)?;
+            let key = self.str_arg()?;
+            self.expect(&Tok::RParen)?;
+            let expr = Expr::Field {
+                base: Box::new(Expr::Slot(current)),
+                key,
+            };
+            let descending = if self.peek() == Some(&Tok::Comma) {
+                self.bump();
+                self.order_dir()?
+            } else {
+                false
+            };
+            return Ok((expr, descending));
         }
         // A degree sub-traversal: `[__.]<hop>('L'…).count()`.
         if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
@@ -1137,6 +1165,15 @@ impl Parser {
             self.current = 0;
             self.slots = 1;
         }
+        // A folded `property()`-Update read tail: wrap it back into an UpdateReturn so
+        // the writes run, then `plan` reads them over the frontier (read-after-write).
+        if let Some((input, ops)) = self.pending_write.take() {
+            plan = Plan::UpdateReturn {
+                input,
+                ops,
+                tail: Box::new(plan),
+            };
+        }
         Ok(plan)
     }
 
@@ -1211,7 +1248,7 @@ impl Parser {
         if lname == "property" {
             let key = self.str_arg()?;
             self.expect(&Tok::Comma)?;
-            let val = self.literal()?;
+            let val = self.property_value_expr()?;
             self.expect(&Tok::RParen)?;
             return Ok(self.apply_property(plan, key, val));
         }
@@ -1230,11 +1267,26 @@ impl Parser {
                 }],
             });
         }
-        // A read step cannot follow a write step (addV/property/drop are terminal
-        // for reads).
-        if is_write(&plan) {
+        // TinkerPop: `property()` is NOT terminal — it returns the mutated element, so
+        // read steps may follow and observe the just-written values (`property(k,v)
+        // .values(k)`). Fold the pending property()-Update aside: stash the write and
+        // continue the read tail over the (unchanged) frontier, seeded from `Row`;
+        // `traversal` wraps it back into an UpdateReturn. `addV`/`addE`/`drop` stay
+        // terminal for reads (a created/dropped element has no read frontier here).
+        let is_property_update = matches!(&plan, Plan::Update { ops, .. }
+            if ops.iter().all(|op| !matches!(op, crate::ir::SetOp::Delete { .. })));
+        let plan = if is_property_update && self.pending_write.is_none() {
+            let Plan::Update { input, ops } = plan else {
+                unreachable!()
+            };
+            self.pending_write = Some((input, ops));
+            Plan::Row
+        } else if is_write(&plan) {
+            // drop() (an Update of Deletes) and addV/addE/Merge stay terminal for reads.
             return Err(format!("step `{lname}` cannot follow a write step"));
-        }
+        } else {
+            plan
+        };
 
         let plan = match lname.as_str() {
             "haslabel" => {
@@ -3312,9 +3364,15 @@ impl Parser {
                         }
                     })
                 };
-                // A select over an UNBOUND tag drops every traverser (core yields
-                // nothing), rather than erroring — the tag is a compile-time slot, so an
-                // unknown one produces no output.
+                // A label that is not a bound step tag falls back to core's Scoping: if
+                // the current traverser is a Map (a `project()`/`group()` row), `select(k)`
+                // projects the entry `k`. We can't statically prove the frontier is a Map,
+                // so we emit the map/record field read (`Expr::Field`) — byte-identical when
+                // the value IS such a Map (the in-spec use, e.g.
+                // `project(...).select('k')`), which is the only case this reaches. Only the
+                // plain form (no Pop, no by-modulator) falls back; an unbound tag under a
+                // `Pop.all`/by-modulated select still drops every traverser as before.
+                let input_current = self.current;
                 let any_unbound = labels.iter().any(|l| {
                     if pop_all {
                         !self.all_labels.contains_key(l)
@@ -3322,10 +3380,31 @@ impl Parser {
                         !self.labels.contains_key(l)
                     }
                 });
-                if any_unbound {
+                if any_unbound && (pop_all || !bys.is_empty()) {
                     self.current = 0;
                     self.slots = 1;
                     return Ok(plan.filter(Expr::Lit(Value::Bool(false))));
+                }
+                if any_unbound {
+                    // Bound labels read their tagged slot; unbound ones read the Map entry.
+                    let field_of = |l: &str| -> Expr {
+                        match self.labels.get(l) {
+                            Some(&slot) => Expr::Slot(slot),
+                            None => Expr::Field {
+                                base: Box::new(Expr::Slot(input_current)),
+                                key: l.to_string(),
+                            },
+                        }
+                    };
+                    let p = if labels.len() == 1 {
+                        plan.project(vec![(labels[0].clone(), field_of(&labels[0]))])
+                    } else {
+                        let entries = labels.iter().map(|l| (l.clone(), field_of(l))).collect();
+                        plan.project(vec![("select".into(), Expr::MapLit { entries })])
+                    };
+                    self.current = 0;
+                    self.slots = 1;
+                    return Ok(p);
                 }
                 let p = if pop_all {
                     // Pop.all: every binding of the (single) tag, as a list.
@@ -4334,17 +4413,23 @@ impl Parser {
     /// Apply a `property('k', v)` step. On an `addV` (a one-node `Insert`) it
     /// folds into that node's properties; on a read traversal it wraps (or extends)
     /// an `Update` that SETs the property on the current elements.
-    fn apply_property(&self, plan: Plan, key: String, val: Value) -> Plan {
+    fn apply_property(&self, plan: Plan, key: String, val: Expr) -> Plan {
         match plan {
-            Plan::Insert { mut nodes, edges } if edges.is_empty() && nodes.len() == 1 => {
-                nodes[0].props.push((key, val));
+            // `addV('L').property(k, <literal>)` folds the value straight into the new
+            // node. A traversal-induced value (`constant`, a degree count) has no meaning
+            // on a not-yet-created vertex, so it falls through to the post-insert Update.
+            Plan::Insert { mut nodes, edges }
+                if edges.is_empty() && nodes.len() == 1 && matches!(val, Expr::Lit(_)) =>
+            {
+                let Expr::Lit(v) = val else { unreachable!() };
+                nodes[0].props.push((key, v));
                 Plan::Insert { nodes, edges }
             }
             Plan::Update { input, mut ops } => {
                 ops.push(crate::ir::SetOp::Set {
                     slot: self.current,
                     key,
-                    value: Expr::Lit(val),
+                    value: val,
                 });
                 Plan::Update { input, ops }
             }
@@ -4353,10 +4438,103 @@ impl Parser {
                 ops: vec![crate::ir::SetOp::Set {
                     slot: self.current,
                     key,
-                    value: Expr::Lit(val),
+                    value: val,
                 }],
             },
         }
+    }
+
+    /// The value argument of `property(key, <value>)`. Besides a plain literal, TinkerPop
+    /// accepts a child traversal evaluated per element (a "traversal-induced value"):
+    /// `constant(v)` (a per-element constant) and a degree sub-traversal
+    /// `[__.]<hop>('L'…).count()` (the out/in/both-degree of the current element). The
+    /// child is rooted at the current traverser, so the count is over *its* neighbours —
+    /// the same `CountSubquery` the `order().by(<degree>)` body builds.
+    fn property_value_expr(&mut self) -> Result<Expr, String> {
+        // `constant(v)` — a per-element constant.
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("constant")) {
+            self.bump();
+            self.expect(&Tok::LParen)?;
+            let v = self.literal()?;
+            self.expect(&Tok::RParen)?;
+            return Ok(Expr::Lit(v));
+        }
+        // A degree sub-traversal `[__.]<hop>('L'…).count()`.
+        let is_hop = {
+            let mut p = self.pos;
+            if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
+                p += 1;
+                if self.toks.get(p) == Some(&Tok::Dot) {
+                    p += 1;
+                }
+            }
+            matches!(self.toks.get(p), Some(Tok::Ident(s)) if matches!(
+                s.to_ascii_lowercase().as_str(),
+                "out" | "in" | "both" | "oute" | "ine" | "bothe"))
+        };
+        if is_hop {
+            return self.degree_count_subquery("property(key, <traversal>)");
+        }
+        // Otherwise a plain literal value.
+        Ok(Expr::Lit(self.literal()?))
+    }
+
+    /// Parse a degree sub-traversal `[__.]<hop>('L'…)[.values('k')].count()` rooted at the
+    /// current slot into a [`Expr::CountSubquery`] — the count of the current element's
+    /// neighbours along `<hop>`. Shared by `order().by(<degree>)`, `select().by(<degree>)`
+    /// and `property(key, <degree>)`; `ctx` names the caller for the error message.
+    fn degree_count_subquery(&mut self, ctx: &str) -> Result<Expr, String> {
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+            self.bump();
+            self.expect(&Tok::Dot)?;
+        }
+        let hop = self.ident()?.to_ascii_lowercase();
+        let (dir, is_edge) = match hop.as_str() {
+            "out" => (Dir::Out, false),
+            "in" => (Dir::In, false),
+            "both" => (Dir::Both, false),
+            "oute" => (Dir::Out, true),
+            "ine" => (Dir::In, true),
+            "bothe" => (Dir::Both, true),
+            other => return Err(format!("{ctx}: unsupported body `{other}`")),
+        };
+        self.expect(&Tok::LParen)?;
+        let mut labels: Vec<String> = Vec::new();
+        if matches!(self.peek(), Some(Tok::Str(_))) {
+            labels.push(self.str_arg()?);
+            while self.peek() == Some(&Tok::Comma) {
+                self.bump();
+                labels.push(self.str_arg()?);
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        // Optional intermediate `.values('k')` (counts present names — same cardinality as
+        // the hop, so it does not change a count).
+        if self.peek() == Some(&Tok::Dot)
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("values"))
+        {
+            self.expect(&Tok::Dot)?;
+            self.ident()?; // values
+            self.expect(&Tok::LParen)?;
+            self.str_arg()?;
+            self.expect(&Tok::RParen)?;
+        }
+        self.expect(&Tok::Dot)?;
+        let c = self.ident()?;
+        if !c.eq_ignore_ascii_case("count") {
+            return Err(format!("{ctx} must end with .count()"));
+        }
+        self.expect(&Tok::LParen)?;
+        self.expect(&Tok::RParen)?;
+        let body = if is_edge {
+            Plan::Row.expand_edge_gremlin(self.current, dir, &labels)
+        } else {
+            Plan::Row.expand(self.current, dir, &labels)
+        };
+        Ok(Expr::CountSubquery {
+            body: Box::new(body),
+            outer_width: self.slots,
+        })
     }
 
     /// The second argument of `has('k', …)`: a predicate against property `key`.
@@ -7695,6 +7873,109 @@ mod tests {
         );
         // A non-reducing hop chain is applied per element (local is transparent to it).
         assert!(super::parse("g.V().local(out('KNOWS').values('name'))").is_ok());
+    }
+
+    /// `project(...)` rows are Maps; `order().by(select('k'))` sorts by the entry `k`
+    /// (a sub-traversal that reads the Map), and the trailing `select('name')` projects
+    /// the entry from the Map via the tag-fallback. Byte-identical to core's Scoping.
+    #[test]
+    fn order_by_select_sorts_project_rows_and_select_reads_the_map_entry() {
+        let store = social();
+        let rows = gremlin_rows(
+            "g.V().hasLabel('Person').project('name','age').by('name').by('age')\
+             .order().by(select('age'), desc).select('name')",
+            &store,
+        );
+        let names: Vec<String> = rows
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Str(s) => s.to_string(),
+                other => panic!("expected a name string, got {other:?}"),
+            })
+            .collect();
+        // social() ages: alice 30, bob 25, carol 40 → desc by age.
+        assert_eq!(names, vec!["carol", "alice", "bob"]);
+    }
+
+    /// `select('k')` on a Map traverser (a `project()` row) with no step labelled `k`
+    /// projects the entry rather than dropping every row (core's Scoping fallback).
+    #[test]
+    fn select_key_falls_back_to_the_map_entry() {
+        let store = social();
+        let got = value_bag(&gremlin_rows(
+            "g.V().hasLabel('Person').project('name','age').by('name').by('age').select('name')",
+            &store,
+        ));
+        assert_eq!(
+            got,
+            vec!["Str(\"alice\");", "Str(\"bob\");", "Str(\"carol\");"]
+        );
+    }
+
+    /// `property(key, <traversal>)` accepts a traversal-induced value: `constant(v)`
+    /// lowers to a literal SET, a degree sub-traversal `outE().count()` to a
+    /// `CountSubquery` SET (evaluated per element at write time — see `exec`'s SET path).
+    #[test]
+    fn property_value_accepts_constant_and_degree_traversal() {
+        use crate::ir::{Expr, Plan, SetOp};
+        let set_value = |q: &str| -> (String, Expr) {
+            match super::parse(q).unwrap() {
+                Plan::Update { ops, .. } => match ops.into_iter().next().unwrap() {
+                    SetOp::Set { key, value, .. } => (key, value),
+                    other => panic!("expected SetOp::Set, got {other:?}"),
+                },
+                other => panic!("expected Plan::Update, got {other:?}"),
+            }
+        };
+        let (k, v) = set_value("g.V().hasLabel('Person').property('flag', constant(1.0))");
+        assert_eq!(k, "flag");
+        assert!(matches!(v, Expr::Lit(Value::Num(n)) if n == 1.0));
+        let (k, v) = set_value("g.V().property('deg', outE().count())");
+        assert_eq!(k, "deg");
+        assert!(matches!(v, Expr::CountSubquery { .. }));
+    }
+
+    /// Read-after-write (an `UpdateReturn`): TinkerPop `property(k, v).values(k)` and GQL
+    /// `MATCH … SET … RETURN` apply the write, then read the just-written value over the
+    /// SAME frontier. constant() and a degree `count()` both flow through.
+    #[test]
+    fn read_after_write_reads_the_written_values() {
+        let nd = "{\"type\":\"node\",\"id\":\"marko\",\"labels\":[\"P\"],\"properties\":{\"id\":\"marko\"}}\n\
+                  {\"type\":\"node\",\"id\":\"a\",\"labels\":[\"P\"],\"properties\":{\"id\":\"a\"}}\n\
+                  {\"type\":\"node\",\"id\":\"b\",\"labels\":[\"P\"],\"properties\":{\"id\":\"b\"}}\n\
+                  {\"type\":\"edge\",\"id\":\"e1\",\"from\":\"marko\",\"to\":\"a\",\"labels\":[\"KNOWS\"],\"properties\":{}}\n\
+                  {\"type\":\"edge\",\"id\":\"e2\",\"from\":\"marko\",\"to\":\"b\",\"labels\":[\"KNOWS\"],\"properties\":{}}";
+        // Gremlin `property(k, constant(v)).values(k)` — the write, then the read of it.
+        let mut st = crate::ndjson::from_ndjson(nd).unwrap();
+        let flags = crate::exec::execute(
+            &super::parse("g.V().hasLabel('P').property('flag', constant(1.0)).values('flag')")
+                .unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        assert_eq!(
+            value_bag(&flags),
+            vec!["Num(1.0);", "Num(1.0);", "Num(1.0);"]
+        );
+        // Gremlin `property(k, outE().count()).values(k)` — a traversal-induced out-degree.
+        let deg = crate::exec::execute(
+            &super::parse(
+                "g.V().has('id', eq('marko')).property('deg', outE().count()).values('deg')",
+            )
+            .unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        assert_eq!(value_bag(&deg), vec!["Num(2.0);"]);
+        // GQL `MATCH … SET … RETURN` reads the mutated value over the same binding.
+        let mut st2 = crate::ndjson::from_ndjson(nd).unwrap();
+        let gql = crate::exec::execute(
+            &crate::gql::parse("MATCH (n:P) SET n.x = 7 RETURN n.x AS v").unwrap(),
+            &mut st2,
+        )
+        .unwrap();
+        assert_eq!(value_bag(&gql), vec!["Num(7.0);", "Num(7.0);", "Num(7.0);"]);
     }
 
     #[test]

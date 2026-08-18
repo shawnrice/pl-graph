@@ -846,6 +846,19 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 c,
             )
         }
+        // Rewrite the MATCH `input` (index seeds / pushdown apply to it); the tail is
+        // a Row-seeded projection, a leaf like InsertReturn's.
+        Plan::UpdateReturn { input, ops, tail } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::UpdateReturn {
+                    input: Box::new(i),
+                    ops,
+                    tail,
+                },
+                c,
+            )
+        }
         Plan::Join { left, right, on } => {
             let (l, cl) = rewrite(*left, idx);
             let (r, cr) = rewrite(*right, idx);
@@ -1635,6 +1648,7 @@ fn width(plan: &Plan) -> usize {
         | Plan::InsertFrom { .. }
         | Plan::InsertReturn { .. }
         | Plan::Update { .. }
+        | Plan::UpdateReturn { .. }
         | Plan::Merge { .. }
         | Plan::AddEdge { .. }
         | Plan::TxControl { .. } => 0,
@@ -2142,6 +2156,9 @@ mod tests {
                 plan_contains_filter(left) || plan_contains_filter(right)
             }
             Plan::InsertReturn { tail, .. } => plan_contains_filter(tail),
+            Plan::UpdateReturn { input, tail, .. } => {
+                plan_contains_filter(input) || plan_contains_filter(tail)
+            }
             Plan::Scan { .. }
             | Plan::NodeSeed { .. }
             | Plan::EdgeScan

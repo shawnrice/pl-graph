@@ -168,6 +168,15 @@ fn bind_plan(plan: &mut Plan, params: &HashMap<&str, &Value>) -> Result<(), Stri
                 }
             }
         }
+        Plan::UpdateReturn { input, ops, tail } => {
+            bind_plan(input, params)?;
+            for op in ops {
+                if let crate::ir::SetOp::Set { value, .. } = op {
+                    bind_expr(value, params)?;
+                }
+            }
+            bind_plan(tail, params)?;
+        }
         Plan::InsertFrom {
             input,
             nodes,

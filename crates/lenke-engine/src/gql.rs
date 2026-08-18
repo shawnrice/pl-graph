@@ -1093,6 +1093,20 @@ impl Parser {
             || self.peek_kw("DETACH")
         {
             let ops = self.set_ops()?;
+            // `MATCH … SET … RETURN …`: read-after-write. The RETURN projects over the
+            // SAME frontier the writes touched, seeded from `Row` and read against the
+            // mutated store (see `Plan::UpdateReturn`). Without a RETURN it is a plain
+            // Update yielding no rows.
+            if self.eat_kw("RETURN") {
+                let distinct = self.eat_kw("DISTINCT");
+                let items = self.return_items()?;
+                let tail = self.project_and_page(Plan::Row, distinct, items)?;
+                return Ok(Plan::UpdateReturn {
+                    input: Box::new(plan),
+                    ops,
+                    tail: Box::new(tail),
+                });
+            }
             return Ok(Plan::Update {
                 input: Box::new(plan),
                 ops,

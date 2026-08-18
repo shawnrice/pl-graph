@@ -705,6 +705,7 @@ pub(crate) fn is_write(plan: &Plan) -> bool {
             | Plan::InsertFrom { .. }
             | Plan::InsertReturn { .. }
             | Plan::Update { .. }
+            | Plan::UpdateReturn { .. }
             | Plan::Merge { .. }
             | Plan::AddEdge { .. }
     )
@@ -736,160 +737,22 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
             // pipeline's grouping/paging operators.
             let store_ref: &Store = store;
             let batch = pull_body(tail, store_ref, &seed)?;
-            let n = batch.rows();
-            Ok(match output_names(tail) {
-                Some(names) => {
-                    let ncols = names.len();
-                    let mut rows = Flat::with_capacity(n, ncols);
-                    for i in 0..n {
-                        for c in &batch.slots {
-                            rows.data.push(render_cell(c, i, store_ref));
-                        }
-                    }
-                    Rows { names, rows }
-                }
-                None => {
-                    let slot0 = batch.slot(0);
-                    let mut rows = Flat::with_capacity(n, 1);
-                    for i in 0..n {
-                        rows.data.push(render_cell(slot0, i, store_ref));
-                    }
-                    Rows {
-                        names: vec!["_".to_string()],
-                        rows,
-                    }
-                }
-            })
+            Ok(rows_from_batch(tail, &batch, store_ref))
         }
         Plan::Update { input, ops } => {
-            // Read phase: run the match and compute every write into OWNED data —
-            // so the immutable borrow ends before the write phase mutates. A slot
-            // may be a node frontier or (bound relationship) an edge frontier;
-            // SET/REMOVE dispatch on which, so `r.weight` writes an edge property.
-            enum Applied {
-                Set(u32, String, Value),
-                Remove(u32, String),
-                DeleteNode(u32, bool), // (node, detach)
-                DeleteEdge(u32),       // eid
-                SetEdge(u32, String, Value),
-                RemoveEdge(u32, String),
-            }
-            let mut applied: Vec<Applied> = Vec::new();
-            {
-                let track = needs_lineage(input);
-                let batch = pull(input, store, track)?;
-                for op in ops {
-                    match op {
-                        crate::ir::SetOp::Set { slot, key, value } => {
-                            let vals = eval(value, store, &batch)?;
-                            match batch.slot(*slot) {
-                                Col::Nodes(ids) => {
-                                    for (i, &id) in ids.iter().enumerate() {
-                                        // A string `id` is the element's fixed identity —
-                                        // re-keying it would break element_id / round-trip.
-                                        if key == "id" && node_id_is_identity(store, id) {
-                                            return Err(ID_IMMUTABLE_ERR.into());
-                                        }
-                                        applied.push(Applied::Set(
-                                            id,
-                                            key.clone(),
-                                            vals.value_at(i),
-                                        ));
-                                    }
-                                }
-                                Col::Edges(eids) => {
-                                    for (i, &e) in eids.iter().enumerate() {
-                                        if key == "id" && edge_id_is_identity(store, e) {
-                                            return Err(ID_IMMUTABLE_ERR.into());
-                                        }
-                                        applied.push(Applied::SetEdge(
-                                            e,
-                                            key.clone(),
-                                            vals.value_at(i),
-                                        ));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        crate::ir::SetOp::Remove { slot, key } => match batch.slot(*slot) {
-                            Col::Nodes(ids) => {
-                                for &id in ids {
-                                    applied.push(Applied::Remove(id, key.clone()));
-                                }
-                            }
-                            Col::Edges(eids) => {
-                                for &e in eids {
-                                    applied.push(Applied::RemoveEdge(e, key.clone()));
-                                }
-                            }
-                            _ => {}
-                        },
-                        crate::ir::SetOp::Delete { slot, detach } => match batch.slot(*slot) {
-                            Col::Nodes(ids) => {
-                                for &id in ids {
-                                    applied.push(Applied::DeleteNode(id, *detach));
-                                }
-                            }
-                            Col::Edges(eids) => {
-                                for &e in eids {
-                                    applied.push(Applied::DeleteEdge(e));
-                                }
-                            }
-                            _ => {}
-                        },
-                    }
-                }
-            }
-            // Write phase, as a TRANSACTION so a constraint violation rolls the whole
-            // statement back — matching INSERT/_MERGE. Previously SET/REMOVE applied
-            // with no recheck, so `SET u.email = <existing>` silently violated a
-            // unique constraint and `REMOVE u.email` a required one.
-            let scope = stmt_begin(store);
-            // Pass 1: property writes and EDGE deletes. Node deletes are deferred to
-            // pass 2 so an edge deleted here (`DELETE r, a, b`) leaves its endpoints
-            // relationship-free before the non-DETACH node-delete check runs.
-            let mut node_deletes: Vec<(u32, bool)> = Vec::new();
-            for a in applied {
-                match a {
-                    Applied::Set(node, key, value) => store.set_prop(node, &key, value),
-                    Applied::Remove(node, key) => store.remove_prop(node, &key),
-                    Applied::SetEdge(eid, key, value) => store.set_edge_prop(eid, &key, value),
-                    Applied::RemoveEdge(eid, key) => store.remove_edge_prop(eid, &key),
-                    Applied::DeleteEdge(eid) => {
-                        if let Some((u, v)) = store.edge_endpoints(eid) {
-                            store.delete_edge(u, v, eid);
-                        }
-                    }
-                    Applied::DeleteNode(node, detach) => node_deletes.push((node, detach)),
-                }
-            }
-            // Pass 2: node deletes. A non-DETACH delete of a node that still has
-            // relationships is an error (Cypher/core semantics); DETACH deletes the
-            // incident edges too (delete_node cascades). A node matched by several
-            // rows is deleted once (skip if already gone).
-            for (node, detach) in node_deletes {
-                if !store.is_alive(node) {
-                    continue;
-                }
-                if !detach && (!store.out(node).is_empty() || !store.inc(node).is_empty()) {
-                    stmt_rollback(store, scope);
-                    return Err(
-                        "E_INVALID_GRAPH_OP: cannot DELETE a node that still has relationships; \
-                         use DETACH DELETE"
-                            .into(),
-                    );
-                }
-                store.delete_node(node);
-            }
-            // Declared-constraint checks: NOW if standalone, else deferred to the
-            // enclosing transaction's COMMIT. Roll back on the first violation.
-            if let Err(e) = check_deferred_if_standalone(store, scope) {
-                stmt_rollback(store, scope);
-                return Err(e);
-            }
-            stmt_commit(store, scope);
+            run_update(store, input, ops, needs_lineage(input))?;
             Ok(empty_rows())
+        }
+        Plan::UpdateReturn { input, ops, tail } => {
+            // Read-after-write: run `input`, apply `ops`, then read `tail` over the
+            // SAME frontier against the mutated store (write-then-return, the twin of
+            // InsertReturn). `run_update` returns the frontier it wrote so the tail
+            // reads the just-written values without re-scanning.
+            let track = needs_lineage(input) || needs_lineage(tail);
+            let frontier = run_update(store, input, ops, track)?;
+            let store_ref: &Store = store;
+            let batch = pull_body(tail, store_ref, &frontier)?;
+            Ok(rows_from_batch(tail, &batch, store_ref))
         }
         Plan::Merge {
             label,
@@ -917,6 +780,170 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
         }
         _ => try_run(plan, store),
     }
+}
+
+/// Render a tail projection's output `Batch` to `Rows` — the shared tail of the
+/// write-then-return paths (`InsertReturn` / `UpdateReturn`). Uses the tail's output
+/// names when it is a projection, else a single `_` column over slot 0.
+fn rows_from_batch(tail: &Plan, batch: &Batch, store: &Store) -> Rows {
+    let n = batch.rows();
+    match output_names(tail) {
+        Some(names) => {
+            let ncols = names.len();
+            let mut rows = Flat::with_capacity(n, ncols);
+            for i in 0..n {
+                for c in &batch.slots {
+                    rows.data.push(render_cell(c, i, store));
+                }
+            }
+            Rows { names, rows }
+        }
+        None => {
+            let slot0 = batch.slot(0);
+            let mut rows = Flat::with_capacity(n, 1);
+            for i in 0..n {
+                rows.data.push(render_cell(slot0, i, store));
+            }
+            Rows {
+                names: vec!["_".to_string()],
+                rows,
+            }
+        }
+    }
+}
+
+/// The concrete write a matched row expands to, computed while the store is still
+/// immutably borrowed (the read phase) so the write phase can mutate freely.
+enum Applied {
+    Set(u32, String, Value),
+    Remove(u32, String),
+    DeleteNode(u32, bool), // (node, detach)
+    DeleteEdge(u32),       // eid
+    SetEdge(u32, String, Value),
+    RemoveEdge(u32, String),
+}
+
+/// Run a `MATCH … SET/REMOVE/DELETE` update: pull the frontier, apply the ops in a
+/// statement transaction (with the deferred-constraint recheck), and RETURN the
+/// frontier batch it operated on — so `UpdateReturn` can read the just-written values
+/// over the same bindings. `Plan::Update` discards the returned batch.
+fn run_update(
+    store: &mut Store,
+    input: &Plan,
+    ops: &[crate::ir::SetOp],
+    track: bool,
+) -> Result<Batch, String> {
+    // Read phase: run the match and compute every write into OWNED data — the pulled
+    // frontier batch owns its columns (no store borrow), so it survives the mutation
+    // and seeds an `UpdateReturn` tail.
+    let frontier = pull(input, store, track)?;
+    let mut applied: Vec<Applied> = Vec::new();
+    {
+        let batch = &frontier;
+        for op in ops {
+            match op {
+                crate::ir::SetOp::Set { slot, key, value } => {
+                    let vals = eval(value, store, batch)?;
+                    match batch.slot(*slot) {
+                        Col::Nodes(ids) => {
+                            for (i, &id) in ids.iter().enumerate() {
+                                // A string `id` is the element's fixed identity —
+                                // re-keying it would break element_id / round-trip.
+                                if key == "id" && node_id_is_identity(store, id) {
+                                    return Err(ID_IMMUTABLE_ERR.into());
+                                }
+                                applied.push(Applied::Set(id, key.clone(), vals.value_at(i)));
+                            }
+                        }
+                        Col::Edges(eids) => {
+                            for (i, &e) in eids.iter().enumerate() {
+                                if key == "id" && edge_id_is_identity(store, e) {
+                                    return Err(ID_IMMUTABLE_ERR.into());
+                                }
+                                applied.push(Applied::SetEdge(e, key.clone(), vals.value_at(i)));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                crate::ir::SetOp::Remove { slot, key } => match batch.slot(*slot) {
+                    Col::Nodes(ids) => {
+                        for &id in ids {
+                            applied.push(Applied::Remove(id, key.clone()));
+                        }
+                    }
+                    Col::Edges(eids) => {
+                        for &e in eids {
+                            applied.push(Applied::RemoveEdge(e, key.clone()));
+                        }
+                    }
+                    _ => {}
+                },
+                crate::ir::SetOp::Delete { slot, detach } => match batch.slot(*slot) {
+                    Col::Nodes(ids) => {
+                        for &id in ids {
+                            applied.push(Applied::DeleteNode(id, *detach));
+                        }
+                    }
+                    Col::Edges(eids) => {
+                        for &e in eids {
+                            applied.push(Applied::DeleteEdge(e));
+                        }
+                    }
+                    _ => {}
+                },
+            }
+        }
+    }
+    // Write phase, as a TRANSACTION so a constraint violation rolls the whole
+    // statement back — matching INSERT/_MERGE. Previously SET/REMOVE applied
+    // with no recheck, so `SET u.email = <existing>` silently violated a
+    // unique constraint and `REMOVE u.email` a required one.
+    let scope = stmt_begin(store);
+    // Pass 1: property writes and EDGE deletes. Node deletes are deferred to
+    // pass 2 so an edge deleted here (`DELETE r, a, b`) leaves its endpoints
+    // relationship-free before the non-DETACH node-delete check runs.
+    let mut node_deletes: Vec<(u32, bool)> = Vec::new();
+    for a in applied {
+        match a {
+            Applied::Set(node, key, value) => store.set_prop(node, &key, value),
+            Applied::Remove(node, key) => store.remove_prop(node, &key),
+            Applied::SetEdge(eid, key, value) => store.set_edge_prop(eid, &key, value),
+            Applied::RemoveEdge(eid, key) => store.remove_edge_prop(eid, &key),
+            Applied::DeleteEdge(eid) => {
+                if let Some((u, v)) = store.edge_endpoints(eid) {
+                    store.delete_edge(u, v, eid);
+                }
+            }
+            Applied::DeleteNode(node, detach) => node_deletes.push((node, detach)),
+        }
+    }
+    // Pass 2: node deletes. A non-DETACH delete of a node that still has
+    // relationships is an error (Cypher/core semantics); DETACH deletes the
+    // incident edges too (delete_node cascades). A node matched by several
+    // rows is deleted once (skip if already gone).
+    for (node, detach) in node_deletes {
+        if !store.is_alive(node) {
+            continue;
+        }
+        if !detach && (!store.out(node).is_empty() || !store.inc(node).is_empty()) {
+            stmt_rollback(store, scope);
+            return Err(
+                "E_INVALID_GRAPH_OP: cannot DELETE a node that still has relationships; \
+                         use DETACH DELETE"
+                    .into(),
+            );
+        }
+        store.delete_node(node);
+    }
+    // Declared-constraint checks: NOW if standalone, else deferred to the
+    // enclosing transaction's COMMIT. Roll back on the first violation.
+    if let Err(e) = check_deferred_if_standalone(store, scope) {
+        stmt_rollback(store, scope);
+        return Err(e);
+    }
+    stmt_commit(store, scope);
+    Ok(frontier)
 }
 
 /// Execute a `_MERGE`: infer the key from a unique constraint, find the existing
@@ -1641,6 +1668,14 @@ fn needs_lineage(plan: &Plan) -> bool {
                     crate::ir::SetOp::Remove { .. } | crate::ir::SetOp::Delete { .. } => false,
                 })
         }
+        Plan::UpdateReturn { input, ops, tail } => {
+            needs_lineage(input)
+                || needs_lineage(tail)
+                || ops.iter().any(|op| match op {
+                    crate::ir::SetOp::Set { value, .. } => reads_path(value),
+                    crate::ir::SetOp::Remove { .. } | crate::ir::SetOp::Delete { .. } => false,
+                })
+        }
     }
 }
 
@@ -1655,6 +1690,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         | Plan::InsertFrom { .. }
         | Plan::InsertReturn { .. }
         | Plan::Update { .. }
+        | Plan::UpdateReturn { .. }
         | Plan::Merge { .. }
         | Plan::AddEdge { .. }
         | Plan::TxControl { .. } => Batch::of(Vec::new()),
@@ -13981,6 +14017,25 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             }
             Batch::of(slots)
         }
+        // Paging / dedup / tail in a Row-seeded tail (a `SET … RETURN … ORDER BY` /
+        // `DISTINCT`, or a Gremlin `property(…).values(…).dedup()`). The seed is already
+        // materialized, so apply the batch-level operators directly — no streaming cap.
+        Plan::OrderPage {
+            input,
+            keys,
+            skip,
+            limit,
+        } => {
+            let b = pull_body(input, store, seed)?;
+            order_page(&b, store, keys, *skip, *limit)?
+        }
+        Plan::Distinct { input } => distinct_batch(pull_body(input, store, seed)?),
+        Plan::Tail { input, n } => {
+            let b = pull_body(input, store, seed)?;
+            let rows = b.rows();
+            let start = rows.saturating_sub(*n);
+            b.gather(&(start..rows).collect::<Vec<usize>>())
+        }
         other => {
             return Err(format!("unsupported operator in EXISTS body: {other:?}"));
         }
@@ -18216,7 +18271,8 @@ mod tests {
             | Plan::Project { input, .. }
             | Plan::Distinct { input }
             | Plan::SortLocal { input, .. }
-            | Plan::Update { input, .. } => has_interval_expand(input),
+            | Plan::Update { input, .. }
+            | Plan::UpdateReturn { input, .. } => has_interval_expand(input),
             Plan::Join { left, right, .. } => {
                 has_interval_expand(left) || has_interval_expand(right)
             }

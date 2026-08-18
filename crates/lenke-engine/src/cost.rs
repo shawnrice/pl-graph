@@ -240,7 +240,9 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
         // --- row-preserving / structural ----------------------------------------
         Plan::Project { input, .. }
         | Plan::SortLocal { input, .. }
-        | Plan::Update { input, .. } => estimate(input, store),
+        | Plan::Update { input, .. }
+        // An UpdateReturn projects its tail over the written frontier (≈ input rows).
+        | Plan::UpdateReturn { input, .. } => estimate(input, store),
         Plan::Union { left, right, .. } => {
             let (a, b) = (estimate(left, store), estimate(right, store));
             Card::approx(a.rows + b.rows)

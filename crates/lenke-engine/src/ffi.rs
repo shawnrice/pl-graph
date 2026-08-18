@@ -603,7 +603,21 @@ pub unsafe extern "C" fn lnk_query(
                     return std::ptr::null_mut();
                 }
             };
-            guarded(|| crate::exec::try_run_gremlin_json(&plan, store))
+            // A Gremlin write (`addV`/`property`/`drop`/`addE`, or a
+            // `property(k,v).values(k)` read-after-write UpdateReturn) runs through the
+            // mutable executor — like the GQL path — then renders its rows as the bare
+            // Gremlin value array. Previously EVERY Gremlin query took the read-only
+            // `try_run_gremlin_json` path, so a bare write faulted (a write plan pulls to
+            // an empty batch). A read takes the streaming JSON path.
+            if crate::exec::is_write(&plan) {
+                guarded(|| {
+                    crate::exec::enforce_read_only(store)
+                        .and_then(|()| crate::exec::execute(&plan, store))
+                        .map(|rows| crate::json::gremlin_results_json(&rows))
+                })
+            } else {
+                guarded(|| crate::exec::try_run_gremlin_json(&plan, store))
+            }
         }
         _ => {
             crate::ffi_error::set("E_FFI", "unknown query language");

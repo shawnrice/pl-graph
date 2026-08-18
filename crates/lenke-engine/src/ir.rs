@@ -928,8 +928,21 @@ pub enum Plan {
     },
     /// A write over the rows of a read sub-plan: for each matched row, apply the
     /// `ops` (SET/REMOVE) to the bound nodes. Run through `exec::execute`, not
-    /// pulled; produces no rows (a RETURN after an update is a later slice).
+    /// pulled; produces no rows.
     Update { input: Box<Plan>, ops: Vec<SetOp> },
+    /// An `Update` whose written frontier is bound into a following projection —
+    /// `MATCH (n) SET n.x = 1 RETURN n.x` and Gremlin `property(k, v).values(k)`.
+    /// Runs `input`, applies `ops`, then evaluates `tail` (a `Plan::Row`-rooted read)
+    /// over the SAME frontier against the mutated store, so the projection reads the
+    /// just-written values. The engine's read-after-write (write-then-return) path for
+    /// updates — the twin of [`Plan::InsertReturn`]. A write: run through
+    /// `exec::execute`, never pulled. The `tail` is restricted to the operators
+    /// `pull_body` seeds (Row/Project/Filter/Expand/Aggregate/…), not paging/distinct.
+    UpdateReturn {
+        input: Box<Plan>,
+        ops: Vec<SetOp>,
+        tail: Box<Plan>,
+    },
     /// Create ONE edge between two EXISTING nodes (Gremlin `addE`), with inline
     /// properties. A leaf write; `from`/`to` are node ids. Distinct from
     /// `Insert`'s edges, which reference nodes created in the same statement.
