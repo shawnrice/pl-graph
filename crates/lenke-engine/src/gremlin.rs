@@ -45,6 +45,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         sack_slot: None,
         subgraph_caps: std::collections::HashMap::new(),
         pending_write: None,
+        current_is_map: false,
     };
     p.traversal()
 }
@@ -665,6 +666,12 @@ struct Parser {
     /// plan resets to `Row` (the seeded frontier) so the tail builds over it; `traversal`
     /// wraps the finished tail back into a [`Plan::UpdateReturn`].
     pending_write: Option<(Box<Plan>, Vec<crate::ir::SetOp>)>,
+    /// True when the current traverser is a Map (a `project`/`group`/`valueMap`/…
+    /// row), false on an element or scalar frontier. Gremlin's `select('k')` reads a
+    /// Map ENTRY only on a Map; on a vertex/edge an unbound tag matches nothing and the
+    /// traverser drops. Frontier-preserving steps (`filter`/`order`/`dedup`/…) leave it
+    /// unchanged; every other step resets it, and the Map producers set it true.
+    current_is_map: bool,
 }
 
 impl Parser {
@@ -1196,6 +1203,49 @@ impl Parser {
         // The pre-taint value — a `values('k')` that folds into a following `tree()`
         // needs to know it was still on a pure vertex chain BEFORE this step's taint.
         self.path_ok_pre_step = self.path_ok;
+        // Whether the INCOMING frontier was a Map — read by `select` (which consumes the
+        // Map to project an entry) before the reset below clobbers it.
+        let incoming_is_map = self.current_is_map;
+        // The current-is-Map flag survives only the frontier-preserving steps (they
+        // filter/reorder the same traversers); every other step recomputes it — a hop or
+        // scalar read clears it here, a Map producer sets it true in its own arm below.
+        if !matches!(
+            lname.as_str(),
+            "has"
+                | "hasnot"
+                | "hasid"
+                | "haslabel"
+                | "hasnotlabel"
+                | "haskey"
+                | "hasvalue"
+                | "where"
+                | "filter"
+                | "is"
+                | "and"
+                | "or"
+                | "not"
+                | "dedup"
+                | "order"
+                | "by"
+                | "limit"
+                | "tail"
+                | "skip"
+                | "range"
+                | "as"
+                | "identity"
+                | "barrier"
+                | "aggregate"
+                | "store"
+                | "sideeffect"
+                | "sample"
+                | "coin"
+                | "none"
+                | "cyclicpath"
+                | "simplepath"
+                | "profile"
+        ) {
+            self.current_is_map = false;
+        }
         // Only a pure vertex-hop chain keeps `path()` answerable; every other step
         // taints it (`path()` and the element filters are path-preserving). The repeat
         // modulators are exempt: `repeat(<vertex-hop>)` lowers to a VarLength walk that
@@ -2516,6 +2566,7 @@ impl Parser {
                 )]);
                 self.current = 0;
                 self.slots = 1;
+                self.current_is_map = true;
                 p
             }
             "valuemap" | "propertymap" => {
@@ -2549,6 +2600,7 @@ impl Parser {
                 )]);
                 self.current = 0;
                 self.slots = 1;
+                self.current_is_map = true;
                 p
             }
             "properties" => {
@@ -3385,6 +3437,13 @@ impl Parser {
                     self.slots = 1;
                     return Ok(plan.filter(Expr::Lit(Value::Bool(false))));
                 }
+                if any_unbound && !incoming_is_map {
+                    // An unbound tag on an element/scalar frontier (not a Map) matches
+                    // nothing — core drops the traverser, so filter it all away.
+                    self.current = 0;
+                    self.slots = 1;
+                    return Ok(plan.filter(Expr::Lit(Value::Bool(false))));
+                }
                 if any_unbound {
                     // Bound labels read their tagged slot; unbound ones read the Map entry.
                     let field_of = |l: &str| -> Expr {
@@ -3399,6 +3458,7 @@ impl Parser {
                     let p = if labels.len() == 1 {
                         plan.project(vec![(labels[0].clone(), field_of(&labels[0]))])
                     } else {
+                        self.current_is_map = true; // multi-label select yields a Map
                         let entries = labels.iter().map(|l| (l.clone(), field_of(l))).collect();
                         plan.project(vec![("select".into(), Expr::MapLit { entries })])
                     };
@@ -3416,6 +3476,7 @@ impl Parser {
                 } else if labels.len() == 1 {
                     plan.project(vec![(labels[0].clone(), val_of(0, &labels[0])?)])
                 } else {
+                    self.current_is_map = true; // multi-label select yields a Map
                     let entries = labels
                         .iter()
                         .enumerate()
@@ -3461,6 +3522,7 @@ impl Parser {
                 let p = plan.project(vec![("project".into(), Expr::MapLit { entries })]);
                 self.current = 0;
                 self.slots = 1;
+                self.current_is_map = true;
                 p
             }
             "groupcount" => {
@@ -3495,6 +3557,7 @@ impl Parser {
                     .group_to_map();
                 self.current = 0;
                 self.slots = 1; // one Map column
+                self.current_is_map = true;
                 p
             }
             "group" => {
