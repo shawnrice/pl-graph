@@ -14979,8 +14979,9 @@ fn substring(args: &[Value]) -> Value {
 
 /// Apply a unary numeric scalar function. A NULL / non-numeric argument yields
 /// NULL; a computed NaN/Inf result (e.g. `sqrt(-1)`, `ln(0)`) is KEPT (IEEE, like
-/// lenke-core — coerced to null only at JSON egress). `sign(0)` is 0 (unlike
-/// `f64::signum`); rounding is f64's round-half-away-from-zero.
+/// lenke-core — coerced to null only at JSON egress). `sign(0)` is 0 and `sign(NaN)`
+/// is NaN (unlike `f64::signum`, which is ±1 for both); rounding is f64's
+/// round-half-away-from-zero.
 /// The finite→finite unary numeric functions, as raw `f64 -> f64` closures that
 /// match [`scalar_num_fn`] EXACTLY. Restricted to functions that cannot introduce
 /// NaN/Inf from a finite input (`sqrt`/`ln`/`exp`/… can, so they are excluded):
@@ -14993,7 +14994,9 @@ fn unary_finite_num_fn(name: &str) -> Option<fn(f64) -> f64> {
         "ceil" | "ceiling" => f64::ceil,
         "round" => f64::round,
         "sign" => |x: f64| {
-            if x > 0.0 {
+            if x.is_nan() {
+                f64::NAN
+            } else if x > 0.0 {
                 1.0
             } else if x < 0.0 {
                 -1.0
@@ -15011,8 +15014,13 @@ fn scalar_num_fn(name: &str, v: &Value) -> Value {
     };
     let r = match name {
         "abs" => x.abs(),
+        // NaN is not a number, so it has no sign — `sign(NaN)` stays NaN (→ null at
+        // egress), matching JS `Math.sign(NaN)`. Without this guard NaN falls through both
+        // `> 0` and `< 0` (both false for NaN) to the `0.0` else-arm, a wrong answer.
         "sign" => {
-            if x > 0.0 {
+            if x.is_nan() {
+                f64::NAN
+            } else if x > 0.0 {
                 1.0
             } else if x < 0.0 {
                 -1.0
@@ -20207,6 +20215,24 @@ mod tests {
         assert!((num("RETURN atan2(-0.0, -1.0) AS r") - pi).abs() < 1e-12);
         assert!((num("RETURN atan2(0.0 * -1, -1.0) AS r") - pi).abs() < 1e-12);
         assert!(num("RETURN atan2(-0.0, -0.0) AS r").abs() < 1e-12); // atan2(+0, +0) = 0
+    }
+
+    /// NaN has no sign: `sign(NaN)` is NaN (→ null at egress), NOT the 0 that a naive
+    /// `>0 / <0 / else` would give. Finite inputs are unchanged.
+    #[test]
+    fn sign_of_nan_is_nan() {
+        let store =
+            crate::ndjson::from_ndjson("{\"id\":\"n\",\"labels\":[\"V\"],\"props\":{}}").unwrap();
+        let val =
+            |q: &str| -> Value { run(&crate::gql::parse(q).unwrap(), &store).rows[0][0].clone() };
+        // asin(1e100) and log10(-1) are NaN; sign keeps NaN at the row level (it is only
+        // coerced to null at the JSON egress boundary, per the K4 policy).
+        assert!(matches!(val("RETURN sign(asin(1e100)) AS x"), Value::Num(n) if n.is_nan()));
+        assert!(matches!(val("RETURN sign(log10(-1)) AS x"), Value::Num(n) if n.is_nan()));
+        // Finite inputs are unaffected.
+        assert!(matches!(val("RETURN sign(-5.0) AS x"), Value::Num(n) if n == -1.0));
+        assert!(matches!(val("RETURN sign(5.0) AS x"), Value::Num(n) if n == 1.0));
+        assert!(matches!(val("RETURN sign(0.0) AS x"), Value::Num(n) if n == 0.0));
     }
 
     /// Scalar functions: 2-arg round (incl. negative digits), atan2 (arg order +
