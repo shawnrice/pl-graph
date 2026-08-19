@@ -318,6 +318,7 @@ fn parse_internal(query: &str, params: &[(String, Value)], prepared: bool) -> Re
         having_base: 0,
         params: params.iter().cloned().collect(),
         prepared,
+        no_next: false,
     };
     // ISO transaction-control command (`START TRANSACTION`/`COMMIT`/`ROLLBACK`)? A
     // linear query never begins with a bare START/COMMIT/ROLLBACK, so there is no
@@ -349,6 +350,9 @@ fn parse_internal(query: &str, params: &[(String, Value)], prepared: bool) -> Re
         p.group_node_slots = HashSet::new();
         p.group_edge_slots = HashSet::new();
         p.group_var_depth = HashMap::new();
+        // A set operator combined with NEXT is unsupported (both engines reject it);
+        // a UNION arm must not consume a trailing NEXT as its own pipeline boundary.
+        p.no_next = true;
         let right = p.query()?;
         plan = Plan::Union {
             left: Box::new(plan),
@@ -702,6 +706,10 @@ struct Parser {
     /// instead of substituting it, so the plan can be cached and bound per run. Set
     /// by [`parse_prepared`]; the `params` map is empty then.
     prepared: bool,
+    /// Set while parsing a UNION arm: a `NEXT` pipeline boundary combined with a set
+    /// operator is a documented limitation (both engines reject it), so `query_tail`
+    /// refuses to consume `NEXT` here rather than silently re-associating the union.
+    no_next: bool,
 }
 
 impl Parser {
@@ -1044,6 +1052,22 @@ impl Parser {
         loop {
             if self.eat_kw("WITH") {
                 plan = self.with_clause(plan)?;
+            } else if self.peek_kw("RETURN") && !self.no_next && self.scan_for_next() {
+                // `RETURN … NEXT …` (ISO statement composition): the RETURN is a
+                // PIPELINE boundary, not the terminal projection — its columns become
+                // the next statement's driving table. It behaves exactly as a `WITH`
+                // (elements stay handles, so `NEXT MATCH (person)…` can re-traverse a
+                // carried node), so route it through `with_clause`, then an optional
+                // `YIELD` selects/renames the piped columns, and the loop continues
+                // into the next part (FILTER / MATCH / LET / RETURN).
+                self.eat_kw("RETURN");
+                plan = self.with_clause(plan)?;
+                if !self.eat_kw("NEXT") {
+                    return Err("expected NEXT after a pipelined RETURN".into());
+                }
+                if self.eat_kw("YIELD") {
+                    plan = self.next_yield(plan)?;
+                }
             } else if self.eat_kw("LET") {
                 plan = self.let_clause(plan)?;
             } else if self.eat_kw("OPTIONAL") {
@@ -1365,6 +1389,57 @@ impl Parser {
             i += 1;
         }
         None
+    }
+
+    /// Whether a bracket-depth-0 `NEXT` follows the cursor within this linear query —
+    /// the marker that the RETURN about to be parsed is a PIPELINE boundary (its output
+    /// feeds the next statement), not the terminal projection. A depth-0 `UNION` stops
+    /// the scan: `UNION` binds tighter than `NEXT`, so the RETURN belongs to the union
+    /// arm, and the whole union is the NEXT operand.
+    fn scan_for_next(&self) -> bool {
+        let mut depth = 0i32;
+        let mut i = self.pos;
+        while let Some(t) = self.toks.get(i) {
+            match t {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => depth -= 1,
+                Tok::Ident(s) if depth == 0 && s.eq_ignore_ascii_case("NEXT") => return true,
+                Tok::Ident(s) if depth == 0 && s.eq_ignore_ascii_case("UNION") => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// `YIELD col [AS alias], …` after `NEXT`: select (and optionally rename) the piped
+    /// columns, rebinding scope to exactly the yielded ones.
+    fn next_yield(&mut self, plan: Plan) -> Result<Plan, String> {
+        let mut items: Vec<RetItem> = Vec::new();
+        loop {
+            let col = self.ident()?;
+            let slot = *self
+                .scope
+                .get(&col)
+                .ok_or_else(|| format!("YIELD: unknown column `{col}`"))?;
+            let name = if self.eat_kw("AS") {
+                self.ident()?
+            } else {
+                col
+            };
+            items.push(RetItem::Key(name, Expr::Slot(slot)));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        let (plan, out_names) = apply_items(plan, &items);
+        self.scope = out_names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i))
+            .collect();
+        self.slots = out_names.len();
+        Ok(plan)
     }
 
     /// `SELECT [DISTINCT] items [FROM [<graph>] MATCH pattern [WHERE]] [GROUP BY g]
