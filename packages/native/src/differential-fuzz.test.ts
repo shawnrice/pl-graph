@@ -364,10 +364,71 @@ const AGG = [
   'stddev_samp',
 ] as const;
 
+// An inline `CALL (scope) { … }` query. Nothing here generated one before, so the
+// whole correlated-subquery surface — the lateral join, OPTIONAL left-outer null-fill,
+// `RETURN *`, the per-outer-row `UNION`/`EXCEPT`/`INTERSECT` combine (scope-var AND
+// fresh-scan arms), the uncorrelated global set-op, and the scalar-aggregate body — was
+// invisible to the fuzzer. Comparison is structural (row multiset), which is the correct
+// invariant: intra-group row order in a CALL without ORDER BY is unspecified. The yields
+// are plain property refs (not genExpr) so a divergence is attributable to CALL mechanics,
+// not to an unrelated scalar-function difference. The fixture gives node 3 no out-edge, so
+// the empty-body cases (OPTIONAL null-fill, sum→0, min/max→null) are exercised.
+const genCall = (r: () => number): string => {
+  const et = (): string => pick(r, ['E', 'F', 'E|F']);
+  const opt = r() < 0.35 ? 'OPTIONAL ' : '';
+  const k = r();
+
+  // Plain / OPTIONAL correlated lateral join yielding a scalar.
+  if (k < 0.22) {
+    return `MATCH (a:T) ${opt}CALL (a) { MATCH (a)-[e:${et()}]->(b) RETURN b.n AS bn } RETURN a.n AS an, bn`;
+  }
+
+  // `RETURN *` carries the fresh body var back into the outer scope.
+  if (k < 0.36) {
+    return `MATCH (a:T) ${opt}CALL (a) { MATCH (a)-[:${et()}]->(b) RETURN * } RETURN a.n AS an, b.n AS bn`;
+  }
+
+  // A single scalar aggregate body (sum/avg/min/max reduce e.w; count tallies b).
+  if (k < 0.56) {
+    const agg = pick(r, ['sum', 'avg', 'min', 'max', 'count']);
+    const arg = agg === 'count' ? 'b' : 'e.w';
+
+    return `MATCH (a:T) ${opt}CALL (a) { MATCH (a)-[e:${et()}]->(b) RETURN ${agg}(${arg}) AS ag } RETURN a.n AS an, ag`;
+  }
+
+  // Set-op body, BOTH arms scope-var-rooted.
+  if (k < 0.72) {
+    const op = pick(r, ['UNION', 'UNION ALL', 'EXCEPT', 'INTERSECT']);
+
+    return `MATCH (a:T) ${opt}CALL (a) { MATCH (a)-[:${et()}]->(b) RETURN b.n AS x ${op} MATCH (a)-[:${et()}]->(c) RETURN c.n AS x } RETURN a.n AS an, x`;
+  }
+
+  // Set-op body with a FRESH-scan arm (correlation on one side only).
+  if (k < 0.88) {
+    const op = pick(r, ['UNION', 'EXCEPT', 'INTERSECT']);
+    const arms = pick(r, [
+      `MATCH (m:T) RETURN m.n AS x ${op} MATCH (a)-[:${et()}]->(b) RETURN b.n AS x`,
+      `MATCH (a)-[:${et()}]->(b) RETURN b.n AS x ${op} MATCH (m:T) RETURN m.n AS x`,
+    ]);
+
+    return `MATCH (a:T) ${opt}CALL (a) { ${arms} } RETURN a.n AS an, x`;
+  }
+
+  // Uncorrelated global set-op cross-joined with a single outer row.
+  const op = pick(r, ['UNION', 'UNION ALL', 'EXCEPT', 'INTERSECT']);
+
+  return `MATCH (a:T {n: ${pick(r, ['3', '5', '7'])}}) CALL () { MATCH (m:T) RETURN m.n AS x ${op} MATCH (m:U) RETURN m.n AS x } RETURN a.n AS an, x`;
+};
+
 // A full query. Every ORDER BY ends with the distinct `n.n` so the row order is
 // total — an unordered tie is unspecified, not a divergence.
 const genQuery = (r: () => number): string => {
   const p = r();
+
+  // Inline correlated-subquery CALL — the whole surface Phases 0–3 built.
+  if (p < 0.12) {
+    return genCall(r);
+  }
 
   if (p < 0.2) {
     const distinct = r() < 0.5 ? 'DISTINCT ' : '';
