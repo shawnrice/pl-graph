@@ -365,6 +365,10 @@ pub enum PathPart {
     Relationships,
     Length,
     Elements,
+    /// `cardinality(p)` — the ISO count of ALL elements in a path: nodes + edges
+    /// (`path_length` + 1 nodes and `path_length` edges). Distinct from `Length`
+    /// (edges only) and `size` (a list-only function that rejects a path).
+    Cardinality,
 }
 
 /// A `path().by(...)` element projection for the interleaved Gremlin path

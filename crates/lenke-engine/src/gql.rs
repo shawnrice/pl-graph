@@ -5723,13 +5723,21 @@ impl Parser {
             }
             return Ok(Expr::PathAccess { part });
         }
+        // `cardinality` is POLYMORPHIC (list/string via the normal path below), but ISO
+        // also defines it over a PATH — the count of nodes + edges. Route only the
+        // path-variable form to the accessor; a list/string arg falls through.
+        if lname == "cardinality" && matches!(args.as_slice(), [Expr::Path]) {
+            return Ok(Expr::PathAccess {
+                part: PathPart::Cardinality,
+            });
+        }
         let arity_ok = match lname.as_str() {
             // 0 args (numeric constants)
             "e" | "pi" => args.is_empty(),
             // 1 arg
             "abs" | "sign" | "floor" | "ceil" | "ceiling" | "sqrt" | "exp" | "ln" | "log10"
             | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh"
-            | "cot" | "degrees" | "radians" | "upper" | "lower" | "trim" | "length" | "size"
+            | "cot" | "degrees" | "radians" | "upper" | "lower" | "trim" | "size"
             | "cardinality" | "head" | "last"
             // Temporal component accessors carry the leading-underscore extension sigil
             // (`_year`), matching core; the bare ISO spellings are NOT in the grammar.
@@ -10247,7 +10255,7 @@ mod tests {
     fn string_functions() {
         let store = social();
         let q = "MATCH (p:Person) WHERE p.name = 'alice' RETURN \
-                 upper(p.name) AS u, length(p.name) AS l, substring(p.name, 1, 3) AS sub, \
+                 upper(p.name) AS u, char_length(p.name) AS l, substring(p.name, 1, 3) AS sub, \
                  replace(p.name, 'a', 'A') AS rep";
         let out = run(&super::parse(q).unwrap(), &store);
         assert!(matches!(col(&out, 0, "u"), Value::Str(x) if &*x == "ALICE"));

@@ -12907,6 +12907,10 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                                 }
                                 // Hops == number of relationships.
                                 PathPart::Length => Value::Num(edges.len() as f64),
+                                // ISO cardinality of a path: every element (nodes + edges).
+                                PathPart::Cardinality => {
+                                    Value::Num((nodes.len() + edges.len()) as f64)
+                                }
                                 PathPart::Elements => {
                                     // n0, e0, n1, e1, …, nk — each a full element map.
                                     let ns = path_node_values(store, nodes);
@@ -14882,8 +14886,10 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             _ => Value::Null,
         },
         // Length of a string in UTF-16 code units (JS `.length` model), matching
-        // core; `byte_length`/`octet_length` count UTF-8 bytes.
-        "length" | "char_length" | "character_length" => match &args[0] {
+        // core; `byte_length`/`octet_length` count UTF-8 bytes. (`length` is NOT an ISO
+        // GQL function — the standard has CHAR_LENGTH/OCTET_LENGTH/PATH_LENGTH/CARDINALITY
+        // — so it is rejected as unknown, not aliased here.)
+        "char_length" | "character_length" => match &args[0] {
             Value::Str(s) => Value::Num(utf16_len(s) as f64),
             _ => Value::Null,
         },

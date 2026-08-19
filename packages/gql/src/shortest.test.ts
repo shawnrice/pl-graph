@@ -85,18 +85,20 @@ describe('ANY SHORTEST path patterns', () => {
     expect(names(rows)).toEqual(['josh', 'lop', 'vadas']);
   });
 
-  test('ISO path functions: path_length/length, nodes, edges, elements', () => {
+  test('ISO path functions: path_length/cardinality, nodes, edges, elements', () => {
     const rows = query(
       modern(),
       "MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'ripple' " +
-        'RETURN path_length(p) AS len, length(p) AS len2, ' +
+        'RETURN path_length(p) AS len, cardinality(p) AS card, ' +
         'nodes(p) AS ns, edges(p) AS es, elements(p) AS el',
     );
     expect(rows).toHaveLength(1);
     const [row] = rows;
 
-    expect(row.len).toBe(2); // marko -> josh -> ripple
-    expect(row.len2).toBe(2);
+    expect(row.len).toBe(2); // marko -> josh -> ripple: 2 hops (edges)
+    // ISO cardinality = every element: 3 nodes + 2 edges = 5. (`length` is not an ISO
+    // GQL function; PATH_LENGTH gives hops, CARDINALITY gives the element count.)
+    expect(row.card).toBe(5);
 
     const ns = row.ns as Array<{ id: string }>;
     expect(ns.map((v) => v.id)).toEqual(['marko', 'josh', 'ripple']);

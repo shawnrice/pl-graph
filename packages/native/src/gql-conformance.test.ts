@@ -1206,13 +1206,14 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
   test('ISO path functions on a bound path are byte-identical', () => {
     const q =
       `MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'lop' ` +
-      `RETURN path_length(p) AS len, length(p) AS len2, ` +
+      `RETURN path_length(p) AS len, cardinality(p) AS card, ` +
       `nodes(p) AS ns, edges(p) AS es, elements(p) AS el`;
     const [ts, native] = both(q);
     expect(ts).toBe(native);
-    // Length is the hop count; nodes/edges/elements are rich element lists.
+    // path_length is the hop count (1); ISO cardinality is every element — 2 nodes + 1
+    // edge = 3. (`length` is NOT an ISO GQL function.) nodes/edges/elements are rich.
     expect(ts).toBe(
-      `[{"len":1,"len2":1,` +
+      `[{"len":1,"card":3,` +
         `"ns":[` +
         `{"id":"1","labels":["Person"],"properties":{"age":29,"name":"marko"}},` +
         `{"id":"3","labels":["Software"],"properties":{"lang":"java","name":"lop"}}],` +

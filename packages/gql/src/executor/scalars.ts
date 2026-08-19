@@ -718,8 +718,10 @@ const assertScalarArgTypes = (name: string, args: readonly unknown[]): void => {
 
   if (POLY_STR_LIST.has(name)) {
     const [v] = args;
+    // `cardinality` ALSO accepts a path (nodes + edges count) — `size` does not.
+    const okPath = name === 'cardinality' && v instanceof Path;
 
-    if (v !== undefined && !isNullish(v) && typeof v !== 'string' && !Array.isArray(v)) {
+    if (v !== undefined && !isNullish(v) && typeof v !== 'string' && !Array.isArray(v) && !okPath) {
       dataException(`${name}() requires a string or list`);
     }
   }
@@ -771,10 +773,13 @@ export const callScalar = (
   switch (name) {
     case 'round':
       return roundScalar(a, b);
-    // `cardinality` is the ISO GQL / SQL name; `size` is the openCypher spelling.
+    // `cardinality(p)` over a PATH is the ISO count of all elements (nodes + edges);
+    // over a list/string it is the item count. (`length` is NOT an ISO GQL function —
+    // the standard has PATH_LENGTH/CHAR_LENGTH/OCTET_LENGTH/CARDINALITY — so it is
+    // rejected as unknown. `size` is list/string only; a path arg was rejected above.)
     case 'cardinality':
+      return a instanceof Path ? a.vertices.length + a.edges.length : lengthOf(a);
     case 'size':
-    case 'length':
     case 'path_length':
       return lengthOf(a);
     case 'left':
