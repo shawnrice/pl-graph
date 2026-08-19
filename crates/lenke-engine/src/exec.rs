@@ -12402,6 +12402,60 @@ fn arith_general(op: crate::ir::ArithOp, l: &Col, r: &Col) -> Result<Col, String
 }
 
 /// Evaluate `expr` over every row of `batch`, producing a column.
+/// Lazy (SQL-standard) CASE evaluation — the fallback when the inline eager path throws,
+/// because a type error may live in a branch a row never actually reaches. Each condition
+/// is evaluated only over the rows still UNRESOLVED at that branch, and each value only
+/// over the rows that select it, via a gathered sub-batch. So a branch's type error
+/// surfaces ONLY if a row that genuinely reaches that condition (or takes that value) is
+/// ill-typed — matching TS and SQL, where `CASE WHEN c THEN safe ELSE risky END` never
+/// evaluates `risky` for a row where `c` holds. Slower (per-branch gather), so it runs only
+/// on the error path; the eager path stays fully vectorized.
+fn eval_case_masked(
+    branches: &[(Expr, Expr)],
+    otherwise: Option<&Expr>,
+    store: &Store,
+    batch: &Batch,
+) -> Result<Col, String> {
+    let n = batch.rows();
+    let mut out = vec![Value::Null; n];
+    // Original row indices not yet resolved by an earlier branch.
+    let mut pending: Vec<usize> = (0..n).collect();
+    for (cond, val) in branches {
+        if pending.is_empty() {
+            break;
+        }
+        // The condition, evaluated ONLY over the rows that still reach this branch.
+        let cond_col = eval(cond, store, &batch.gather(&pending))?;
+        let mut taken: Vec<usize> = Vec::new();
+        let mut still: Vec<usize> = Vec::with_capacity(pending.len());
+        for (k, &orig) in pending.iter().enumerate() {
+            match cond_col.value_at(k) {
+                Value::Bool(true) => taken.push(orig),
+                Value::Bool(false) | Value::Null => still.push(orig),
+                _ => return Err(TRUTH_TYPE_ERR.to_string()),
+            }
+        }
+        if !taken.is_empty() {
+            // The value, evaluated ONLY over the rows that took this branch.
+            let vcol = eval(val, store, &batch.gather(&taken))?;
+            for (k, &orig) in taken.iter().enumerate() {
+                out[orig] = vcol.value_at(k);
+            }
+        }
+        pending = still;
+    }
+    // Rows that matched no branch → ELSE (over just those rows) or NULL.
+    if !pending.is_empty() {
+        if let Some(e) = otherwise {
+            let ecol = eval(e, store, &batch.gather(&pending))?;
+            for (k, &orig) in pending.iter().enumerate() {
+                out[orig] = ecol.value_at(k);
+            }
+        }
+    }
+    Ok(Col::Gen(out))
+}
+
 fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
     // No rows → no values to produce, and nothing to evaluate: a constant faulting
     // expression (`1/0` under `… LIMIT 0 RETURN 1/0`) must not error over an empty
@@ -13430,59 +13484,64 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             branches,
             otherwise,
         } => {
-            // Categorical remap fast path: every branch is `<dict col> = <str literal>`.
-            // Precompute code → first-matching-branch once, then map each row by its code
-            // instead of evaluating a full compare column per branch. Byte-identical: an
-            // absent value / null-sentinel matches no branch (→ ELSE), same as the 3VL
-            // compares below.
-            if let Some((slot, key, code_to_branch)) = case_dict_lookup(branches, store) {
-                if let (Some(Column::Dict { codes, present, .. }), Col::Nodes(ids)) =
-                    (store.column(&key), batch.slot(slot))
-                {
-                    let vals = eval_all(branches.iter().map(|(_, v)| v), store, batch)?;
-                    let else_col = otherwise
-                        .as_ref()
-                        .map(|e| eval(e, store, batch))
-                        .transpose()?;
-                    let out: Vec<Value> = ids
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &id)| {
-                            let bi = (id != u32::MAX && present[id as usize])
-                                .then(|| code_to_branch[codes[id as usize] as usize])
-                                .flatten();
-                            match bi {
-                                Some(b) => vals[b].value_at(i),
-                                None => else_col.as_ref().map_or(Value::Null, |c| c.value_at(i)),
-                            }
-                        })
-                        .collect();
-                    return Ok(Col::Gen(out));
-                }
-            }
-            let conds = eval_all(branches.iter().map(|(c, _)| c), store, batch)?;
-            let vals = eval_all(branches.iter().map(|(_, v)| v), store, batch)?;
-            let else_col = otherwise
-                .as_ref()
-                .map(|e| eval(e, store, batch))
-                .transpose()?;
-            let n = batch.rows();
-            let out: Vec<Value> = (0..n)
-                .map(|i| {
-                    // First branch whose condition is TRUE (three-valued). A non-null
-                    // non-boolean condition is a data exception — it is NOT coerced to a
-                    // truth value (a WHEN must be a boolean, like WHERE / AND / OR).
-                    for (bi, c) in conds.iter().enumerate() {
-                        match c.value_at(i) {
-                            Value::Bool(true) => return Ok(vals[bi].value_at(i)),
-                            Value::Bool(false) | Value::Null => {}
-                            _ => return Err(TRUTH_TYPE_ERR.to_string()),
-                        }
+            let otherwise = otherwise.as_deref();
+            // Eager fast path over the FULL batch, INLINE so it keeps the plain-CASE codegen
+            // (fully vectorized). On ANY error a branch may hold a type error for a row that
+            // never actually takes it, so fall back to the lazy (SQL-standard) masked
+            // evaluation, which evaluates each condition/value only over the rows that reach
+            // it — an unreached branch's type error cannot surface (`CASE WHEN true THEN 1
+            // ELSE (2 + 'abc') END` is 1). The masked path runs ONLY on the error.
+            let eager: Result<Col, String> = (|| {
+                // Categorical remap fast path: every branch is `<dict col> = <str literal>`.
+                // Select by code without evaluating a full compare column per branch.
+                if let Some((slot, key, code_to_branch)) = case_dict_lookup(branches, store) {
+                    if let (Some(Column::Dict { codes, present, .. }), Col::Nodes(ids)) =
+                        (store.column(&key), batch.slot(slot))
+                    {
+                        let vals = eval_all(branches.iter().map(|(_, v)| v), store, batch)?;
+                        let else_col = otherwise.map(|e| eval(e, store, batch)).transpose()?;
+                        let out: Vec<Value> = ids
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &id)| {
+                                let bi = (id != u32::MAX && present[id as usize])
+                                    .then(|| code_to_branch[codes[id as usize] as usize])
+                                    .flatten();
+                                match bi {
+                                    Some(b) => vals[b].value_at(i),
+                                    None => {
+                                        else_col.as_ref().map_or(Value::Null, |c| c.value_at(i))
+                                    }
+                                }
+                            })
+                            .collect();
+                        return Ok(Col::Gen(out));
                     }
-                    Ok(else_col.as_ref().map_or(Value::Null, |c| c.value_at(i)))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            Col::Gen(out)
+                }
+                let conds = eval_all(branches.iter().map(|(c, _)| c), store, batch)?;
+                let vals = eval_all(branches.iter().map(|(_, v)| v), store, batch)?;
+                let else_col = otherwise.map(|e| eval(e, store, batch)).transpose()?;
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| {
+                        // First branch whose condition is TRUE (three-valued). A non-null
+                        // non-boolean condition is a data exception (a WHEN must be boolean).
+                        for (bi, c) in conds.iter().enumerate() {
+                            match c.value_at(i) {
+                                Value::Bool(true) => return Ok(vals[bi].value_at(i)),
+                                Value::Bool(false) | Value::Null => {}
+                                _ => return Err(TRUTH_TYPE_ERR.to_string()),
+                            }
+                        }
+                        Ok(else_col.as_ref().map_or(Value::Null, |c| c.value_at(i)))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                Ok(Col::Gen(out))
+            })();
+            match eager {
+                Ok(col) => col,
+                Err(_) => eval_case_masked(branches, otherwise, store, batch)?,
+            }
         }
         Expr::Cast { target, expr } => {
             // Evaluate the input, then cast per row via the value contract. A
@@ -22395,6 +22454,32 @@ mod tests {
         // Columns are [c, g] in item order — group n=3 has count 2, n=5 has count 1.
         assert_eq!((num(&rows[0][0]), num(&rows[0][1])), (2.0, 3.0));
         assert_eq!((num(&rows[1][0]), num(&rows[1][1])), (1.0, 5.0));
+    }
+
+    /// CASE is LAZY (SQL-standard): a type error in a branch a row never takes does NOT
+    /// fire. The eager fast path evaluates all branches vectorized, but on ANY error retries
+    /// with masked evaluation (each branch only over the rows that reach it). A branch that
+    /// a row genuinely takes, or a non-boolean WHEN reached before a match, still faults.
+    #[test]
+    fn case_is_lazy_over_unreached_branches() {
+        let store = social();
+        let ok = |q: &str| {
+            try_run(
+                &crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store),
+                &store,
+            )
+        };
+        // The ELSE holds an arithmetic type error but is never taken (WHEN true) → no fault.
+        assert!(matches!(
+            ok("MATCH (p:Person) RETURN CASE WHEN true THEN 1 ELSE (2 + 'abc') END AS x LIMIT 1")
+                .unwrap()
+                .rows[0][0],
+            Value::Num(x) if x == 1.0
+        ));
+        // A row that genuinely TAKES the ill-typed branch faults.
+        assert!(ok("MATCH (p:Person) RETURN CASE WHEN true THEN (2 + 'abc') END AS x").is_err());
+        // A non-boolean WHEN reached before any match faults (a WHEN must be boolean).
+        assert!(ok("MATCH (p:Person) RETURN CASE WHEN 5 THEN 1 ELSE 2 END AS x").is_err());
     }
 
     /// A grouped aggregate over empty input emits ZERO rows (unlike the scalar
