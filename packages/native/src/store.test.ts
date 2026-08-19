@@ -5,7 +5,7 @@
 import { describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
-import { createFfiBackend } from './backend-ffi.js';
+import { createFfiEngineBackend } from './backend-ffi-engine.js';
 import { graphFromNdjson } from './graph.js';
 import { createStore, inferDeps } from './store.js';
 
@@ -14,7 +14,7 @@ import { createStore, inferDeps } from './store.js';
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
 const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
+  `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
   import.meta.url,
 ).pathname;
 
@@ -33,7 +33,7 @@ const NDJSON = [
 ].join('\n');
 
 const newStore = () => {
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(LIB);
   const g = graphFromNdjson(backend, new TextEncoder().encode(NDJSON));
 
   return createStore(g);

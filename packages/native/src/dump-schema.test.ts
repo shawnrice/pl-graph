@@ -6,19 +6,19 @@
 import { describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
-import { createFfiBackend } from './backend-ffi.js';
-import { createWasmBackend } from './backend-wasm.js';
+import { createFfiEngineBackend } from './backend-ffi-engine.js';
+import { createWasmEngineBackend } from './backend-wasm-engine.js';
 import type { Backend } from './backend.js';
 import { applySchemaOp, createEmptyGraph, type RustGraph, type SchemaOp } from './index.js';
 
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
 const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
+  `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
   import.meta.url,
 ).pathname;
 const WASM = new URL(
-  '../../../crates/lenke-core/target/wasm32-unknown-unknown/release/lenke_core.wasm',
+  '../../../crates/lenke-engine/target/wasm32-unknown-unknown/release/lenke_engine.wasm',
   import.meta.url,
 ).pathname;
 
@@ -41,10 +41,10 @@ const declareAll = (g: RustGraph): void => {
 };
 
 const backends: Array<{ name: string; make: () => Promise<Backend> | Backend; ok: boolean }> = [
-  { name: 'ffi', make: () => createFfiBackend(LIB), ok: existsSync(LIB) },
+  { name: 'ffi', make: () => createFfiEngineBackend(LIB), ok: existsSync(LIB) },
   {
     name: 'wasm',
-    make: async () => createWasmBackend(await Bun.file(WASM).arrayBuffer()),
+    make: async () => createWasmEngineBackend(await Bun.file(WASM).arrayBuffer()),
     ok: existsSync(WASM),
   },
 ];
@@ -100,9 +100,13 @@ for (const { name, make, ok } of backends) {
           query: 'MATCH (a:Acct) RETURN sum(a.balance) = 0',
         },
       ]);
-      // The edge unique constraint is index-backed → its auto-created edge index is
-      // in the dump too (so a replay reconstructs the index, not just the constraint).
-      expect(by('createEdgeIndex')).toEqual([{ op: 'createEdgeIndex', key: 'id' }]);
+      // The engine's edge-unique constraint is SELF-CONTAINED — it reconstructs its
+      // own backing index on replay (the round-trip below proves it), so it dumps as
+      // a single op with NO separate createEdgeIndex (core emitted both).
+      expect(by('createEdgeIndex')).toEqual([]);
+      expect(by('createEdgeUniqueConstraint')).toEqual([
+        { op: 'createEdgeUniqueConstraint', edgeType: 'FOLLOWS', key: 'id' },
+      ]);
       // The RI-tree interval index (an accelerator not derivable from data) must
       // also dump, so it survives a snapshot reload / CDC replay.
       expect(by('createEdgeIntervalIndex')).toEqual([

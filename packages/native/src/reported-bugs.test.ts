@@ -5,13 +5,13 @@
 import { describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
-import { createFfiBackend } from './backend-ffi.js';
+import { createFfiEngineBackend } from './backend-ffi-engine.js';
 import { decodeArrow, graphFromNdjson } from './graph.js';
 
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
 const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
+  `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
   import.meta.url,
 ).pathname;
 const hasLib = existsSync(LIB);
@@ -29,7 +29,7 @@ const OVER_53 = '9007199254740993';
 const BIG = '123456789012345678';
 
 const newGraph = () => {
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(LIB);
   const ndjson = `{"type":"node","id":"a","labels":["N"],"properties":{"amount":${OVER_53},"total":${BIG}}}`;
 
   return graphFromNdjson(backend, new TextEncoder().encode(ndjson));
