@@ -2908,9 +2908,18 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // per sub-row — the outer slots the sub-row still carries, followed by
             // the yield expressions. Outer rows with no sub-row drop out (inner
             // lateral join). The subquery's internal variables are NOT surfaced.
+            //
+            // Slot `ow` seeds a PROVENANCE id (the outer row index) the body carries
+            // through; today the inner join reads it from nothing, but it is the hook
+            // for grouping results back per outer row (OPTIONAL / set-op / aggregate
+            // bodies). The body's own variables land at `ow + 1…`.
             let outer = pull(input, store, track)?;
             let ow = *outer_width;
-            let sub = pull_body(body, store, &outer)?;
+            let n = outer.rows();
+            let mut seed_slots = outer.slots.clone();
+            seed_slots.push(Col::Num((0..n).map(|i| i as f64).collect()));
+            let seed = Batch::of(seed_slots);
+            let sub = pull_body(body, store, &seed)?;
             let mut out_slots: Vec<Col> = (0..ow).map(|i| sub.slot(i).clone()).collect();
             for (_, e) in yields {
                 out_slots.push(eval(e, store, &sub)?);

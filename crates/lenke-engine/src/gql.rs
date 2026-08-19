@@ -4053,7 +4053,12 @@ impl Parser {
             .iter()
             .map(|s| (s.clone(), self.scope[s]))
             .collect();
-        let mut sub_slots = outer_width;
+        // Slot `outer_width` is RESERVED for the per-outer-row PROVENANCE column the exec
+        // seeds (the same layout `correlated_subquery_body` uses); the body's own
+        // variables append from `outer_width + 1`. This lets the correlated body be run
+        // ONCE over all outer rows and grouped back per outer row — the foundation for
+        // OPTIONAL / set-op / aggregate CALL bodies.
+        let mut sub_slots = outer_width + 1;
         let body = self.extend_chain(Plan::Row, &mut sub_scope, &mut sub_slots, from)?;
 
         // Parse WHERE/RETURN against the sub-scope. A parse error discards the
@@ -7100,11 +7105,13 @@ mod tests {
             input: Box::new(Plan::Scan {
                 label: Some("Person".into()),
             }),
+            // Slot 1 is the exec-seeded provenance column; the body's expanded node `x`
+            // lands at slot 2 (`outer_width + 1`).
             body: Box::new(Plan::Row.expand(0, Dir::Out, &["KNOWS".to_string()])),
             yields: vec![(
                 "friend".into(),
                 Expr::Prop {
-                    slot: 1,
+                    slot: 2,
                     key: "name".into(),
                 },
             )],
