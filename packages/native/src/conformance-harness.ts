@@ -1,11 +1,11 @@
-// The switch that turns the TS differential/conformance suites into a drop-in
-// readiness check for the standalone engine. By default the suites run against
-// lenke-core (byte-identical to the TS engine — the shipped hard invariant). With
-// `LENKE_ENGINE=1` they run against lenke-engine instead, and result comparison
-// relaxes from byte-identical to STRUCTURAL (order-independent) — because the
-// engine legitimately differs in unspecified output order (row order, property-key
-// order, label-set order), never in the answer. A structural divergence under
-// `LENKE_ENGINE=1` is therefore a real engine bug.
+// The switch that runs the TS differential/conformance suites against the native
+// backend. lenke-engine is now the DEFAULT (it has replaced lenke-core as the
+// primary Rust driver), and result comparison is STRUCTURAL (order-independent) —
+// because the engine legitimately differs in unspecified output order (row order,
+// property-key order, label-set order), never in the answer. A structural
+// divergence is therefore a real engine bug. During the migration, `LENKE_CORE=1`
+// still runs the retiring lenke-core with byte-identical comparison (its shipped
+// invariant); that path is removed once the crate is deleted.
 import { existsSync } from 'node:fs';
 
 import { createFfiEngineBackend } from './backend-ffi-engine.js';
@@ -22,14 +22,16 @@ const lib = (crate: string): string =>
 export const CORE_LIB = lib('lenke-core');
 export const ENGINE_LIB = lib('lenke-engine');
 
-/** True when the suite is running against the standalone engine (`LENKE_ENGINE=1`). */
-export const USE_ENGINE = process.env.LENKE_ENGINE === '1';
+/** True when the suite runs against the engine — the default now. `LENKE_CORE=1`
+ *  runs the retiring lenke-core during the migration. (`LENKE_ENGINE=1` also still
+ *  forces the engine, for scripts that set it.) */
+export const USE_ENGINE = process.env.LENKE_CORE !== '1';
 
 /** The native library under test, and whether it's present (skip the suite if not). */
 export const NATIVE_LIB = USE_ENGINE ? ENGINE_LIB : CORE_LIB;
 export const nativeReady = existsSync(NATIVE_LIB);
 
-/** Build the native backend under test (core by default; engine with LENKE_ENGINE=1). */
+/** Build the native backend under test (engine by default; core with LENKE_CORE=1). */
 export const nativeBackend = (): Backend =>
   USE_ENGINE ? createFfiEngineBackend(ENGINE_LIB) : createFfiBackend(CORE_LIB);
 
