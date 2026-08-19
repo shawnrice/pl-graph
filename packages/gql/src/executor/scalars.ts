@@ -1134,9 +1134,16 @@ export const castValue = (v: unknown, category: string): unknown => {
 };
 
 // ISO GQL `to_list`: a string → its UTF-16 code-unit characters (same unit
-// model as `split('')`); a list → itself; any other value → a singleton list.
+// model as `split('')`); a list → itself; a non-finite number (NaN/Inf) → null;
+// any other value → a singleton list.
 export const toListScalar = (a: unknown): unknown[] | null => {
   if (isNullish(a)) {
+    return null;
+  }
+
+  // A non-finite number (NaN/±Inf) is not a convertible value → null, matching the
+  // engine (which nulls non-finite numbers in to_list), NOT a `[null]` singleton.
+  if (typeof a === 'number' && !Number.isFinite(a)) {
     return null;
   }
 
@@ -1294,6 +1301,13 @@ export const callConversionFn = (name: string, a: unknown): unknown => {
   switch (name) {
     case 'tostring':
     case 'to_string':
+      // A non-finite number (NaN/±Inf) has no text form → null, matching the engine's
+      // `to_string_fn` (which stringifies only FINITE numbers), NOT JS `String(NaN)`
+      // giving "NaN". Everything else defers to `str` (composites serialize as JSON).
+      if (typeof a === 'number' && !Number.isFinite(a)) {
+        return null;
+      }
+
       return isNullish(a) ? null : str(a);
     case 'tointeger':
     case 'to_integer':

@@ -293,6 +293,19 @@ describe('GQL: byte-identity regressions from the differential fuzzer', () => {
     expect(val(`RETURN (to_float('1e300') IS NULL) AS x`)).toBe(false);
   });
 
+  test('a non-finite number converts to null, not "NaN"/[null]', () => {
+    // log10(-1) and asin(2) are NaN (kept as a live value, only nulled at egress).
+    // The conversion functions treat a non-finite number as an invalid input → null,
+    // matching the native engine (NOT JS `String(NaN)` = "NaN" or a `[null]` singleton).
+    expect(val(`RETURN to_string(log10(-1)) AS x`)).toBe(null);
+    expect(val(`RETURN to_string(asin(2)) AS x`)).toBe(null);
+    expect(val(`RETURN to_list(log10(-1)) AS x`)).toBe(null);
+    expect(val(`RETURN to_list(asin(2)) AS x`)).toBe(null);
+    // Finite values are unaffected.
+    expect(val(`RETURN to_string(5.5) AS x`)).toBe('5.5');
+    expect(val(`RETURN to_list(5) AS x`)).toEqual([5]);
+  });
+
   test('percentile requires numeric values, not coerced strings', () => {
     // A non-numeric value is a data exception now (strict typing) — no string is coerced,
     // not even a numeric-looking one, matching the native percentile / sum / avg.
