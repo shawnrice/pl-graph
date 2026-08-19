@@ -21,13 +21,13 @@ import { Graph } from '@lenke/core';
 import { query as tsQuery } from '@lenke/gql';
 import { deserialize as tsDeserialize, serialize as tsSerialize } from '@lenke/serialization';
 
-import { createFfiBackend } from './backend-ffi.js';
+import { createFfiEngineBackend } from './backend-ffi-engine.js';
 import { graphFromNdjson } from './graph.js';
 
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
 const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
+  `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
   import.meta.url,
 ).pathname;
 const suite = existsSync(LIB) ? describe : describe.skip;
@@ -200,7 +200,7 @@ const outcome = (run: () => unknown): string => {
 };
 
 suite('differential fuzz: write path (TS engine vs Rust core)', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(LIB);
   const SEED_COUNT =
     process.env.FUZZ_SEED === undefined
       ? Math.floor(Math.random() * 0x1_0000_0000)

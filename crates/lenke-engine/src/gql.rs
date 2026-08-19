@@ -189,6 +189,10 @@ struct Rel {
     etypes: Vec<String>,
     var: Option<String>,
     props: Vec<(String, Value)>,
+    /// Inline edge property EXPRESSIONS (`-[:R {w: date('…'), n: a.n}]->`), populated
+    /// only in an INSERT context (`rel(insert_ctx = true)`); a MATCH edge rejects them
+    /// (use an inline WHERE). Empty otherwise.
+    prop_exprs: Vec<(String, Expr)>,
     /// Token span of an inline `WHERE pred` on the edge (`-[e:T WHERE pred]->`),
     /// re-parsed once the edge is bound to a slot; `None` when absent.
     where_range: Option<(usize, usize)>,
@@ -1600,7 +1604,7 @@ impl Parser {
         if let Some(v) = &va {
             scope.insert(v.clone(), 0);
         }
-        let rel = self.rel()?;
+        let rel = self.rel(false)?;
         // `*` → min 0 unbounded, `+` → min 1 unbounded, `{n,m}` → a bounded hop range.
         let (min, max) = if self.eat(&Tok::Star) {
             (0, None)
@@ -1899,7 +1903,7 @@ impl Parser {
         start_label: String,
         start_props: Vec<(String, crate::value::Value)>,
     ) -> Result<Plan, String> {
-        let rel = self.rel()?;
+        let rel = self.rel(false)?;
         self.expect(&Tok::LParen)?;
         let end_var = if matches!(self.peek(), Some(Tok::Ident(_))) {
             Some(self.ident()?)
@@ -2111,11 +2115,16 @@ impl Parser {
     // reference it (bare `(x)`). Edges must be directed and carry no properties
     // yet (the store has no edge-property model).
     fn insert(&mut self) -> Result<Plan, String> {
-        let mut nodes: Vec<crate::ir::InsertNode> = Vec::new();
-        let mut edges: Vec<crate::ir::InsertEdge> = Vec::new();
+        // Parse each property as an EXPRESSION (a literal lifts to `Expr::Lit`), so a
+        // plain INSERT accepts a constant expression — `duration('P1D')`, `1 + 1`,
+        // `date('2020-01-01')` — exactly as TS does. A plain INSERT has no enclosing
+        // bindings (`self.scope` is empty here), so every property is constant and no
+        // node resolves to a bound slot.
+        let mut nodes: Vec<crate::ir::InsertNodeExpr> = Vec::new();
+        let mut edges: Vec<crate::ir::InsertEdgeExpr> = Vec::new();
         let mut var_to_idx: HashMap<String, usize> = HashMap::new();
         loop {
-            self.insert_path(&mut nodes, &mut edges, &mut var_to_idx)?;
+            self.insert_path_expr(&mut nodes, &mut edges, &mut var_to_idx)?;
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -2123,12 +2132,21 @@ impl Parser {
         // `INSERT (…) RETURN …`: the created nodes are bound into scope so a
         // following projection can read them. Each node keeps the slot equal to
         // its creation index (the same index `var_to_idx` records), so the tail's
-        // `Expr::Prop{slot}` lines up with the seeded row the executor builds.
+        // `Expr::Prop{slot}` lines up with the seeded row the executor builds. The
+        // RETURN path reads the created nodes by slot from the literal plan, so a
+        // (rare) constant expression here is not yet supported.
         if self.peek_kw("RETURN")
             || self.peek_kw("ORDER")
             || self.peek_kw("OFFSET")
             || self.peek_kw("LIMIT")
         {
+            let Some((nodes, edges)) = Self::lower_insert_literal(&nodes, &edges) else {
+                return Err(
+                    "an INSERT … RETURN property value must be a literal (evaluate a constant \
+                     expression in a plain INSERT, or via FOR/MATCH … INSERT)"
+                        .into(),
+                );
+            };
             self.scope = var_to_idx;
             self.slots = nodes.len();
             let tail = self.query_tail(Plan::Row)?;
@@ -2138,97 +2156,57 @@ impl Parser {
                 tail: Box::new(tail),
             });
         }
-        Ok(Plan::Insert { nodes, edges })
+        // Keep the constant-literal fast path (`Plan::Insert`) when every value is a
+        // literal; otherwise evaluate the constant expressions ONCE over a single
+        // empty row (`InsertFrom` has a store at exec time, so `duration()` and a
+        // host-wired clock resolve correctly).
+        if let Some((nodes, edges)) = Self::lower_insert_literal(&nodes, &edges) {
+            return Ok(Plan::Insert { nodes, edges });
+        }
+        Ok(Plan::InsertFrom {
+            input: Box::new(Plan::Row),
+            nodes,
+            edges,
+        })
     }
 
-    // insert_path := insert_node ( rel insert_node )*
-    fn insert_path(
-        &mut self,
-        nodes: &mut Vec<crate::ir::InsertNode>,
-        edges: &mut Vec<crate::ir::InsertEdge>,
-        var_to_idx: &mut HashMap<String, usize>,
-    ) -> Result<(), String> {
-        let mut prev = self.insert_node(nodes, var_to_idx)?;
-        while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
-            let rel = self.rel()?;
-            if rel.where_range.is_some() {
-                return Err("inline WHERE on an INSERT relationship is not supported".into());
+    /// Lower expression-form INSERT templates back to the constant-literal plan when
+    /// every property is an `Expr::Lit` and no node is a bound reference — the fast
+    /// path that keeps a plain `INSERT` on `Plan::Insert`. `None` if any value is a
+    /// non-literal expression (the caller then evaluates via `InsertFrom`).
+    fn lower_insert_literal(
+        enodes: &[crate::ir::InsertNodeExpr],
+        eedges: &[crate::ir::InsertEdgeExpr],
+    ) -> Option<(Vec<crate::ir::InsertNode>, Vec<crate::ir::InsertEdge>)> {
+        let lit_props = |props: &[(String, Expr)]| -> Option<Vec<(String, crate::value::Value)>> {
+            props
+                .iter()
+                .map(|(k, e)| match e {
+                    Expr::Lit(v) => Some((k.clone(), v.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut nodes = Vec::with_capacity(enodes.len());
+        for n in enodes {
+            if n.bound.is_some() {
+                return None;
             }
-            let next = self.insert_node(nodes, var_to_idx)?;
-            let (from, to) = match rel.dir {
-                Dir::Out => (prev, next),
-                Dir::In => (next, prev),
-                Dir::Both => {
-                    return Err("INSERT requires a directed relationship".into());
-                }
-            };
-            // An inserted edge has exactly one concrete type — a `|`-disjunction is
-            // a MATCH construct, not creatable.
-            let etype =
-                match rel.etypes.as_slice() {
-                    [t] => t.clone(),
-                    [] => return Err("INSERT of a relationship requires an edge type".into()),
-                    _ => return Err(
-                        "INSERT of a relationship requires a single edge type, not a disjunction"
-                            .into(),
-                    ),
-                };
-            edges.push(crate::ir::InsertEdge {
-                from,
-                to,
-                etype,
-                props: rel.props,
+            nodes.push(crate::ir::InsertNode {
+                labels: n.labels.clone(),
+                props: lit_props(&n.props)?,
             });
-            prev = next;
         }
-        Ok(())
-    }
-
-    // insert_node := '(' [var] (':' Label)* [ '{' props '}' ] ')'
-    // Returns the node's index. A first mention with a known var defines it; a
-    // later bare mention references it.
-    fn insert_node(
-        &mut self,
-        nodes: &mut Vec<crate::ir::InsertNode>,
-        var_to_idx: &mut HashMap<String, usize>,
-    ) -> Result<usize, String> {
-        self.expect(&Tok::LParen)?;
-        let var = if matches!(self.peek(), Some(Tok::Ident(_))) {
-            Some(self.ident()?)
-        } else {
-            None
-        };
-        let mut labels = Vec::new();
-        while self.eat(&Tok::Colon) {
-            labels.push(self.ident()?);
-            // `&` conjoins additional labels (`:A&B`). Only AND is creatable —
-            // `|`/`!` are label-expression forms that don't denote a single node.
-            while self.eat(&Tok::Amp) {
-                labels.push(self.ident()?);
-            }
+        let mut edges = Vec::with_capacity(eedges.len());
+        for e in eedges {
+            edges.push(crate::ir::InsertEdge {
+                from: e.from,
+                to: e.to,
+                etype: e.etype.clone(),
+                props: lit_props(&e.props)?,
+            });
         }
-        let props = if matches!(self.peek(), Some(Tok::LBrace)) {
-            self.literal_props("an inserted node")?
-        } else {
-            Vec::new()
-        };
-        self.expect(&Tok::RParen)?;
-
-        if let Some(v) = &var {
-            if let Some(&idx) = var_to_idx.get(v) {
-                // A reference to an already-defined node may not re-decorate it.
-                if !labels.is_empty() || !props.is_empty() {
-                    return Err(format!("variable `{v}` is already defined in this INSERT"));
-                }
-                return Ok(idx);
-            }
-        }
-        let idx = nodes.len();
-        nodes.push(crate::ir::InsertNode { labels, props });
-        if let Some(v) = var {
-            var_to_idx.insert(v, idx);
-        }
-        Ok(idx)
+        Some((nodes, edges))
     }
 
     /// A row-driven INSERT (`FOR … INSERT (…)` / `MATCH … INSERT (…)`): parse the
@@ -2261,7 +2239,7 @@ impl Parser {
     ) -> Result<(), String> {
         let mut prev = self.insert_node_expr(nodes, var_to_idx)?;
         while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
-            let rel = self.rel()?;
+            let rel = self.rel(true)?;
             if rel.where_range.is_some() {
                 return Err("inline WHERE on an INSERT relationship is not supported".into());
             }
@@ -2280,12 +2258,14 @@ impl Parser {
                             .into(),
                     ),
                 };
-            // A relationship's inline props are literal (the `rel` parser is a MATCH
-            // construct); lift them to constant expressions so the templates are uniform.
+            // Literal inline props lift to `Expr::Lit`; captured expression props
+            // (`{w: date('…'), n: a.n}`) are already `Expr`. Together they form the
+            // edge template, evaluated per row (a constant folds once).
             let props = rel
                 .props
                 .into_iter()
                 .map(|(k, v)| (k, Expr::Lit(v)))
+                .chain(rel.prop_exprs)
                 .collect();
             edges.push(crate::ir::InsertEdgeExpr {
                 from,
@@ -2796,7 +2776,7 @@ impl Parser {
                 }
                 continue;
             }
-            let rel = self.rel()?;
+            let rel = self.rel(false)?;
             let quant = self.opt_quantifier()?;
             let (v2, v2_label, v2_props, v2_where, v2_le, v2_prop_exprs) = self.node()?;
             // A relationship variable, inline edge properties, or an inline edge
@@ -3078,7 +3058,7 @@ impl Parser {
         // One or more hops, each `-[e:R]->(n)`; all hops must agree on direction and
         // edge type (a mixed-type/-direction unit is not supported).
         loop {
-            let rel = self.rel()?;
+            let rel = self.rel(false)?;
             if !rel.props.is_empty() || rel.where_range.is_some() {
                 return Err(
                     "edge properties / a per-hop WHERE on a subpath group are not supported yet"
@@ -3322,7 +3302,7 @@ impl Parser {
             }
             let mut inner: Vec<Seg> = Vec::new();
             loop {
-                let rel = self.rel()?;
+                let rel = self.rel(false)?;
                 let n = self.node_plain()?;
                 if bad_inner(&n) {
                     return Err(noinner.into());
@@ -3360,7 +3340,7 @@ impl Parser {
             }
             let mut segs: Vec<Seg> = Vec::new();
             loop {
-                let rel = self.rel()?;
+                let rel = self.rel(false)?;
                 let epred = self.edge_pred_from_rel(&rel)?;
                 if let Some((imin, imax)) = self.opt_quantifier()? {
                     // A quantified hop `-[e]->{lo,hi}` — a Sub with a bare single-hop inner.
@@ -3647,7 +3627,7 @@ impl Parser {
                 "OPTIONAL MATCH must start from a bound variable; `{v}` is not in scope"
             ));
         };
-        let rel = self.rel()?;
+        let rel = self.rel(false)?;
         if !rel.props.is_empty() || rel.where_range.is_some() {
             return Err(
                 "edge properties / an inline edge WHERE on OPTIONAL MATCH are not supported".into(),
@@ -4289,7 +4269,7 @@ impl Parser {
     // Captures an optional relationship VARIABLE and inline edge PROPERTIES. `~` is
     // the undirected delimiter: like `-`, it carries NO direction, so `~[...]~`
     // (and any `-`/`~` mix) is `Dir::Both`, exactly as core resolves it.
-    fn rel(&mut self) -> Result<Rel, String> {
+    fn rel(&mut self, insert_ctx: bool) -> Result<Rel, String> {
         let incoming = self.eat(&Tok::LArrow);
         if !incoming && !self.eat(&Tok::Minus) && !self.eat(&Tok::Tilde) {
             return Err(format!("expected `-`, `~`, or `<-` at token {}", self.pos));
@@ -4329,14 +4309,24 @@ impl Parser {
                 }
             }
         }
+        let mut prop_exprs = Vec::new();
         let props = if matches!(self.peek(), Some(Tok::LBrace)) {
             let (lits, exprs) = self.props()?;
             if !exprs.is_empty() {
-                // An inline EDGE property expression `-[:R {w: a.n}]->` — use an inline
-                // edge `WHERE` instead (the correlated-edge lowering lives there).
-                return Err(
-                    "an inline edge property expression is not supported; use an inline WHERE on the edge".into(),
-                );
+                if insert_ctx {
+                    // An INSERT edge CREATES the relationship, so a property expression
+                    // (`-[:R {w: date('…'), n: a.n}]->`) is evaluated and stored — parse
+                    // each captured span against the current (MATCH/FOR) scope.
+                    for (k, range) in exprs {
+                        prop_exprs.push((k, self.parse_captured_where(range)?));
+                    }
+                } else {
+                    // A MATCH edge property is a FILTER, not a creation — an expression
+                    // there uses an inline edge `WHERE` (the correlated-edge lowering).
+                    return Err(
+                        "an inline edge property expression is not supported; use an inline WHERE on the edge".into(),
+                    );
+                }
             }
             lits
         } else {
@@ -4369,6 +4359,7 @@ impl Parser {
             etypes,
             var,
             props,
+            prop_exprs,
             where_range,
         })
     }
@@ -5528,7 +5519,7 @@ impl Parser {
             // REVERSE (single hop): the first node is a LOCAL variable; the correlated
             // (bound) variable is the LANDING — `EXISTS { (m)-[:R]->(n) }` with `n`
             // outer. Traverse from the bound endpoint backward to the local node.
-            let rel = self.rel()?;
+            let rel = self.rel(false)?;
             if self.opt_quantifier()?.is_some() {
                 return Err(format!(
                     "a variable-length {kw} correlated on the landing node is not supported"
@@ -6519,15 +6510,39 @@ mod tests {
         assert_eq!(count("MATCH (n:P {age: 1}) RETURN n.age AS x"), 1);
     }
 
-    /// Positions that permit only literal property values reject an expression with a
-    /// context message rather than silently dropping it.
+    /// A plain INSERT evaluates a CONSTANT property expression (`duration('P1D')`,
+    /// arithmetic) like TS — but a reference to an unbound variable (nothing is bound
+    /// in a plain INSERT) is still an error, now the precise "unknown variable" one.
     #[test]
-    fn inline_property_expression_rejected_where_unsupported() {
+    fn insert_constant_expr_ok_unbound_var_rejected() {
+        // A constant expression is accepted and stored.
+        let mut st = Builder::default().build();
+        exec_gql(
+            &mut st,
+            "INSERT (:Z {id: 'z', d: duration('P1D'), n: 1 + 1})",
+        );
+        assert!(matches!(st.prop(0, "n"), Value::Num(x) if x == 2.0));
+        assert!(matches!(st.prop(0, "d"), Value::Temporal(_)));
+        // A reference to an unbound variable is rejected (nothing is bound here).
         let e = super::parse("INSERT (x:P {age: y.age})").unwrap_err();
         assert!(
-            e.contains("must be literals"),
-            "expected a literal-only rejection, got: {e}"
+            e.contains("unknown variable"),
+            "expected an unbound-variable rejection, got: {e}"
         );
+    }
+
+    /// An INSERT relationship also evaluates a constant property expression
+    /// (`-[:R {at: date('…')}]->`), not only bare literals.
+    #[test]
+    fn insert_edge_constant_expr_prop() {
+        let mut st = Builder::default().build();
+        exec_gql(
+            &mut st,
+            "INSERT (:P {id: 'a'})-[:R {w: 1 + 2, at: date('2020-01-01')}]->(:P {id: 'b'})",
+        );
+        assert_eq!(st.edge_count(), 1);
+        assert!(matches!(st.edge_prop(0, "w"), Value::Num(x) if x == 3.0));
+        assert!(matches!(st.edge_prop(0, "at"), Value::Temporal(_)));
     }
 
     #[test]
