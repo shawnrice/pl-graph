@@ -62,6 +62,17 @@ describe('GQL type/NaN semantics (the reference the Rust engine matches)', () =>
     expect(v(`round(5, null)`)).toBe(5);
   });
 
+  test('stddev faults on a non-numeric value even when too few rows to compute', () => {
+    // stddev_samp needs >= 2 rows, but a non-numeric VALUE is a type error regardless —
+    // the type-check runs before the row-count short-circuit. `DISTINCT true` dedups to a
+    // single boolean; it faults (not null), matching the engine and sum/avg/percentile.
+    const q = (e: string): unknown[] => query(fixture(), `MATCH (n:T) RETURN ${e} AS x`);
+    expect(() => q(`stddev_samp(DISTINCT true)`)).toThrow(/number/i);
+    expect(() => q(`stddev_pop(DISTINCT (n.n IS NULL))`)).toThrow(/number/i);
+    // A single numeric value is still null (too few rows), not a fault.
+    expect(q(`stddev_samp(DISTINCT 5)`)).toEqual([{ x: null }]);
+  });
+
   test('min/max use the total order: max keeps NaN (largest), min skips it', () => {
     // sqrt(score) over [-1, 4, 9] → [NaN, 2, 3]. Total order (NaN last): max is
     // NaN, min is 2 — deterministic regardless of scan order.

@@ -1075,10 +1075,10 @@ const compileAggregate = (expr: FuncExpr): CompiledExpr => {
         const sample = name === 'stddev_samp';
         const n = values.length;
 
-        if (sample ? n < 2 : n === 0) {
-          return null;
-        }
-
+        // Type-check the values (via `numArg`) BEFORE the count short-circuit: a non-numeric
+        // value is a data exception even when there are too few rows to compute a deviation,
+        // so `stddev_samp(true)` FAULTS rather than returning null. Matches the native engine
+        // and `sum`/`avg`/`percentile`. An empty group has nothing to check → null below.
         let s = 0;
         let sq = 0;
 
@@ -1086,6 +1086,10 @@ const compileAggregate = (expr: FuncExpr): CompiledExpr => {
           const x = numArg(v);
           s += x;
           sq += x * x;
+        }
+
+        if (sample ? n < 2 : n === 0) {
+          return null;
         }
 
         const variance = (sq - (s * s) / n) / (sample ? n - 1 : n);
