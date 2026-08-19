@@ -129,6 +129,19 @@ const CAST_TEMPORAL = new Map<string, string>([
   ['duration', 'duration'],
 ]);
 
+// The ISO niladic now-functions and the temporal constructor each desugars to. The
+// timestamp forms wrap in local_datetime() (a DATE `$__now` coerces to midnight),
+// current_date truncates via date(), the time forms take local_time() (the
+// time-of-day). `local_time` is ALSO a constructor (`local_time('13:47')`); only the
+// argumentless form is the now-function (see the caller's lookahead).
+const NOW_FUNCTIONS = new Map<string, string>([
+  ['current_date', 'date'],
+  ['current_timestamp', 'local_datetime'],
+  ['local_timestamp', 'local_datetime'],
+  ['current_time', 'local_time'],
+  ['local_time', 'local_time'],
+]);
+
 // Map a type name to the normalized `IS TYPED` category. Reuses the CAST
 // vocabulary + temporal kinds + `null`/`nothing`/`any`. Mirrors Rust
 // `type_test_category`. The `integer` vs `float` split is resolved at eval by
@@ -1997,6 +2010,44 @@ export const parse = (
   // re-enable the `IN` operator for its extent. This restores the default inside
   // `(…)` even while a `LET` binding's top level suppresses a bare `IN`, so
   // `LET x = (a IN [1]) IN body END` parses as intended.
+  // A bare now-function (`current_date`/`current_timestamp`/`local_timestamp`/
+  // `current_time`/`local_time`) desugars to its temporal constructor over the reserved
+  // `$__now` clock param the host supplies — so the engine never reads a wall clock and
+  // the two engines stay byte-identical. Returns `undefined` when the token is not an
+  // ARGUMENTLESS now-function, so the caller falls through to the ordinary call path
+  // (e.g. the `local_time('13:47')` constructor).
+  const parseNowFunction = (t: Token): Expr | undefined => {
+    if (t.type !== 'ident' || t.delimited) {
+      return undefined;
+    }
+
+    const lc = t.value.toLowerCase();
+    const fn = NOW_FUNCTIONS.get(lc);
+    const isCtor =
+      lc === 'local_time' &&
+      tokens[pos + 1]?.type === 'lparen' &&
+      tokens[pos + 2]?.type !== 'rparen';
+
+    if (fn === undefined || isCtor) {
+      return undefined;
+    }
+
+    advance();
+
+    if (check('lparen')) {
+      advance();
+      expect('rparen', "')' to close a now-function");
+    }
+
+    return {
+      kind: 'func',
+      name: fn,
+      args: [{ kind: 'param', name: '__now' }],
+      distinct: false,
+      star: false,
+    };
+  };
+
   const parsePrimary = (): Expr => {
     const saved = inOperatorEnabled;
     inOperatorEnabled = true;
@@ -2030,47 +2081,10 @@ export const parse = (
       return parseTemporalLiteral();
     }
 
-    // Bare now-functions `current_date` / `current_timestamp` / `local_timestamp` /
-    // `current_time` / `local_time` desugar to a reserved `$__now` DATETIME param the
-    // host supplies — the engine never reads the clock, which keeps the two engines
-    // byte-identical. `current_date` truncates via `date(...)`; the time forms via
-    // `local_time(...)` (the time-of-day, null for a DATE `$__now`); the datetime forms
-    // wrap in `local_datetime(...)` so the result is DATETIME-kind regardless of what
-    // kind `$__now` was supplied as (a DATE `$__now` coerces to midnight rather than
-    // leaking a DATE out of `current_timestamp`).
-    if (t.type === 'ident' && !t.delimited) {
-      const lc = t.value.toLowerCase();
-      const isNow =
-        lc === 'current_date' ||
-        lc === 'current_timestamp' ||
-        lc === 'local_timestamp' ||
-        lc === 'current_time' ||
-        lc === 'local_time';
-      // `local_time(arg)` is the CONSTRUCTOR, not the niladic now-function — only the
-      // argumentless form (bare, or an empty `()`) reads the clock.
-      const isCtor =
-        lc === 'local_time' &&
-        tokens[pos + 1]?.type === 'lparen' &&
-        tokens[pos + 2]?.type !== 'rparen';
+    const nowFn = parseNowFunction(t);
 
-      if (isNow && !isCtor) {
-        advance();
-
-        if (check('lparen')) {
-          advance();
-          expect('rparen', "')' to close a now-function");
-        }
-
-        const now: Expr = { kind: 'param', name: '__now' };
-        const fn =
-          lc === 'current_date'
-            ? 'date'
-            : lc === 'current_time' || lc === 'local_time'
-              ? 'local_time'
-              : 'local_datetime';
-
-        return { kind: 'func', name: fn, args: [now], distinct: false, star: false };
-      }
+    if (nowFn !== undefined) {
+      return nowFn;
     }
 
     if (t.type === 'param') {

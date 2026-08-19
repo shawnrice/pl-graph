@@ -2592,18 +2592,47 @@ const patternVars = (patterns: readonly PathPattern[]): string[] => {
       vars.push(p.start.variable);
     }
 
-    for (const { rel, node } of p.segments) {
-      if (rel.variable) {
-        vars.push(rel.variable);
-      }
-
-      if (node.variable) {
-        vars.push(node.variable);
-      }
+    for (const seg of p.segments) {
+      collectSegmentVars(seg, vars);
     }
   }
 
   return vars;
+};
+
+/** Collect every variable a pattern SEGMENT binds — including a quantified subpath's
+ *  GROUP variables. The endpoint `rel`/`node` are direct bindings; a quantified subpath
+ *  ALSO exposes its inner source/target and each inner hop as group (list) variables
+ *  (`((x)-[e]->(y)){n}` → x, e, y), and a nested subpath recurses one list level deeper.
+ *  Without this, `size(x)` / `x[i].prop` over a group variable failed the scope check
+ *  ("variable not defined") even though the executor binds them (`bindGroupVars`). */
+const collectSegmentVars = (seg: Segment, vars: string[]): void => {
+  if (seg.rel.variable) {
+    vars.push(seg.rel.variable);
+  }
+
+  if (seg.node.variable) {
+    vars.push(seg.node.variable);
+  }
+
+  // A quantified subpath's inner source `(x)` and first target `(y`/`m)` are group vars.
+  if (seg.hopFrom?.variable) {
+    vars.push(seg.hopFrom.variable);
+  }
+
+  if (seg.hopTo?.variable) {
+    vars.push(seg.hopTo.variable);
+  }
+
+  // Multi-element units: every further inner hop (its edge + landing node) is a group var.
+  for (const rest of seg.unitRest ?? []) {
+    collectSegmentVars(rest, vars);
+  }
+
+  // A nested parenthesized subpath exposes its inner variables as lists-of-lists.
+  if (seg.nested) {
+    collectSegmentVars(seg.nested, vars);
+  }
 };
 
 // --- compile-time scope validation ------------------------------------------
