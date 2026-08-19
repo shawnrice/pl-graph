@@ -230,7 +230,7 @@ describe('GQL: current_timestamp coerces $__now kind to DATETIME', () => {
   });
 });
 
-describe('GQL: ordering a temporal against a non-temporal is a type error', () => {
+describe('GQL: ordering a temporal against a non-temporal is UNKNOWN (null), not a fault', () => {
   const dated = (): Graph => {
     const g = new Graph();
     query(g, `INSERT (:R {vf: DATE '2021-06-01'})`);
@@ -238,30 +238,28 @@ describe('GQL: ordering a temporal against a non-temporal is a type error', () =
     return g;
   };
 
-  test('untagged string param vs a stored DATE faults E_INVALID_VALUE (not silent empty)', () => {
-    const e = thrown(() =>
-      query(dated(), `MATCH (r:R) WHERE r.vf <= $x RETURN r`, { x: '2021-01-01' }),
+  test('untagged string param vs a stored DATE is null (row filters out, no fault)', () => {
+    // A schemaless graph can hold heterogeneous types across nodes, so an incomparable row
+    // is UNKNOWN and filters out of the WHERE rather than aborting the whole query — the
+    // same as `1 < 'abc'` and cross-type equality's no-match. Byte-identical to the engine.
+    expect(query(dated(), `MATCH (r:R) WHERE r.vf <= $x RETURN r`, { x: '2021-01-01' })).toEqual(
+      [],
     );
-    expect(hasErrorCode(e, ErrorCode.InvalidValue)).toBe(true);
+    expect(query(dated(), `MATCH (r:R) RETURN (r.vf <= $x) AS c`, { x: '2021-01-01' })).toEqual([
+      { c: null },
+    ]);
   });
 
-  test('reversed operands and number vs DATE fault the same way', () => {
-    expect(
-      hasErrorCode(
-        thrown(() => query(dated(), `MATCH (r:R) WHERE $x >= r.vf RETURN r`, { x: '2021-01-01' })),
-        ErrorCode.InvalidValue,
-      ),
-    ).toBe(true);
-    expect(
-      hasErrorCode(
-        thrown(() => query(dated(), `MATCH (r:R) WHERE r.vf < 5 RETURN r`)),
-        ErrorCode.InvalidValue,
-      ),
-    ).toBe(true);
+  test('reversed operands and number vs DATE are null the same way', () => {
+    expect(query(dated(), `MATCH (r:R) WHERE $x >= r.vf RETURN r`, { x: '2021-01-01' })).toEqual(
+      [],
+    );
+    expect(query(dated(), `MATCH (r:R) WHERE r.vf < 5 RETURN r`)).toEqual([]);
+    expect(query(dated(), `MATCH (r:R) RETURN (r.vf < 5) AS c`)).toEqual([{ c: null }]);
   });
 
   test('equality is unaffected, and a real DATE operand works', () => {
-    // Mismatched-type equality is simply unequal (0 rows), not an error.
+    // Mismatched-type equality is simply unequal (0 rows), not null.
     expect(query(dated(), `MATCH (r:R) WHERE r.vf = 5 RETURN count(*) AS c`)).toEqual([{ c: 0 }]);
     // A DATE literal (or a tagged param) compares fine.
     expect(

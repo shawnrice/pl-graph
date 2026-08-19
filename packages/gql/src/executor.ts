@@ -648,17 +648,12 @@ export const compileExpr = (expr: Expr): CompiledExpr => {
           return c === null ? null : fn(c, 0);
         }
 
-        // A temporal vs a non-temporal relational comparison (both-temporal was
-        // handled above) is a type error — an untagged string param vs a stored
-        // DATE is a mistake, not "no rows" — so fault instead of silently UNKNOWN.
-        // Byte-identical to native's FAULT_CMP_TEMPORAL.
-        if (isTemporal(lv) !== isTemporal(rv)) {
-          throw new LenkeError(
-            "cannot order-compare a temporal value with a non-temporal value; tag the literal (e.g. DATE '2024-01-01') or CAST it to the matching type",
-            { code: ErrorCode.InvalidValue },
-          );
-        }
-
+        // Any remaining cross-type ordering is UNKNOWN → null, NOT a fault: a temporal vs
+        // a non-temporal (a temporal is an object, so `orderable` is false below), or a
+        // number vs a string, are incomparable and evaluate to null. In a schemaless graph
+        // a property can hold heterogeneous types across nodes, so an incomparable row must
+        // filter out of a WHERE rather than abort the whole query. Matches the engine,
+        // cross-type equality's no-match, and the null/NaN-carrying model.
         const t = typeof lv;
         const orderable = t === typeof rv && (t === 'number' || t === 'string' || t === 'boolean');
 
