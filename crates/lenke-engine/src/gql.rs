@@ -4050,13 +4050,35 @@ impl Parser {
         }
         self.expect(&Tok::RBrace)?;
 
-        // A single `COUNT(...)` aggregate RETURN (no set-op tail) is a correlated COUNT
-        // subquery: for each outer row, the number of body sub-matches (0 if none — LEFT
-        // semantics, so the outer row survives). Appended via a projection that passes
-        // the outer columns through and adds the count. (Other aggregates stay unsupported.)
+        // A single scalar-aggregate RETURN (no set-op tail) is a correlated aggregate
+        // subquery: for each outer row, reduce the body's sub-matches. `COUNT` counts them
+        // (0 if none — the outer row survives); `SUM`/`AVG`/`MIN`/`MAX` reduce the argument
+        // (NULL over an empty match — SQL aggregate-of-nothing). Appended via a projection
+        // that passes the outer columns through and adds the aggregate.
         if parts_raw.is_empty() && items.len() == 1 {
             if let RetItem::Agg(agg) = &items[0] {
-                if agg.func == crate::ir::AggFn::Count && !agg.distinct {
+                use crate::ir::AggFn;
+                let subquery = if agg.distinct {
+                    None
+                } else {
+                    match agg.func {
+                        AggFn::Count => Some(Expr::CountSubquery {
+                            body: Box::new(body.clone()),
+                            outer_width,
+                        }),
+                        AggFn::Sum | AggFn::Avg | AggFn::Min | AggFn::Max => {
+                            // The aggregate must have an argument (`sum(*)` is not a thing).
+                            agg.arg.clone().map(|arg| Expr::AggSubquery {
+                                body: Box::new(body.clone()),
+                                scalar: Box::new(arg),
+                                func: agg.func,
+                                outer_width,
+                            })
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(sub) = subquery {
                     let name = agg.name.clone();
                     let mut by_slot: Vec<Option<String>> = vec![None; outer_width];
                     for (n, &s) in self.scope.iter() {
@@ -4069,13 +4091,7 @@ impl Parser {
                         .enumerate()
                         .map(|(i, nm)| (nm.unwrap_or_else(|| format!("col{i}")), Expr::Slot(i)))
                         .collect();
-                    proj.push((
-                        name.clone(),
-                        Expr::CountSubquery {
-                            body: Box::new(body),
-                            outer_width,
-                        },
-                    ));
+                    proj.push((name.clone(), sub));
                     self.scope.insert(name, outer_width);
                     self.slots = outer_width + 1;
                     return Ok(plan.project(proj));

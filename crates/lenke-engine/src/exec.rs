@@ -1862,6 +1862,7 @@ fn needs_lineage(plan: &Plan) -> bool {
             | Expr::CountSubquery { .. }
             | Expr::ScalarSubquery { .. }
             | Expr::CollectSubquery { .. }
+            | Expr::AggSubquery { .. }
             | Expr::UncorrelatedExists { .. }
             | Expr::UncorrelatedCount { .. }
             | Expr::UncorrelatedScalar { .. } => false,
@@ -10346,6 +10347,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         | Expr::CountSubquery { .. }
         | Expr::ScalarSubquery { .. }
         | Expr::CollectSubquery { .. }
+        | Expr::AggSubquery { .. }
         | Expr::UncorrelatedExists { .. }
         | Expr::UncorrelatedCount { .. }
         | Expr::UncorrelatedScalar { .. } => false,
@@ -10454,6 +10456,7 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         | Expr::CountSubquery { .. }
         | Expr::ScalarSubquery { .. }
         | Expr::CollectSubquery { .. }
+        | Expr::AggSubquery { .. }
         | Expr::UncorrelatedExists { .. }
         | Expr::UncorrelatedCount { .. }
         | Expr::UncorrelatedScalar { .. }
@@ -14146,6 +14149,63 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 }
             }
             Col::Gen(out.into_iter().map(Value::List).collect())
+        }
+        Expr::AggSubquery {
+            body, scalar, func, ..
+        } => {
+            // Correlated scalar aggregate: the same provenance-tagged sub-run as
+            // CollectSubquery, but REDUCE `scalar` per outer row under `func` instead of
+            // gathering into a list. Empty / all-null group → NULL (SQL aggregate-of-
+            // nothing) for sum/avg/min/max.
+            let n = batch.rows();
+            let prov = batch.slots.len();
+            let mut slots = batch.slots.clone();
+            slots.push(Col::Num((0..n).map(|i| i as f64).collect()));
+            let seed = Batch::of(slots);
+            let survivors = pull_body(body, store, &seed)?;
+            let vals = eval(scalar, store, &survivors)?;
+            // Per outer row: (running total, count of numeric values, best for min/max).
+            let mut acc: Vec<(f64, u64, Option<f64>)> = vec![(0.0, 0, None); n];
+            if let Col::Num(ids) = survivors.slot(prov).clone() {
+                for (j, &id) in ids.iter().enumerate() {
+                    let i = id as usize;
+                    if i >= n {
+                        continue;
+                    }
+                    let Value::Num(x) = vals.value_at(j) else {
+                        continue; // NULL / non-numeric args are ignored (SQL sum/avg/min/max)
+                    };
+                    let (total, cnt, best) = &mut acc[i];
+                    *total += x;
+                    *cnt += 1;
+                    *best = Some(match *best {
+                        None => x,
+                        Some(b) => {
+                            let take_new = (*func == AggFn::Min
+                                && value::cmp_num_total(x, b).is_lt())
+                                || (*func == AggFn::Max && value::cmp_num_total(x, b).is_gt());
+                            if take_new {
+                                x
+                            } else {
+                                b
+                            }
+                        }
+                    });
+                }
+            }
+            let out: Vec<Value> = acc
+                .into_iter()
+                .map(|(total, cnt, best)| match func {
+                    // GQL `SUM` of an empty / all-null set is 0 (not SQL's NULL) — matching
+                    // pure-TS and the engine's ordinary aggregate.
+                    AggFn::Sum => Value::Num(total),
+                    // AVG / MIN / MAX of nothing → NULL.
+                    AggFn::Avg if cnt == 0 => Value::Null,
+                    AggFn::Avg => Value::Num(total / cnt as f64),
+                    _ => best.map_or(Value::Null, Value::Num),
+                })
+                .collect();
+            Col::Gen(out)
         }
         Expr::ScalarSubquery { body, scalar, .. } => {
             // Correlated scalar: same provenance-tagged sub-run, but project `scalar`

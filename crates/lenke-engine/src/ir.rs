@@ -294,6 +294,18 @@ pub enum Expr {
         scalar: Box<Expr>,
         outer_width: usize,
     },
+    /// A single scalar aggregate over a correlated CALL body — `CALL (p) { MATCH …
+    /// RETURN sum(x) AS s }` for `func` in sum/avg/min/max. The same provenance-tagged
+    /// body as [`Expr::CollectSubquery`]; `scalar` is the aggregate's argument evaluated
+    /// over the body's sub-scope, reduced per outer row under `func`. Empty / all-null
+    /// group: `SUM` → 0 (GQL, not SQL's NULL), `AVG`/`MIN`/`MAX` → NULL. `count` stays
+    /// [`Expr::CountSubquery`] (empty → 0).
+    AggSubquery {
+        body: Box<Plan>,
+        scalar: Box<Expr>,
+        func: AggFn,
+        outer_width: usize,
+    },
     /// `VALUE { <pattern> RETURN <scalar> }` — a correlated SCALAR subquery. Same
     /// provenance-tagged body run as [`Expr::Exists`]; yields the `scalar` expression
     /// evaluated on the body's single matching row per outer row (NULL when the body

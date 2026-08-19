@@ -168,10 +168,24 @@ outer_width + 1`); adapt the current `CallInline` exec + non-aggregate yields to
     a fresh-scan arm/INTERSECT/OPTIONAL+set-op/uncorrelated/three-part, all ORDER BY'd).
     The differential fuzzer still generates no inline-CALL — extending it is the remaining
     open coverage item.
-- **Phase 3 (optional):** fold in the scalar-aggregate CALL body (`sum`/`avg`/`min`/`max`).
+- **Phase 3 (done):** scalar-aggregate CALL body (`sum`/`avg`/`min`/`max`). A single-arm
+  body whose RETURN is one non-distinct scalar aggregate lowers to a new `Expr::AggSubquery`
+  (the parser generalized the `COUNT(*)` special case). The exec mirrors `CollectSubquery`
+  — the same provenance-tagged sub-run — but REDUCES the argument per outer row instead of
+  gathering a list. Empty / all-null group: `SUM` → 0 (GQL, not SQL's NULL — pure-TS is the
+  oracle), `AVG`/`MIN`/`MAX` → NULL; `COUNT` still routes through `CountSubquery` (→ 0).
+  Closed "correlated CALL sum → decorrelated". All three inline-CALL conformance tests now
+  pass against the engine backend (184 → 187 vs engine over Phases 1–3).
 
 ## Effort
 
 Multi-day, not a bounded fix. Phase 0 + Phase 1 are moderate (parser + a null-pad exec
 path over the existing lateral join, once prov is carried). Phase 2 is the large one — a
 new per-outer-row set-op combine in the vectorized exec, plus the byte-identity work.
+Phase 3 is small once prov is carried (an aggregate twin of `CollectSubquery`).
+
+## Status: DONE (Phases 0–3)
+
+All four phases are implemented and verified byte-identical against the conformance
+suite. Remaining open coverage item: the differential fuzzer generates no inline-CALL —
+extending it would harden the intra-group / row-order pins the ORDER BY'd tests mask.

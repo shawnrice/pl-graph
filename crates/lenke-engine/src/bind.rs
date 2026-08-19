@@ -310,7 +310,9 @@ fn bind_expr(e: &mut Expr, params: &HashMap<&str, &Value>) -> Result<(), String>
         | Expr::CountSubquery { body, .. }
         | Expr::UncorrelatedExists { body, .. }
         | Expr::UncorrelatedCount { body, .. } => bind_plan(body, params)?,
-        Expr::ScalarSubquery { body, scalar, .. } | Expr::CollectSubquery { body, scalar, .. } => {
+        Expr::ScalarSubquery { body, scalar, .. }
+        | Expr::CollectSubquery { body, scalar, .. }
+        | Expr::AggSubquery { body, scalar, .. } => {
             bind_plan(body, params)?;
             bind_expr(scalar, params)?;
         }
