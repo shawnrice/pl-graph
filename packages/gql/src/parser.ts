@@ -2030,17 +2030,30 @@ export const parse = (
       return parseTemporalLiteral();
     }
 
-    // Bare now-functions `current_date` / `current_timestamp` / `local_timestamp`
-    // desugar to a reserved `$__now` DATETIME param the host supplies — the engine
-    // never reads the clock, which keeps the two engines byte-identical.
-    // `current_date` truncates via `date(...)`; the datetime forms wrap in
-    // `local_datetime(...)` so the result is DATETIME-kind regardless of what
-    // kind `$__now` was supplied as (a DATE `$__now` coerces to midnight rather
-    // than leaking a DATE out of `current_timestamp`).
+    // Bare now-functions `current_date` / `current_timestamp` / `local_timestamp` /
+    // `current_time` / `local_time` desugar to a reserved `$__now` DATETIME param the
+    // host supplies — the engine never reads the clock, which keeps the two engines
+    // byte-identical. `current_date` truncates via `date(...)`; the time forms via
+    // `local_time(...)` (the time-of-day, null for a DATE `$__now`); the datetime forms
+    // wrap in `local_datetime(...)` so the result is DATETIME-kind regardless of what
+    // kind `$__now` was supplied as (a DATE `$__now` coerces to midnight rather than
+    // leaking a DATE out of `current_timestamp`).
     if (t.type === 'ident' && !t.delimited) {
       const lc = t.value.toLowerCase();
+      const isNow =
+        lc === 'current_date' ||
+        lc === 'current_timestamp' ||
+        lc === 'local_timestamp' ||
+        lc === 'current_time' ||
+        lc === 'local_time';
+      // `local_time(arg)` is the CONSTRUCTOR, not the niladic now-function — only the
+      // argumentless form (bare, or an empty `()`) reads the clock.
+      const isCtor =
+        lc === 'local_time' &&
+        tokens[pos + 1]?.type === 'lparen' &&
+        tokens[pos + 2]?.type !== 'rparen';
 
-      if (lc === 'current_date' || lc === 'current_timestamp' || lc === 'local_timestamp') {
+      if (isNow && !isCtor) {
         advance();
 
         if (check('lparen')) {
@@ -2049,7 +2062,12 @@ export const parse = (
         }
 
         const now: Expr = { kind: 'param', name: '__now' };
-        const fn = lc === 'current_date' ? 'date' : 'local_datetime';
+        const fn =
+          lc === 'current_date'
+            ? 'date'
+            : lc === 'current_time' || lc === 'local_time'
+              ? 'local_time'
+              : 'local_datetime';
 
         return { kind: 'func', name: fn, args: [now], distinct: false, star: false };
       }

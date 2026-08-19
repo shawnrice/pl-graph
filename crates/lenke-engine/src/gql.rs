@@ -4996,6 +4996,26 @@ impl Parser {
                         return self.hoist_having_agg(func);
                     }
                 }
+                // ISO niladic current-datetime functions read the reserved `$__now`
+                // clock param the host injects; absent → null. The engine stays pure —
+                // it never reads a wall clock itself. A DATE `$__now` coerces to a
+                // midnight datetime for the timestamp forms (via `temporal_ctor`). A
+                // bare name or an empty `()` is the now-function; `local_time(arg)` is
+                // the constructor, which falls through to the call path below.
+                if let Some(kind) = current_temporal_kind(&s) {
+                    let niladic = self.peek() != Some(&Tok::LParen)
+                        || self.toks.get(self.pos + 1) == Some(&Tok::RParen);
+                    if niladic {
+                        if self.eat(&Tok::LParen) {
+                            self.expect(&Tok::RParen)?;
+                        }
+                        let val = self
+                            .params
+                            .get("__now")
+                            .map_or(Value::Null, |v| crate::exec::temporal_ctor(v, kind));
+                        return Ok(Expr::Lit(val));
+                    }
+                }
                 // A scalar function call `name(args…)`. (Aggregates are handled in
                 // return_items, never reached here.) A call may be subscripted /
                 // field-accessed (`edges(p)[0].w`), so route through `field_chain`.
@@ -5012,18 +5032,6 @@ impl Parser {
                 // binding wins), before any graph-variable resolution.
                 if let Some((_, e)) = self.lets.iter().rev().find(|(n, _)| n == &s) {
                     return Ok(e.clone());
-                }
-                // ISO niladic current-datetime functions (`current_timestamp`,
-                // `local_timestamp`, `current_date`) read the reserved `$__now` clock
-                // param the host injects; absent → null. The engine stays pure — it
-                // never reads a wall clock itself. A DATE `$__now` coerces to a midnight
-                // datetime for the timestamp forms (via `temporal_ctor`).
-                if let Some(kind) = current_temporal_kind(&s) {
-                    let val = self
-                        .params
-                        .get("__now")
-                        .map_or(Value::Null, |v| crate::exec::temporal_ctor(v, kind));
-                    return Ok(Expr::Lit(val));
                 }
                 let slot = *self
                     .scope
@@ -5959,12 +5967,18 @@ fn temporal_tag(kw: &str) -> Option<&'static str> {
 
 /// Map an ISO niladic current-datetime function to the temporal kind it reads the
 /// `$__now` clock as: `current_timestamp`/`local_timestamp` → a local `datetime`,
-/// `current_date` → a `date`. Only the forms pure-TS supports are recognized, so the
-/// two engines stay byte-identical.
+/// `current_date` → a `date`, `current_time`/`local_time` → a local time-of-day
+/// (`localtime`; null for a DATE `$__now`). Kept in step with the pure-TS desugaring
+/// so the two engines stay byte-identical.
+///
+/// `local_time` is only niladic when argumentless — `local_time('13:47:09')` is the
+/// constructor, which reaches this path with a `(`; the caller resolves the niladic
+/// form from a bare identifier, so a constructor call never lands here.
 fn current_temporal_kind(name: &str) -> Option<&'static str> {
     Some(match name {
         "current_timestamp" | "local_timestamp" => "datetime",
         "current_date" => "date",
+        "current_time" | "local_time" => "localtime",
         _ => return None,
     })
 }
@@ -6405,6 +6419,51 @@ mod tests {
             &[("k".into(), n(2.0))],
             "MATCH (n:Person) RETURN n.name AS x ORDER BY n.name LIMIT 2",
         );
+    }
+
+    /// The ISO niladic now-functions read the injected `$__now` clock: the timestamp
+    /// forms as a DATETIME, `current_date` as a DATE, `current_time`/`local_time` as a
+    /// time-of-day; an unsupplied clock → null. The engine never reads a wall clock.
+    #[test]
+    fn niladic_now_functions_read_injected_clock() {
+        use crate::temporal::Temporal;
+        let store = Builder::default().build();
+        let run_p = |q: &str, params: &[(String, Value)]| -> Value {
+            let plan = super::parse_with_params(q, params).unwrap();
+            run(&plan, &store).rows[0][0].clone()
+        };
+        let now = Value::Temporal(Temporal::parse("datetime", "2026-07-12T10:30:45").unwrap());
+        let p = vec![("__now".to_string(), now)];
+        assert!(matches!(
+            run_p("RETURN current_timestamp AS t", &p),
+            Value::Temporal(Temporal::DateTime(_))
+        ));
+        assert!(matches!(
+            run_p("RETURN local_timestamp AS t", &p),
+            Value::Temporal(Temporal::DateTime(_))
+        ));
+        assert!(matches!(
+            run_p("RETURN current_date AS t", &p),
+            Value::Temporal(Temporal::Date(_))
+        ));
+        assert!(matches!(
+            run_p("RETURN current_time AS t", &p),
+            Value::Temporal(Temporal::Time(_))
+        ));
+        // `local_time()` (empty parens) is the niladic form; `local_time('…')` the ctor.
+        assert!(matches!(
+            run_p("RETURN local_time() AS t", &p),
+            Value::Temporal(Temporal::Time(_))
+        ));
+        assert!(matches!(
+            run_p("RETURN local_time('13:47:09') AS t", &[]),
+            Value::Temporal(Temporal::Time(_))
+        ));
+        // No clock supplied → null.
+        assert!(matches!(
+            run_p("RETURN current_timestamp AS t", &[]),
+            Value::Null
+        ));
     }
 
     /// For a scalar / inline-prop param, substitution produces the EXACT same plan as
