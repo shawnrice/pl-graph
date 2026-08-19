@@ -247,6 +247,13 @@ fn set_exec_error(e: &str) {
                 crate::ffi_error::set("E_MISSING_PARAMETER", rest);
                 return;
             }
+            // A pattern that blows past its compute budget (the trail/step budget on a
+            // dense var-length expansion) is a resource limit, not a bad value — carry
+            // the more-specific code through instead of collapsing it to E_INVALID_VALUE.
+            "E_RESOURCE_EXHAUSTED" => {
+                crate::ffi_error::set("E_RESOURCE_EXHAUSTED", rest);
+                return;
+            }
             _ => {}
         }
     }
