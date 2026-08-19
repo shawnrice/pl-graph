@@ -278,7 +278,9 @@ suite('GQL function differential (TS vs native)', () => {
   for (const expr of CASES) {
     test(`RETURN ${expr}`, () => {
       const q = `MATCH (n:T) RETURN ${expr} AS v`;
-      expect(evalOutcome(() => nativeGraph.query(q))).toEqual(evalOutcome(() => tsQuery(tsGraph, q)));
+      expect(evalOutcome(() => nativeGraph.query(q))).toEqual(
+        evalOutcome(() => tsQuery(tsGraph, q)),
+      );
     });
   }
 
