@@ -14436,7 +14436,12 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
                 (Some(x), Some(y)) => Value::Num(match name {
                     "log" => y.ln() / x.ln(),
                     "power" => x.powf(y),
-                    "atan2" => x.atan2(y),
+                    // atan2 is the one math fn whose result distinguishes the sign of a zero
+                    // operand (`atan2(-0, -1) = -PI` vs `atan2(+0, -1) = +PI`). We treat -0
+                    // and +0 as one value everywhere, so fold -0 to +0 on both inputs (the
+                    // pure-TS engine does the same). Every other fn collapses -0 to 0 or null
+                    // at egress already.
+                    "atan2" => (x + 0.0).atan2(y + 0.0),
                     _ => x % y,
                 }),
                 _ => Value::Null,
@@ -16819,17 +16824,25 @@ fn compare(op: CompareOp, l: &Col, r: &Col) -> Col {
             out.push(None);
             continue;
         }
-        // Equality uses the value contract's `equals` (cross-type = false, not
-        // unknown). Ordering uses `cmp_partial` (3VL): incomparable operands —
-        // different types or a NaN — make the comparison UNKNOWN (→ NULL), NOT a
-        // Bool from the total order. (The total order is only for sort/min/max.)
+        // Equality uses the value contract's `equals` (cross-type = false, not unknown).
+        // Ordering uses `cmp_partial`: a genuinely incomparable pair — DIFFERENT types — is
+        // UNKNOWN (→ NULL). A NaN operand is IEEE, NOT 3VL: `<`/`>`/`<=`/`>=` are definitely
+        // FALSE (matching JS and the pure-TS engine). Two Nums are incomparable ONLY via a
+        // NaN, so `None` there → Some(false); `None` across types stays UNKNOWN.
+        let order = |f: fn(std::cmp::Ordering) -> bool| -> Option<bool> {
+            match value::cmp_partial(&a, &b) {
+                Some(ord) => Some(f(ord)),
+                None if matches!((&a, &b), (Value::Num(_), Value::Num(_))) => Some(false),
+                None => None,
+            }
+        };
         let res = match op {
             CompareOp::Eq => Some(value::equals(&a, &b)),
             CompareOp::Ne => Some(!value::equals(&a, &b)),
-            CompareOp::Lt => value::cmp_partial(&a, &b).map(std::cmp::Ordering::is_lt),
-            CompareOp::Le => value::cmp_partial(&a, &b).map(std::cmp::Ordering::is_le),
-            CompareOp::Gt => value::cmp_partial(&a, &b).map(std::cmp::Ordering::is_gt),
-            CompareOp::Ge => value::cmp_partial(&a, &b).map(std::cmp::Ordering::is_ge),
+            CompareOp::Lt => order(std::cmp::Ordering::is_lt),
+            CompareOp::Le => order(std::cmp::Ordering::is_le),
+            CompareOp::Gt => order(std::cmp::Ordering::is_gt),
+            CompareOp::Ge => order(std::cmp::Ordering::is_ge),
         };
         if res.is_none() {
             any_unknown = true;
@@ -20138,6 +20151,62 @@ mod tests {
             .map(|r| format!("{:?},{:?}", r[0], r[1]))
             .collect();
         assert_eq!(rows, vec!["Num(30.0),Num(2.0)", "Num(40.0),Num(1.0)"]);
+    }
+
+    /// A NaN operand makes ordering (`< > <= >=`) definitely FALSE (IEEE), NOT unknown —
+    /// matching JS and the pure-TS engine. Equality with NaN stays false (NaN != NaN).
+    #[test]
+    fn nan_ordering_is_ieee_false() {
+        let store =
+            crate::ndjson::from_ndjson("{\"id\":\"n\",\"labels\":[\"V\"],\"props\":{}}").unwrap();
+        let val =
+            |q: &str| -> Value { run(&crate::gql::parse(q).unwrap(), &store).rows[0][0].clone() };
+        // log10(-1) is NaN. Every ordering against it is FALSE, not null.
+        assert!(matches!(
+            val("RETURN (log10(-1) < 5) AS x"),
+            Value::Bool(false)
+        ));
+        assert!(matches!(
+            val("RETURN (log10(-1) >= 5) AS x"),
+            Value::Bool(false)
+        ));
+        assert!(matches!(
+            val("RETURN (5 < log10(-1)) AS x"),
+            Value::Bool(false)
+        ));
+        assert!(matches!(
+            val("RETURN (0.0 > log10(-1)) AS x"),
+            Value::Bool(false)
+        ));
+        // Equality with NaN is still FALSE, and its negation TRUE — ordering is the only
+        // thing that changed from 3-valued to IEEE.
+        assert!(matches!(
+            val("RETURN (log10(-1) = log10(-1)) AS x"),
+            Value::Bool(false)
+        ));
+        assert!(matches!(
+            val("RETURN (log10(-1) <> log10(-1)) AS x"),
+            Value::Bool(true)
+        ));
+    }
+
+    /// -0 and +0 are one value: atan2 (the only fn whose result distinguishes the sign of
+    /// a zero operand) folds -0 to +0 on both inputs, whether the -0 came from a literal
+    /// or from arithmetic (`0 * -1`). So atan2(±0, -1) is always +PI, never -PI.
+    #[test]
+    fn signed_zero_folds_in_atan2() {
+        let store =
+            crate::ndjson::from_ndjson("{\"id\":\"n\",\"labels\":[\"V\"],\"props\":{}}").unwrap();
+        let num = |q: &str| -> f64 {
+            match run(&crate::gql::parse(q).unwrap(), &store).rows[0][0].clone() {
+                Value::Num(n) => n,
+                other => panic!("want num, got {other:?}"),
+            }
+        };
+        let pi = std::f64::consts::PI;
+        assert!((num("RETURN atan2(-0.0, -1.0) AS r") - pi).abs() < 1e-12);
+        assert!((num("RETURN atan2(0.0 * -1, -1.0) AS r") - pi).abs() < 1e-12);
+        assert!(num("RETURN atan2(-0.0, -0.0) AS r").abs() < 1e-12); // atan2(+0, +0) = 0
     }
 
     /// Scalar functions: 2-arg round (incl. negative digits), atan2 (arg order +
