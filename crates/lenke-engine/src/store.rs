@@ -579,10 +579,20 @@ impl Column {
 pub enum Change {
     NodeAdded(u32),
     NodeDeleted(u32),
-    NodeProp { node: u32, key: String },
+    NodeProp {
+        node: u32,
+        key: String,
+    },
+    /// A node gained or lost a label (`SET n:Label` / `REMOVE n:Label`). Treated
+    /// like a node change for CDC scoping — the node's current label set/props are
+    /// re-read.
+    NodeLabel(u32),
     EdgeAdded(u32),
     EdgeDeleted(u32),
-    EdgeProp { eid: u32, key: String },
+    EdgeProp {
+        eid: u32,
+        key: String,
+    },
 }
 
 #[derive(Clone)]
@@ -592,6 +602,10 @@ enum Undo {
     AddNode,
     /// Undo `add_edge`: delete the edge by its id from both endpoints.
     AddEdge { u: u32, v: u32, eid: u32 },
+    /// Undo `add_label`: strip the label from the node again.
+    AddLabel { node: u32, label: String },
+    /// Undo `remove_label`: restore the label membership.
+    RemoveLabel { node: u32, label: String },
     /// Undo `set_prop`/`remove_prop`: restore the cell to its prior state.
     RestoreCell {
         node: u32,
@@ -2037,7 +2051,7 @@ impl Store {
         let mut edge_changed = false;
         for c in changes {
             match c {
-                Change::NodeAdded(n) | Change::NodeProp { node: n, .. } => {
+                Change::NodeAdded(n) | Change::NodeProp { node: n, .. } | Change::NodeLabel(n) => {
                     if self.is_alive(*n) {
                         for l in self.labels_of(*n) {
                             if !labels.contains(&l) {
@@ -2943,6 +2957,68 @@ impl Store {
         });
     }
 
+    /// Add `label` to a node's label set (`SET n:Label`). Idempotent — a no-op if
+    /// already present. Transaction-logged so a rollback strips it again; a caller
+    /// wanting constraint enforcement runs the deferred checks after.
+    pub fn add_label(&mut self, node: u32, label: &str) {
+        if self.is_labeled(node, label) {
+            return;
+        }
+        self.touch();
+        self.apply_add_label(node, label);
+        if let Some(log) = &mut self.undo {
+            log.push(Undo::AddLabel {
+                node,
+                label: label.to_string(),
+            });
+        }
+        self.record_change(Change::NodeLabel(node));
+    }
+
+    /// Remove `label` from a node's label set (`REMOVE n:Label`). Idempotent — a
+    /// no-op if the node does not carry it. Transaction-logged.
+    pub fn remove_label(&mut self, node: u32, label: &str) {
+        if !self.is_labeled(node, label) {
+            return;
+        }
+        self.touch();
+        self.apply_remove_label(node, label);
+        if let Some(log) = &mut self.undo {
+            log.push(Undo::RemoveLabel {
+                node,
+                label: label.to_string(),
+            });
+        }
+        self.record_change(Change::NodeLabel(node));
+    }
+
+    /// Insert `node` into `label`'s bucket (kept sorted for `has_label`'s binary
+    /// search). The label→min-label cache is keyed on `node_count` only, so a
+    /// membership change under a stable count must invalidate it by hand.
+    fn apply_add_label(&mut self, node: u32, label: &str) {
+        let bucket = self.by_label.entry(label.to_string()).or_default();
+        if let Err(pos) = bucket.binary_search(&node) {
+            bucket.insert(pos, node);
+        }
+        self.invalidate_min_label();
+    }
+
+    fn apply_remove_label(&mut self, node: u32, label: &str) {
+        if let Some(bucket) = self.by_label.get_mut(label) {
+            if let Ok(pos) = bucket.binary_search(&node) {
+                bucket.remove(pos);
+            }
+        }
+        self.invalidate_min_label();
+    }
+
+    fn invalidate_min_label(&self) {
+        *self
+            .min_label_cache
+            .write()
+            .expect("min_label_cache poisoned") = None;
+    }
+
     fn apply_remove_prop(&mut self, node: u32, key: &str) {
         // A REMOVE makes the key ABSENT — `set_absent` clears BOTH the value bit and the
         // null bit, so it is distinct from a stored present-null (which `has('k')` sees).
@@ -3731,6 +3807,7 @@ impl Store {
             let node = match ch {
                 Change::NodeAdded(n)
                 | Change::NodeProp { node: n, .. }
+                | Change::NodeLabel(n)
                 | Change::NodeDeleted(n) => Some(*n),
                 Change::EdgeAdded(_) | Change::EdgeDeleted(_) | Change::EdgeProp { .. } => None,
             };
@@ -3838,6 +3915,8 @@ impl Store {
         match rec {
             Undo::AddNode => self.pop_last_node(),
             Undo::AddEdge { u, v, eid } => self.delete_edge(u, v, eid),
+            Undo::AddLabel { node, label } => self.apply_remove_label(node, &label),
+            Undo::RemoveLabel { node, label } => self.apply_add_label(node, &label),
             Undo::RestoreCell {
                 node,
                 key,

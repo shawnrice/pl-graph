@@ -2018,18 +2018,33 @@ impl Parser {
         loop {
             if self.eat_kw("SET") {
                 loop {
-                    let (slot, key) = self.slot_dot_key()?;
-                    self.expect(&Tok::Eq)?;
-                    let value = self.expr()?;
-                    ops.push(crate::ir::SetOp::Set { slot, key, value });
+                    // `SET n:Label` / `SET n IS Label` mutates the label set;
+                    // `SET n.key = expr` mutates a property.
+                    let (slot, label) = self.slot_label()?;
+                    if let Some(label) = label {
+                        ops.push(crate::ir::SetOp::AddLabel { slot, label });
+                    } else {
+                        self.expect(&Tok::Dot)?;
+                        let key = self.ident()?;
+                        self.expect(&Tok::Eq)?;
+                        let value = self.expr()?;
+                        ops.push(crate::ir::SetOp::Set { slot, key, value });
+                    }
                     if !self.eat(&Tok::Comma) {
                         break;
                     }
                 }
             } else if self.eat_kw("REMOVE") {
                 loop {
-                    let (slot, key) = self.slot_dot_key()?;
-                    ops.push(crate::ir::SetOp::Remove { slot, key });
+                    // `REMOVE n:Label` / `REMOVE n IS Label` vs `REMOVE n.key`.
+                    let (slot, label) = self.slot_label()?;
+                    if let Some(label) = label {
+                        ops.push(crate::ir::SetOp::RemoveLabel { slot, label });
+                    } else {
+                        self.expect(&Tok::Dot)?;
+                        let key = self.ident()?;
+                        ops.push(crate::ir::SetOp::Remove { slot, key });
+                    }
                     if !self.eat(&Tok::Comma) {
                         break;
                     }
@@ -2060,6 +2075,22 @@ impl Parser {
             return Err("expected SET, REMOVE, or DELETE".into());
         }
         Ok(ops)
+    }
+
+    // Read a bound variable and its slot; if a `:Label` / `IS Label` follows,
+    // consume the label and return it (`Some`) — the caller emits a label op.
+    // Otherwise the next token is a `.key` the caller reads (`None`).
+    fn slot_label(&mut self) -> Result<(usize, Option<String>), String> {
+        let var = self.ident()?;
+        let slot = *self
+            .scope
+            .get(&var)
+            .ok_or_else(|| format!("unknown variable `{var}`"))?;
+        if self.eat(&Tok::Colon) || self.eat_kw("IS") {
+            Ok((slot, Some(self.ident()?)))
+        } else {
+            Ok((slot, None))
+        }
     }
 
     // A bound `var.key` reference (the target of a SET/REMOVE).
@@ -6082,6 +6113,43 @@ mod tests {
         assert!(
             try_gql(&mut st2, "MATCH (n:U {id:'c'}) SET n.k = null").is_ok(),
             "two present-nulls do NOT violate a unique constraint (nulls exempt)"
+        );
+    }
+
+    /// `SET n:Label` / `REMOVE n:Label` (and the `IS` spelling) mutate a node's
+    /// label set; the change is re-checked against the constraints on the new label
+    /// — adding `:Acct` to a node with no email violates Acct's required-email, and
+    /// the whole statement rolls back.
+    #[test]
+    fn set_and_remove_label() {
+        let try_gql = |st: &mut Store, sql: &str| -> Result<(), String> {
+            let p = crate::opt::optimize_indexed(super::parse(sql).unwrap(), st);
+            crate::exec::execute(&p, st).map(|_| ())
+        };
+
+        let mut st = Builder::default().build();
+        exec_gql(&mut st, "INSERT (:Person {name: 'P'})");
+
+        // SET adds a label (the original label stays).
+        exec_gql(&mut st, "MATCH (p:Person {name: 'P'}) SET p:Staff");
+        assert!(st.is_labeled(0, "Staff"));
+        assert!(st.is_labeled(0, "Person"));
+        // A repeat SET is idempotent, and the node is now seekable by the new label.
+        exec_gql(&mut st, "MATCH (p:Staff) SET p:Staff");
+        assert_eq!(st.nodes_with_label("Staff").len(), 1);
+
+        // REMOVE (the `IS` spelling) strips it.
+        exec_gql(&mut st, "MATCH (p:Person {name: 'P'}) REMOVE p IS Staff");
+        assert!(!st.is_labeled(0, "Staff"));
+        assert!(st.nodes_with_label("Staff").is_empty());
+
+        // Adding a label whose required constraint the node cannot satisfy is
+        // rejected, and the label add rolls back.
+        st.create_required_constraint("Acct", "email").unwrap();
+        assert!(try_gql(&mut st, "MATCH (p:Person {name: 'P'}) SET p:Acct").is_err());
+        assert!(
+            !st.is_labeled(0, "Acct"),
+            "the rejected label add rolled back"
         );
     }
 

@@ -1056,6 +1056,16 @@ pub enum SetOp {
         slot: usize,
         key: String,
     },
+    /// `SET n:Label` — add `label` to the bound node in `slot`. Idempotent.
+    AddLabel {
+        slot: usize,
+        label: String,
+    },
+    /// `REMOVE n:Label` — strip `label` from the bound node in `slot`. Idempotent.
+    RemoveLabel {
+        slot: usize,
+        label: String,
+    },
     /// Delete the bound element in `slot` — a node (GQL `DELETE`/`DETACH DELETE`,
     /// Gremlin `drop()`) or an edge. `detach` deletes a node's incident edges too;
     /// a non-`detach` DELETE of a node that still has edges is an error (Cypher/core

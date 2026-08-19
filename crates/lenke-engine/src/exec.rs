@@ -895,6 +895,8 @@ fn rows_from_batch(tail: &Plan, batch: &Batch, store: &Store) -> Rows {
 enum Applied {
     Set(u32, String, Value),
     Remove(u32, String),
+    AddLabel(u32, String),
+    RemoveLabel(u32, String),
     DeleteNode(u32, bool), // (node, detach)
     DeleteEdge(u32),       // eid
     SetEdge(u32, String, Value),
@@ -957,6 +959,20 @@ fn run_update(
                     }
                     _ => {}
                 },
+                crate::ir::SetOp::AddLabel { slot, label } => {
+                    if let Col::Nodes(ids) = batch.slot(*slot) {
+                        for &id in ids {
+                            applied.push(Applied::AddLabel(id, label.clone()));
+                        }
+                    }
+                }
+                crate::ir::SetOp::RemoveLabel { slot, label } => {
+                    if let Col::Nodes(ids) = batch.slot(*slot) {
+                        for &id in ids {
+                            applied.push(Applied::RemoveLabel(id, label.clone()));
+                        }
+                    }
+                }
                 crate::ir::SetOp::Delete { slot, detach } => match batch.slot(*slot) {
                     Col::Nodes(ids) => {
                         for &id in ids {
@@ -986,6 +1002,8 @@ fn run_update(
         match a {
             Applied::Set(node, key, value) => store.set_prop(node, &key, value),
             Applied::Remove(node, key) => store.remove_prop(node, &key),
+            Applied::AddLabel(node, label) => store.add_label(node, &label),
+            Applied::RemoveLabel(node, label) => store.remove_label(node, &label),
             Applied::SetEdge(eid, key, value) => store.set_edge_prop(eid, &key, value),
             Applied::RemoveEdge(eid, key) => store.remove_edge_prop(eid, &key),
             Applied::DeleteEdge(eid) => {
@@ -1896,7 +1914,10 @@ fn needs_lineage(plan: &Plan) -> bool {
             needs_lineage(input)
                 || ops.iter().any(|op| match op {
                     crate::ir::SetOp::Set { value, .. } => reads_path(value),
-                    crate::ir::SetOp::Remove { .. } | crate::ir::SetOp::Delete { .. } => false,
+                    crate::ir::SetOp::Remove { .. }
+                    | crate::ir::SetOp::AddLabel { .. }
+                    | crate::ir::SetOp::RemoveLabel { .. }
+                    | crate::ir::SetOp::Delete { .. } => false,
                 })
         }
         Plan::UpdateReturn { input, ops, tail } => {
@@ -1904,7 +1925,10 @@ fn needs_lineage(plan: &Plan) -> bool {
                 || needs_lineage(tail)
                 || ops.iter().any(|op| match op {
                     crate::ir::SetOp::Set { value, .. } => reads_path(value),
-                    crate::ir::SetOp::Remove { .. } | crate::ir::SetOp::Delete { .. } => false,
+                    crate::ir::SetOp::Remove { .. }
+                    | crate::ir::SetOp::AddLabel { .. }
+                    | crate::ir::SetOp::RemoveLabel { .. }
+                    | crate::ir::SetOp::Delete { .. } => false,
                 })
         }
     }
