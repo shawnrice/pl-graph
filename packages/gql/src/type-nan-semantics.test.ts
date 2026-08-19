@@ -33,6 +33,21 @@ describe('GQL type/NaN semantics (the reference the Rust engine matches)', () =>
     );
   });
 
+  test('a null operand short-circuits arithmetic to null before the type-check', () => {
+    // Null propagates BEFORE the numeric type-check (matching the engine): the result is
+    // null regardless of the other operand's type. The type error only fires when NEITHER
+    // side is null. So `true + 1` throws (above), but `null + true` / `null - 'abc'` are
+    // null, NOT a type error.
+    const v = (e: string): unknown =>
+      query(fixture(), `MATCH (n:T) RETURN ${e} AS x LIMIT 1`)[0].x;
+    expect(v(`null - 'abc'`)).toBe(null);
+    expect(v(`null + true`)).toBe(null);
+    expect(v(`null - [1, 2]`)).toBe(null);
+    expect(v(`'abc' * null`)).toBe(null);
+    // Null even wins over a division-by-zero (also matching the engine).
+    expect(v(`null / 0`)).toBe(null);
+  });
+
   test('min/max use the total order: max keeps NaN (largest), min skips it', () => {
     // sqrt(score) over [-1, 4, 9] → [NaN, 2, 3]. Total order (NaN last): max is
     // NaN, min is 2 — deterministic regardless of scan order.

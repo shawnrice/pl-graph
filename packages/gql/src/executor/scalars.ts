@@ -212,8 +212,9 @@ export const ARITH: Record<ArithOp, (a: number, b: number) => number> = {
 
 /**
  * One step of a left-associative arithmetic fold `lval <op> rval`. Preserves the
- * binary semantics: temporal arithmetic when either side is temporal, null from a
- * non-numeric operand, and a division/modulo-by-zero data exception.
+ * binary semantics: temporal arithmetic when either side is temporal, null when either
+ * operand is null (propagated BEFORE the numeric type-check), a data exception for a
+ * non-numeric operand otherwise, and a division/modulo-by-zero data exception.
  */
 export const arithStep = (
   op: ArithOp,
@@ -225,12 +226,17 @@ export const arithStep = (
     return temporalArith(op, lval, rval);
   }
 
-  const lv = numOf(lval);
-  const rv = numOf(rval);
-
-  if (lv === null || rv === null) {
+  // Null propagates BEFORE the numeric type-check, matching the engine: a null operand
+  // makes the result null regardless of the other operand's type (the engine's math
+  // carries a null/NaN and nulls it at egress). A non-numeric operand only faults when
+  // NEITHER side is null — `'abc' + 1` raises, but `null - 'abc'` is null.
+  if (isNullish(lval) || isNullish(rval)) {
     return null;
   }
+
+  // Both operands are non-null here, so numOf returns a number or faults (never null).
+  const lv = numOf(lval) as number;
+  const rv = numOf(rval) as number;
 
   if ((op === '/' || op === '%') && rv === 0) {
     return dataException('division by zero');
