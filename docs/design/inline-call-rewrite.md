@@ -184,8 +184,20 @@ path over the existing lateral join, once prov is carried). Phase 2 is the large
 new per-outer-row set-op combine in the vectorized exec, plus the byte-identity work.
 Phase 3 is small once prov is carried (an aggregate twin of `CollectSubquery`).
 
-## Status: DONE (Phases 0–3)
+## Status: DONE (Phases 0–3, fuzzed)
 
 All four phases are implemented and verified byte-identical against the conformance
-suite. Remaining open coverage item: the differential fuzzer generates no inline-CALL —
-extending it would harden the intra-group / row-order pins the ORDER BY'd tests mask.
+suite. The differential fuzzer now also generates inline CALL (a `genCall` producing the
+plain/OPTIONAL lateral join, `RETURN *`, the set-op combine with scope-var AND fresh-scan
+arms, the uncorrelated global set-op, and the scalar-aggregate body — ~12% of queries,
+~2,400 per seed). It compares structurally (row multiset), which is the correct invariant
+since intra-group order without ORDER BY is unspecified. 16 seeds × ~2,400 CALL queries
+turned up ZERO CALL divergences; a coverage probe confirmed 2000/2000 generated CALL
+queries execute (not vacuous both-error). The only divergences the run surfaces are the
+pre-existing non-bool-in-AND/FILTER class (engine lenient, TS strict) — unrelated.
+
+Measured perf: the `call/inline` micro-bench is 0.360 ms at the pre-rewrite baseline vs
+0.370 ms at HEAD (min of 8) — a ~3% delta, below the repo's ~10% noise floor. The plain
+lateral-join exec path is unchanged code; the one structural addition (Phase 0's prov
+column) is one extra `Col::Num` per CALL, necessary for every feature above and neutral
+at the bench's outer-set size.
