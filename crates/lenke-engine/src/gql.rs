@@ -2496,12 +2496,14 @@ impl Parser {
     // A literal property value: number, string, the keyword true/false/null, or a
     // `[...]` list of literal values (used e.g. by `CALL personalized_pagerank(
     // {sourceNodes: ['a', 'b']})`; a list is a first-class stored property value).
-    /// Resolve a `$name` parameter to its value, or a parse error if unbound.
+    /// Resolve a `$name` parameter to its value. A missing binding carries the
+    /// `E_MISSING_PARAMETER` wire code (the FFI routes the prefix) — a supplied-but-
+    /// unbound param is a missing parameter, not a syntax error, matching TS.
     fn lookup_param(&self, name: &str) -> Result<Value, String> {
         self.params
             .get(name)
             .cloned()
-            .ok_or_else(|| format!("unbound parameter `${name}`"))
+            .ok_or_else(|| format!("E_MISSING_PARAMETER: unbound parameter `${name}`"))
     }
 
     fn literal_value(&mut self) -> Result<Value, String> {
@@ -6401,7 +6403,22 @@ mod tests {
     fn unbound_param_is_a_parse_error() {
         let err =
             super::parse_with_params("MATCH (n) WHERE n.k = $missing RETURN n", &[]).unwrap_err();
+        // A supplied-but-unbound `$param` carries the E_MISSING_PARAMETER wire code (the
+        // FFI routes the prefix), not a bare syntax error — matching TS.
+        assert!(
+            err.starts_with("E_MISSING_PARAMETER:"),
+            "expected the E_MISSING_PARAMETER prefix, got: {err}"
+        );
         assert!(err.contains("missing"), "unhelpful error: {err}");
+    }
+
+    /// A well-formed JSON param whose VALUE is outside the param model — a malformed
+    /// tagged temporal (`{"@date":"nope"}`) — is a VALUE error, not a JSON-syntax one,
+    /// so `params_from_obj` rejects it (the FFI maps this to E_INVALID_VALUE).
+    #[test]
+    fn malformed_tagged_temporal_param_is_a_value_error() {
+        let obj = crate::ndjson::parse_json(r#"{"x":{"@date":"nope"}}"#).unwrap();
+        assert!(crate::ndjson::params_from_obj(&obj).is_err());
     }
 
     /// A string param carrying query-like text is a plain VALUE — matched literally,

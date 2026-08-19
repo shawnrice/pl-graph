@@ -505,10 +505,20 @@ pub unsafe extern "C" fn lnk_query(
             crate::ffi_error::set("E_FFI", "params are not valid UTF-8");
             return std::ptr::null_mut();
         };
-        match crate::ndjson::parse_params(p) {
-            Ok(params) => params,
+        // A JSON SYNTAX error is E_INVALID_JSON; a well-formed JSON whose VALUE is
+        // outside the param model (a nested object, a malformed tagged temporal) is
+        // E_INVALID_VALUE — the JSON parsed, the value did not.
+        let obj = match crate::ndjson::parse_json(p) {
+            Ok(obj) => obj,
             Err(e) => {
                 crate::ffi_error::set("E_INVALID_JSON", &e);
+                return std::ptr::null_mut();
+            }
+        };
+        match crate::ndjson::params_from_obj(&obj) {
+            Ok(params) => params,
+            Err(e) => {
+                crate::ffi_error::set("E_INVALID_VALUE", &e);
                 return std::ptr::null_mut();
             }
         }
@@ -558,10 +568,13 @@ pub unsafe extern "C" fn lnk_query(
             let plan = match crate::gql::parse_with_params(q, &params) {
                 Ok(plan) => plan,
                 Err(e) => {
-                    // A genuine parse error is E_SYNTAX; an unknown function name (caught
-                    // while resolving the call) carries its own more specific code.
+                    // A genuine parse error is E_SYNTAX; a more specific code carried as a
+                    // prefix (unknown function, a supplied-but-missing `$param`) is routed
+                    // to its own wire code.
                     if let Some(rest) = e.strip_prefix("E_UNKNOWN_FUNCTION: ") {
                         crate::ffi_error::set("E_UNKNOWN_FUNCTION", rest);
+                    } else if let Some(rest) = e.strip_prefix("E_MISSING_PARAMETER: ") {
+                        crate::ffi_error::set("E_MISSING_PARAMETER", rest);
                     } else {
                         crate::ffi_error::set("E_SYNTAX", &e);
                     }
