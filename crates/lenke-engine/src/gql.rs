@@ -5013,6 +5013,18 @@ impl Parser {
                 if let Some((_, e)) = self.lets.iter().rev().find(|(n, _)| n == &s) {
                     return Ok(e.clone());
                 }
+                // ISO niladic current-datetime functions (`current_timestamp`,
+                // `local_timestamp`, `current_date`) read the reserved `$__now` clock
+                // param the host injects; absent → null. The engine stays pure — it
+                // never reads a wall clock itself. A DATE `$__now` coerces to a midnight
+                // datetime for the timestamp forms (via `temporal_ctor`).
+                if let Some(kind) = current_temporal_kind(&s) {
+                    let val = self
+                        .params
+                        .get("__now")
+                        .map_or(Value::Null, |v| crate::exec::temporal_ctor(v, kind));
+                    return Ok(Expr::Lit(val));
+                }
                 let slot = *self
                     .scope
                     .get(&s)
@@ -5941,6 +5953,18 @@ fn temporal_tag(kw: &str) -> Option<&'static str> {
         // `TIMESTAMP` is core's alias for a (local) DATETIME literal.
         "DATETIME" | "TIMESTAMP" => "datetime",
         "DURATION" => "duration",
+        _ => return None,
+    })
+}
+
+/// Map an ISO niladic current-datetime function to the temporal kind it reads the
+/// `$__now` clock as: `current_timestamp`/`local_timestamp` → a local `datetime`,
+/// `current_date` → a `date`. Only the forms pure-TS supports are recognized, so the
+/// two engines stay byte-identical.
+fn current_temporal_kind(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "current_timestamp" | "local_timestamp" => "datetime",
+        "current_date" => "date",
         _ => return None,
     })
 }

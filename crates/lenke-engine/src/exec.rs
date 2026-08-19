@@ -15117,7 +15117,7 @@ fn date_part(func: &str, t: crate::temporal::Temporal) -> Option<i64> {
 /// `datetime(date)` → midnight, `local_time(datetime)` → the time-of-day). A
 /// bare `YYYY-MM-DD` string to a datetime target coerces to midnight. Anything
 /// with no sensible conversion → NULL. Ported from lenke-core for agreement.
-fn temporal_ctor(v: &Value, kind: &str) -> Value {
+pub(crate) fn temporal_ctor(v: &Value, kind: &str) -> Value {
     use crate::temporal::{Date, DateTime, Temporal, Time};
     const SPD: i64 = 86_400;
     match v {
