@@ -433,10 +433,6 @@ export const tokenize = (src: string): Token[] => {
       // Guard against the `''.includes('') === true` quirk: a bare `0` at EOF
       // must not be mistaken for a base prefix.
       const isBasePrefix = c === '0' && afterZero !== undefined && 'xXoObB'.includes(afterZero);
-      // Track whether the literal is an *integer* form (no fraction/exponent).
-      // Only integers are held to the safe-integer range; floats may exceed it
-      // because they are inherently approximate.
-      let isInteger = true;
 
       if (isBasePrefix) {
         const digitClass = BASE_DIGIT_CLASS[afterZero.toLowerCase()] ?? BASE_DIGIT_CLASS.b;
@@ -459,13 +455,11 @@ export const tokenize = (src: string): Token[] => {
         digits();
 
         if (src[i] === '.') {
-          isInteger = false;
           i += 1;
           digits();
         }
 
         if (src[i] === 'e' || src[i] === 'E') {
-          isInteger = false;
           i += 1;
 
           if (src[i] === '+' || src[i] === '-') {
@@ -479,17 +473,16 @@ export const tokenize = (src: string): Token[] => {
       const text = src.slice(start, i);
       const num = Number(text.replace(/_/g, ''));
 
-      // A malformed mantissa/exponent (`1e`, `0x`, `.e5`) coerces to NaN; an
-      // overflowing magnitude (`1e999`) to Infinity. Reject both — otherwise a
-      // garbage `lit` node flows into the AST and downstream arithmetic.
-      if (!Number.isFinite(num)) {
+      // A malformed mantissa (`1e`, `0x`) coerces to NaN — that is a genuine syntax
+      // error, so reject it. An overflowing magnitude (`1e999`) coerces to Infinity, and
+      // a large integer past 2^53 (`9007199254740993`) rounds to the nearest double: both
+      // are ACCEPTED. The numeric model is f64 with no bigint — values leave lenke only as
+      // JSON (a JS number) or Arrow, never boxed to preserve exact large integers — so a
+      // literal that differs from its text is just the f64 contract (like `0.1 + 0.2`).
+      // Infinity is a live value here (nulled only at JSON egress; `1e999 IS NULL` is
+      // false), matching the engine. Only NaN is unrepresentable and rejected.
+      if (Number.isNaN(num)) {
         throw new GqlSyntaxError(`Malformed numeric literal '${text}'`, start);
-      }
-
-      // An integer literal past 2^53 silently loses precision as a JS double.
-      // Reject rather than return a value that differs from what was written.
-      if (isInteger && !Number.isSafeInteger(num)) {
-        throw new GqlSyntaxError(`Integer literal '${text}' exceeds the safe integer range`, start);
       }
 
       push('number', text, start, num);

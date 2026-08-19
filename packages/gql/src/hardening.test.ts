@@ -236,12 +236,25 @@ describe('hardening: malformed numeric literals are rejected', () => {
     });
   }
 
-  test('rejects an overflowing exponent (Infinity)', () => {
-    expect(() => parse(`RETURN 1e999 AS r`)).toThrow(GqlSyntaxError);
+  test('accepts an overflowing exponent as Infinity (f64 model), nulled at egress', () => {
+    // 1e999 overflows f64 to Infinity — a live value, not a syntax error. It is nulled
+    // only at JSON egress; `IS NULL` sees the real Infinity (false). Matches the engine.
+    expect(litValue('1e999')).toBe(Infinity);
+    const g = new Graph();
+    expect(query(g, `RETURN (1e999 IS NULL) AS x`)[0].x).toBe(false);
+    // The in-process `query()` API returns the live JS value (Infinity); it is nulled
+    // only at the JSON egress boundary (which the engine always crosses), so the
+    // differential fuzzer — which JSON-stringifies both sides — sees null on both.
+    expect(query(g, `RETURN 1e999 AS x`)[0].x).toBe(Infinity);
+    expect(JSON.stringify(query(g, `RETURN 1e999 AS x`))).toBe(`[{"x":null}]`);
   });
 
-  test('rejects an integer beyond the safe range', () => {
-    expect(() => parse(`RETURN 99999999999999999999 AS r`)).toThrow(GqlSyntaxError);
+  test('accepts an integer beyond 2^53 as a rounded double (no bigint)', () => {
+    // The numeric model is f64 with no bigint; a large integer literal rounds to the
+    // nearest double (precision loss is the f64 contract), matching the engine — values
+    // only leave lenke as JSON/Arrow, never boxed to preserve an exact large integer.
+    expect(litValue('99999999999999999999')).toBe(1e20);
+    expect(litValue('9007199254740993')).toBe(9007199254740992);
   });
 
   test('still accepts valid integers, bases, and floats', () => {
