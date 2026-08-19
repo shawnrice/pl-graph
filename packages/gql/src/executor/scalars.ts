@@ -847,7 +847,12 @@ export const toIntScalar = (a: unknown): number | null => {
   }
 
   if (typeof a === 'number') {
-    return Math.trunc(a);
+    // A non-finite number (NaN/Inf) truncates to null, matching the engine's integer
+    // branch (`if n.is_finite() { n.trunc() } else { Null }`). Without this, to_integer
+    // returns a raw NaN that reads as null at RETURN egress but leaks as a value through
+    // FOR..IN (`FOR v IN to_integer(NaN)` would yield a spurious [null] row). Note: to_float
+    // deliberately KEEPS NaN in both engines, so the asymmetry here mirrors the engine.
+    return Number.isFinite(a) ? Math.trunc(a) : null;
   }
 
   // A boolean converts to 1 / 0 — the ISO-GQL / Ultipa explicit conversion, matching the

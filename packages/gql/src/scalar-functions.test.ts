@@ -301,9 +301,15 @@ describe('GQL: byte-identity regressions from the differential fuzzer', () => {
     expect(val(`RETURN to_string(asin(2)) AS x`)).toBe(null);
     expect(val(`RETURN to_list(log10(-1)) AS x`)).toBe(null);
     expect(val(`RETURN to_list(asin(2)) AS x`)).toBe(null);
+    // to_integer of a non-finite number is null too (its integer branch checks
+    // finiteness). This reads as null at RETURN but, unlike a raw NaN, also yields
+    // ZERO rows through FOR..IN, matching the engine.
+    expect(val(`RETURN to_integer(log10(-1)) AS x`)).toBe(null);
+    expect(query(g, `FOR v IN to_integer(log10(-1)) RETURN v AS x`)).toEqual([]);
     // Finite values are unaffected.
     expect(val(`RETURN to_string(5.5) AS x`)).toBe('5.5');
     expect(val(`RETURN to_list(5) AS x`)).toEqual([5]);
+    expect(val(`RETURN to_integer(3.9) AS x`)).toBe(3);
   });
 
   test('percentile requires numeric values, not coerced strings', () => {
