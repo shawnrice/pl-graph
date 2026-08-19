@@ -1187,7 +1187,11 @@ impl Parser {
         for (name, e) in &extra_group {
             items.push(RetItem::Key(name.clone(), e.clone()));
         }
-        let needs_schema_proj = !extra_group.is_empty();
+        // A simple aggregate's plan schema is `[keys… , aggs…]` (see `apply_items`), which
+        // is NOT the RETURN item order when an aggregate precedes a key (`RETURN count(*) AS
+        // c, n.k AS g`). It ALWAYS needs the final reorder-to-visible-order projection, not
+        // only when there are extra (hidden) group keys to drop.
+        let needs_schema_proj = (has_agg && !has_agg_expr) || !extra_group.is_empty();
         // `GROUP BY <keys>` with NO aggregate is DISTINCT over the projection (the
         // returned items ARE the keys), matching core.
         let group_distinct = group_by_present && !has_agg;

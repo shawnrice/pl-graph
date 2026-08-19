@@ -22370,6 +22370,33 @@ mod tests {
         assert!(ok("MATCH (n:T) RETURN sum(date('2020-01-01')) AS x").is_err());
     }
 
+    /// A grouped RETURN preserves the ITEM column order even when an aggregate precedes a
+    /// group key (`count(*) AS c, n.k AS g` → the count column is FIRST). The plan's schema
+    /// is `[keys…, aggs…]`, so this relies on the final reorder-to-visible projection —
+    /// which previously ran only when there were hidden group keys to drop.
+    #[test]
+    fn grouped_return_preserves_aggregate_first_column_order() {
+        let nd = "{\"id\":\"1\",\"labels\":[\"T\"],\"props\":{\"n\":3}}\n\
+                  {\"id\":\"2\",\"labels\":[\"T\"],\"props\":{\"n\":3}}\n\
+                  {\"id\":\"3\",\"labels\":[\"T\"],\"props\":{\"n\":5}}";
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let rows = try_run(
+            &crate::opt::optimize_indexed(
+                crate::gql::parse(
+                    "MATCH (n:T) RETURN count(*) AS c, n.n AS g GROUP BY n.n ORDER BY g",
+                )
+                .unwrap(),
+                &store,
+            ),
+            &store,
+        )
+        .unwrap()
+        .rows;
+        // Columns are [c, g] in item order — group n=3 has count 2, n=5 has count 1.
+        assert_eq!((num(&rows[0][0]), num(&rows[0][1])), (2.0, 3.0));
+        assert_eq!((num(&rows[1][0]), num(&rows[1][1])), (1.0, 5.0));
+    }
+
     /// A grouped aggregate over empty input emits ZERO rows (unlike the scalar
     /// case) — there are no groups.
     #[test]
