@@ -1840,6 +1840,13 @@ impl Parser {
         };
         self.expect(&Tok::RParen)?;
 
+        // An edge form `(a:A {..})-[m:R {..}]->(b:B {..})` — upsert the single edge
+        // between the two key-matched endpoints. Detected by an edge delimiter after
+        // the first node.
+        if matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
+            return self.merge_edge(var, label, props);
+        }
+
         // Bind the merged node at slot 0 so _ON_CREATE/_ON_UPDATE SET and WHERE
         // resolve `var.key`.
         self.scope = HashMap::new();
@@ -1880,6 +1887,110 @@ impl Parser {
             on_create,
             on_update,
         })
+    }
+
+    /// The `_MERGE` edge form, entered once the first node's `-`/`<-`/`~` delimiter
+    /// is seen. `start_*` is that first node. Parses the relationship and the second
+    /// node, binds start/end/edge at slots 0/1/2, then the dispositions (slot-aware,
+    /// since a disposition may target either endpoint or the edge).
+    fn merge_edge(
+        &mut self,
+        start_var: Option<String>,
+        start_label: String,
+        start_props: Vec<(String, crate::value::Value)>,
+    ) -> Result<Plan, String> {
+        let rel = self.rel()?;
+        self.expect(&Tok::LParen)?;
+        let end_var = if matches!(self.peek(), Some(Tok::Ident(_))) {
+            Some(self.ident()?)
+        } else {
+            None
+        };
+        self.expect(&Tok::Colon)?;
+        let end_label = self.ident()?;
+        let end_props = if matches!(self.peek(), Some(Tok::LBrace)) {
+            self.literal_props("a _MERGE key")?
+        } else {
+            Vec::new()
+        };
+        self.expect(&Tok::RParen)?;
+
+        // Exactly one plain edge type (no `|`-disjunction, no `!`-negation).
+        if rel.etypes.len() != 1 || rel.etypes[0] == "!" {
+            return Err("E_INVALID_GRAPH_OP: a _MERGE edge must carry exactly one type".into());
+        }
+        let etype = rel.etypes[0].clone();
+        if rel.where_range.is_some() {
+            return Err("E_INVALID_GRAPH_OP: a _MERGE edge does not take an inline WHERE".into());
+        }
+
+        // Slots: start = 0, end = 1, edge = 2 — for the disposition expressions.
+        self.scope = HashMap::new();
+        if let Some(v) = &start_var {
+            self.scope.insert(v.clone(), 0);
+        }
+        if let Some(v) = &end_var {
+            self.scope.insert(v.clone(), 1);
+        }
+        if let Some(v) = &rel.var {
+            self.scope.insert(v.clone(), 2);
+        }
+        self.slots = 3;
+
+        let on_create = if self.eat_kw("_ON_CREATE") {
+            if !self.eat_kw("SET") {
+                return Err("expected SET after _ON_CREATE".into());
+            }
+            self.assign_list_slotted()?
+        } else {
+            Vec::new()
+        };
+
+        let on_update = if self.eat_kw("_ON_UPDATE_NOTHING") {
+            crate::ir::MergeEdgeUpdate::Nothing
+        } else if self.eat_kw("_ON_UPDATE") {
+            if !self.eat_kw("SET") {
+                return Err("expected SET after _ON_UPDATE".into());
+            }
+            let assigns = self.assign_list_slotted()?;
+            let filter = if self.eat_kw("WHERE") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            crate::ir::MergeEdgeUpdate::Set { assigns, filter }
+        } else {
+            crate::ir::MergeEdgeUpdate::Clobber
+        };
+
+        Ok(Plan::MergeEdge {
+            start_label,
+            start_props,
+            end_label,
+            end_props,
+            dir: rel.dir,
+            etype,
+            edge_props: rel.props,
+            on_create,
+            on_update,
+        })
+    }
+
+    // assign_list_slotted := var '.' key '=' expr ( ',' … )* — like `assign_list`
+    // but KEEPS each assignment's target slot (edge `_MERGE` writes span the two
+    // endpoints and the edge).
+    fn assign_list_slotted(&mut self) -> Result<Vec<(usize, String, Expr)>, String> {
+        let mut out = Vec::new();
+        loop {
+            let (slot, key) = self.slot_dot_key()?;
+            self.expect(&Tok::Eq)?;
+            let value = self.expr()?;
+            out.push((slot, key, value));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     // assign_list := var '.' key '=' expr ( ',' var '.' key '=' expr )*
@@ -10547,6 +10658,96 @@ mod tests {
     fn merge_without_constraint_errors() {
         let mut st = Builder::default().build(); // no constraint
         assert!(merge(&mut st, "_MERGE (u:User {email: 'a'})").is_err());
+    }
+
+    /// A two-label store (`User.id`, `Team.id` unique) with one vertex of each,
+    /// for the edge-form `_MERGE` tests.
+    fn edge_merge_store() -> Store {
+        let mut st = Builder::default().build();
+        st.create_unique_constraint("User", &["id"]).unwrap();
+        st.create_unique_constraint("Team", &["id"]).unwrap();
+        merge_all(&mut st, "INSERT (:User {id: 'u1'}), (:Team {id: 't1'})");
+        st
+    }
+    fn merge_all(store: &mut Store, q: &str) {
+        crate::exec::execute(&super::parse(q).unwrap(), store).unwrap();
+    }
+
+    /// Edge `_MERGE`: absent → the edge is created between the two key-matched
+    /// endpoints with its inline props, then `_ON_CREATE` fires on the edge.
+    #[test]
+    fn merge_edge_creates_between_key_matched_endpoints() {
+        let mut st = edge_merge_store();
+        merge(
+            &mut st,
+            "_MERGE (u:User {id:'u1'})-[m:MEMBER {since: 1}]->(t:Team {id:'t1'}) \
+             _ON_CREATE SET m.role = 'admin'",
+        )
+        .unwrap();
+        assert_eq!(st.edge_count(), 1);
+        assert!(matches!(st.edge_prop(0, "since"), Value::Num(x) if x == 1.0));
+        assert!(matches!(st.edge_prop(0, "role"), Value::Str(x) if &*x == "admin"));
+    }
+
+    /// Idempotent + default clobber of edge props; `_ON_CREATE` does NOT re-fire.
+    #[test]
+    fn merge_edge_is_idempotent_and_clobbers_props() {
+        let mut st = edge_merge_store();
+        merge(
+            &mut st,
+            "_MERGE (u:User {id:'u1'})-[m:MEMBER {since: 1}]->(t:Team {id:'t1'}) \
+             _ON_CREATE SET m.role = 'admin'",
+        )
+        .unwrap();
+        merge(
+            &mut st,
+            "_MERGE (u:User {id:'u1'})-[m:MEMBER {since: 2}]->(t:Team {id:'t1'})",
+        )
+        .unwrap();
+        assert_eq!(st.edge_count(), 1); // no duplicate edge
+        assert!(matches!(st.edge_prop(0, "since"), Value::Num(x) if x == 2.0)); // clobbered
+        assert!(matches!(st.edge_prop(0, "role"), Value::Str(x) if &*x == "admin"));
+        // on_create kept
+    }
+
+    /// `_ON_UPDATE SET … WHERE p` gates the edge update; a false gate is a no-op.
+    #[test]
+    fn merge_edge_on_update_where_gate() {
+        let mut st = edge_merge_store();
+        merge(
+            &mut st,
+            "_MERGE (u:User {id:'u1'})-[m:MEMBER {v: 1}]->(t:Team {id:'t1'})",
+        )
+        .unwrap();
+        // Gate true → applies.
+        merge(
+            &mut st,
+            "_MERGE (u:User {id:'u1'})-[m:MEMBER]->(t:Team {id:'t1'}) \
+             _ON_UPDATE SET m.v = 9 WHERE m.v < 9",
+        )
+        .unwrap();
+        assert!(matches!(st.edge_prop(0, "v"), Value::Num(x) if x == 9.0));
+        // Gate false → no-op.
+        merge(
+            &mut st,
+            "_MERGE (u:User {id:'u1'})-[m:MEMBER]->(t:Team {id:'t1'}) \
+             _ON_UPDATE SET m.v = 2 WHERE m.v < 2",
+        )
+        .unwrap();
+        assert!(matches!(st.edge_prop(0, "v"), Value::Num(x) if x == 9.0));
+    }
+
+    /// A missing endpoint (its key matches no vertex) is an error, not a silent
+    /// create — and it leaves no edge behind.
+    #[test]
+    fn merge_edge_missing_endpoint_errors() {
+        let mut st = edge_merge_store();
+        assert!(merge(
+            &mut st,
+            "_MERGE (u:User {id:'u1'})-[m:MEMBER]->(t:Team {id:'nope'})"
+        )
+        .is_err());
+        assert_eq!(st.edge_count(), 0);
     }
 
     // --- part 7: relationship variables & edge properties (B5c) ---

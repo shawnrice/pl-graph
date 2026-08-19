@@ -183,6 +183,7 @@ fn plan_has_varlen(plan: &Plan) -> bool {
         | Plan::Insert { .. }
         | Plan::InsertReturn { .. }
         | Plan::Merge { .. }
+        | Plan::MergeEdge { .. }
         | Plan::AddEdge { .. }
         | Plan::CallProcedure { .. } => false,
         Plan::Filter { input, .. }
@@ -694,9 +695,9 @@ fn run_insert_from(
                 n.bound
                     .map(|slot| match batch.slot(slot) {
                         Col::Nodes(ids) => Ok(ids.clone()),
-                        _ => Err(
-                            "INSERT references a bound variable that is not a node".to_string()
-                        ),
+                        _ => {
+                            Err("INSERT references a bound variable that is not a node".to_string())
+                        }
                     })
                     .transpose()
             })
@@ -761,6 +762,7 @@ pub(crate) fn is_write(plan: &Plan) -> bool {
             | Plan::Update { .. }
             | Plan::UpdateReturn { .. }
             | Plan::Merge { .. }
+            | Plan::MergeEdge { .. }
             | Plan::AddEdge { .. }
     )
 }
@@ -814,6 +816,28 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
             on_create,
             on_update,
         } => execute_merge(store, label, props, on_create, on_update),
+        Plan::MergeEdge {
+            start_label,
+            start_props,
+            end_label,
+            end_props,
+            dir,
+            etype,
+            edge_props,
+            on_create,
+            on_update,
+        } => execute_merge_edge(
+            store,
+            start_label,
+            start_props,
+            end_label,
+            end_props,
+            *dir,
+            etype,
+            edge_props,
+            on_create,
+            on_update,
+        ),
         Plan::AddEdge {
             from,
             to,
@@ -1089,6 +1113,158 @@ fn execute_merge(
                 Err(e) => {
                     stmt_rollback(store, scope);
                     return Err(e);
+                }
+            }
+        }
+    }
+
+    if let Err(e) = check_deferred_if_standalone(store, scope) {
+        stmt_rollback(store, scope);
+        return Err(e);
+    }
+    stmt_commit(store, scope);
+    Ok(empty_rows())
+}
+
+/// Resolve a `_MERGE` edge endpoint: the vertex whose inferred unique key matches
+/// the pattern's `props`. A missing key or no match is an error (mirrors the TS
+/// engine's `resolveMergeEndpoint`).
+fn resolve_merge_endpoint(
+    store: &Store,
+    label: &str,
+    props: &[(String, Value)],
+) -> Result<u32, String> {
+    let have: Vec<String> = props.iter().map(|(k, _)| k.clone()).collect();
+    let key_keys = store.infer_merge_key(label, &have)?;
+    let want = key_bytes(&key_keys, |k| pattern_value(props, k));
+    store
+        .nodes_with_label(label)
+        .iter()
+        .copied()
+        .find(|&id| key_bytes(&key_keys, |k| store.prop(id, k)) == want)
+        .ok_or_else(|| {
+            format!(
+                "E_INVALID_GRAPH_OP: _MERGE endpoint (:{label} {{…}}) not found — its key must match an existing vertex"
+            )
+        })
+}
+
+/// Execute a `_MERGE` edge upsert: resolve both endpoints by their unique key,
+/// then upsert the single edge between them keyed by (from, to, `etype`).
+#[allow(clippy::too_many_arguments)]
+fn execute_merge_edge(
+    store: &mut Store,
+    start_label: &str,
+    start_props: &[(String, Value)],
+    end_label: &str,
+    end_props: &[(String, Value)],
+    dir: Dir,
+    etype: &str,
+    edge_props: &[(String, Value)],
+    on_create: &[(usize, String, Expr)],
+    on_update: &crate::ir::MergeEdgeUpdate,
+) -> Result<Rows, String> {
+    use crate::ir::MergeEdgeUpdate;
+    let scope = stmt_begin(store);
+
+    let start_id = match resolve_merge_endpoint(store, start_label, start_props) {
+        Ok(id) => id,
+        Err(e) => {
+            stmt_rollback(store, scope);
+            return Err(e);
+        }
+    };
+    let end_id = match resolve_merge_endpoint(store, end_label, end_props) {
+        Ok(id) => id,
+        Err(e) => {
+            stmt_rollback(store, scope);
+            return Err(e);
+        }
+    };
+    // The pattern positions (start=slot 0, end=slot 1) are fixed; direction only
+    // decides which is the edge's tail vs head.
+    let (from, to) = match dir {
+        Dir::In => (end_id, start_id),
+        _ => (start_id, end_id),
+    };
+
+    let existing = store
+        .out(from)
+        .iter()
+        .find(|a| a.nbr == to && store.edge_type_name(a.eid).as_deref() == Some(etype))
+        .map(|a| a.eid);
+
+    let (eid, created) = match existing {
+        Some(e) => (e, false),
+        None => {
+            let e = store.add_edge(from, to, etype);
+            for (k, v) in edge_props {
+                store.set_edge_prop(e, k, v.clone());
+            }
+            (e, true)
+        }
+    };
+
+    // slot 0 = start node, slot 1 = end node, slot 2 = edge — the disposition
+    // expressions read and write through this batch.
+    let batch = Batch::of(vec![
+        Col::Nodes(vec![start_id]),
+        Col::Nodes(vec![end_id]),
+        Col::Edges(vec![eid]),
+    ]);
+
+    // Evaluate every assignment BEFORE mutating, so a fault rolls the whole MERGE
+    // back rather than leaving a partial write.
+    let eval_writes = |store: &Store,
+                       assigns: &[(usize, String, Expr)]|
+     -> Result<Vec<(usize, String, Value)>, String> {
+        assigns
+            .iter()
+            .map(|(slot, k, e)| Ok((*slot, k.clone(), eval(e, store, &batch)?.value_at(0))))
+            .collect()
+    };
+    let apply = |store: &mut Store, writes: Vec<(usize, String, Value)>| {
+        for (slot, k, v) in writes {
+            match slot {
+                0 => store.set_prop(start_id, &k, v),
+                1 => store.set_prop(end_id, &k, v),
+                _ => store.set_edge_prop(eid, &k, v),
+            }
+        }
+    };
+
+    if created {
+        match eval_writes(store, on_create) {
+            Ok(w) => apply(store, w),
+            Err(e) => {
+                stmt_rollback(store, scope);
+                return Err(e);
+            }
+        }
+    } else {
+        match on_update {
+            MergeEdgeUpdate::Nothing => {}
+            MergeEdgeUpdate::Clobber => {
+                for (k, v) in edge_props {
+                    store.set_edge_prop(eid, k, v.clone());
+                }
+            }
+            MergeEdgeUpdate::Set { assigns, filter } => {
+                let gate = match filter.as_ref().map(|f| eval(f, store, &batch)).transpose() {
+                    Ok(g) => g.is_none_or(|c| matches!(c.value_at(0), Value::Bool(true))),
+                    Err(e) => {
+                        stmt_rollback(store, scope);
+                        return Err(e);
+                    }
+                };
+                if gate {
+                    match eval_writes(store, assigns) {
+                        Ok(w) => apply(store, w),
+                        Err(e) => {
+                            stmt_rollback(store, scope);
+                            return Err(e);
+                        }
+                    }
                 }
             }
         }
@@ -1662,6 +1838,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::Insert { .. }
         | Plan::InsertReturn { .. }
         | Plan::Merge { .. }
+        | Plan::MergeEdge { .. }
         | Plan::AddEdge { .. }
         | Plan::CallProcedure { .. }
         | Plan::TxControl { .. }
@@ -1746,6 +1923,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         | Plan::Update { .. }
         | Plan::UpdateReturn { .. }
         | Plan::Merge { .. }
+        | Plan::MergeEdge { .. }
         | Plan::AddEdge { .. }
         | Plan::TxControl { .. } => Batch::of(Vec::new()),
         // `Row` is the leaf of an EXISTS body and is only ever fed a batch by
@@ -22543,9 +22721,10 @@ mod tests {
         };
         // SKIP 1 LIMIT 1 → window [1, 2) is only the n=2 row (CAST('5')=5). The paged-out
         // n=1 row (CAST('abc') would fault) is never evaluated.
-        let rows = ok("MATCH (n:T) RETURN CAST(n.s AS INTEGER) AS x, n.n AS t ORDER BY t SKIP 1 LIMIT 1")
-            .unwrap()
-            .rows;
+        let rows =
+            ok("MATCH (n:T) RETURN CAST(n.s AS INTEGER) AS x, n.n AS t ORDER BY t SKIP 1 LIMIT 1")
+                .unwrap()
+                .rows;
         assert_eq!(num(&rows[0][0]), 5.0);
         // Sanity: WITHOUT the skip the n=1 row IS projected and the CAST faults.
         assert!(ok("MATCH (n:T) RETURN CAST(n.s AS INTEGER) AS x, n.n AS t ORDER BY t").is_err());

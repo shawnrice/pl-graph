@@ -965,6 +965,25 @@ pub enum Plan {
         on_create: Vec<(String, Expr)>,
         on_update: MergeUpdate,
     },
+    /// Keyed upsert of ONE edge between two vertices matched by their unique keys
+    /// (the `_MERGE` edge form, spec docs/design/gql-extensions.md §2 v1). Both
+    /// endpoints are resolved by the unique key inferred from `*_label`/`*_props`
+    /// (a missing endpoint is an error); the edge is keyed structurally by
+    /// (from, to, `etype`). Absent → create it with `edge_props`, then `on_create`.
+    /// Present → apply `on_update` (default: clobber the edge's props to
+    /// `edge_props`). The dispositions bind the start node at slot 0, the end node
+    /// at slot 1, and the edge at slot 2.
+    MergeEdge {
+        start_label: String,
+        start_props: Vec<(String, Value)>,
+        end_label: String,
+        end_props: Vec<(String, Value)>,
+        dir: Dir,
+        etype: String,
+        edge_props: Vec<(String, Value)>,
+        on_create: Vec<(usize, String, Expr)>,
+        on_update: MergeEdgeUpdate,
+    },
     /// An ISO GQL transaction-control command (`START TRANSACTION [READ ONLY|READ
     /// WRITE]`, `COMMIT [WORK]`, `ROLLBACK [WORK]`). Not a query — it drives the
     /// store's transaction frame and yields no rows. `read_only` is only meaningful
@@ -1003,6 +1022,24 @@ pub enum MergeUpdate {
         filter: Option<Expr>,
     },
     /// `_ON_UPDATE_NOTHING`: leave the existing node untouched.
+    Nothing,
+}
+
+/// The `_MERGE` edge-form update disposition when the edge already exists. Unlike
+/// [`MergeUpdate`], each assignment carries its target `slot` (0 = start node,
+/// 1 = end node, 2 = edge), since a disposition may write to either endpoint or the
+/// edge itself.
+#[derive(Clone, Debug)]
+pub enum MergeEdgeUpdate {
+    /// Default (bare `_MERGE`): set every edge property to the pattern's value.
+    Clobber,
+    /// `_ON_UPDATE SET … [WHERE p]`: apply exactly these assignments, gated by
+    /// `filter` (false → no-op, not an error).
+    Set {
+        assigns: Vec<(usize, String, Expr)>,
+        filter: Option<Expr>,
+    },
+    /// `_ON_UPDATE_NOTHING`: leave the existing edge untouched.
     Nothing,
 }
 

@@ -268,7 +268,8 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
         Plan::Insert { .. }
         | Plan::InsertReturn { .. }
         | Plan::AddEdge { .. }
-        | Plan::Merge { .. } => Card::approx(1.0),
+        | Plan::Merge { .. }
+        | Plan::MergeEdge { .. } => Card::approx(1.0),
     }
 }
 

@@ -1930,11 +1930,11 @@ impl Store {
             .collect();
         match covered.as_slice() {
             [] => Err(format!(
-                "E_MERGE: _MERGE on `{label}` has no applicable unique constraint"
+                "E_INVALID_GRAPH_OP: _MERGE on `{label}` has no applicable unique constraint"
             )),
             [one] => Ok((*one).clone()),
             _ => Err(format!(
-                "E_MERGE: _MERGE on `{label}` is ambiguous — the pattern touches several unique constraints"
+                "E_INVALID_GRAPH_OP: _MERGE on `{label}` is ambiguous — the pattern touches several unique constraints"
             )),
         }
     }

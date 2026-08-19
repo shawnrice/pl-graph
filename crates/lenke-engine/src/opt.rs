@@ -300,6 +300,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
         | Plan::Insert { .. }
         | Plan::InsertReturn { .. }
         | Plan::Merge { .. }
+        | Plan::MergeEdge { .. }
         | Plan::AddEdge { .. }
         | Plan::CallProcedure { .. }
         | Plan::TxControl { .. }) => (p, false),
@@ -1650,6 +1651,7 @@ fn width(plan: &Plan) -> usize {
         | Plan::Update { .. }
         | Plan::UpdateReturn { .. }
         | Plan::Merge { .. }
+        | Plan::MergeEdge { .. }
         | Plan::AddEdge { .. }
         | Plan::TxControl { .. } => 0,
 
@@ -2169,6 +2171,7 @@ mod tests {
             | Plan::Insert { .. }
             | Plan::InsertFrom { .. }
             | Plan::Merge { .. }
+            | Plan::MergeEdge { .. }
             | Plan::AddEdge { .. }
             | Plan::CallProcedure { .. }
             | Plan::TxControl { .. } => false,

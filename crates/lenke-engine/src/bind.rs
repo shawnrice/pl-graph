@@ -211,6 +211,23 @@ fn bind_plan(plan: &mut Plan, params: &HashMap<&str, &Value>) -> Result<(), Stri
                 }
             }
         }
+        Plan::MergeEdge {
+            on_create,
+            on_update,
+            ..
+        } => {
+            for (_, _, e) in on_create {
+                bind_expr(e, params)?;
+            }
+            if let crate::ir::MergeEdgeUpdate::Set { assigns, filter } = on_update {
+                for (_, _, e) in assigns {
+                    bind_expr(e, params)?;
+                }
+                if let Some(f) = filter {
+                    bind_expr(f, params)?;
+                }
+            }
+        }
 
         // Multi-input.
         Plan::Union { left, right, .. } | Plan::Join { left, right, .. } => {
