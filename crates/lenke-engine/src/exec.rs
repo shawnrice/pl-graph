@@ -4149,9 +4149,12 @@ fn try_late_materialize(
     let n = base.rows();
     let start = skip.unwrap_or(0).min(n);
     let end = start.saturating_add(limit).min(n);
-    if end >= n {
-        // The window is the whole set — a full projection is unavoidable; nothing
-        // to late-materialize.
+    if start == 0 && end >= n {
+        // The window is the WHOLE set (no skip, and the limit reaches the end) — a full
+        // projection is unavoidable; nothing to late-materialize. With a SKIP, though, the
+        // prefix `[0, start)` is dropped, so the window is NOT the whole set: late-
+        // materialize still projects only `[start, end)`, which also means a fallible
+        // projection never runs for a paged-out row (the reason to keep this path here).
         return Ok(None);
     }
     if end <= start {
@@ -22480,6 +22483,32 @@ mod tests {
         assert!(ok("MATCH (p:Person) RETURN CASE WHEN true THEN (2 + 'abc') END AS x").is_err());
         // A non-boolean WHEN reached before any match faults (a WHEN must be boolean).
         assert!(ok("MATCH (p:Person) RETURN CASE WHEN 5 THEN 1 ELSE 2 END AS x").is_err());
+    }
+
+    /// A SKIP whose window reaches the end of the data still late-materializes: only the
+    /// surviving `[skip, end)` rows are projected, so a FALLIBLE projection never runs for a
+    /// PAGED-OUT row. Previously `end >= n` bailed to a full projection and faulted on the
+    /// skipped rows even when no surviving row was ill-typed.
+    #[test]
+    fn skip_window_at_end_does_not_project_paged_out_rows() {
+        // Sorted by n: n=1 → s='abc' (a CAST-to-int fault), n=2 → s='5' (castable).
+        let nd = "{\"id\":\"1\",\"labels\":[\"T\"],\"props\":{\"n\":1,\"s\":\"abc\"}}\n\
+                  {\"id\":\"2\",\"labels\":[\"T\"],\"props\":{\"n\":2,\"s\":\"5\"}}";
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let ok = |q: &str| {
+            try_run(
+                &crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store),
+                &store,
+            )
+        };
+        // SKIP 1 LIMIT 1 → window [1, 2) is only the n=2 row (CAST('5')=5). The paged-out
+        // n=1 row (CAST('abc') would fault) is never evaluated.
+        let rows = ok("MATCH (n:T) RETURN CAST(n.s AS INTEGER) AS x, n.n AS t ORDER BY t SKIP 1 LIMIT 1")
+            .unwrap()
+            .rows;
+        assert_eq!(num(&rows[0][0]), 5.0);
+        // Sanity: WITHOUT the skip the n=1 row IS projected and the CAST faults.
+        assert!(ok("MATCH (n:T) RETURN CAST(n.s AS INTEGER) AS x, n.n AS t ORDER BY t").is_err());
     }
 
     /// A grouped aggregate over empty input emits ZERO rows (unlike the scalar

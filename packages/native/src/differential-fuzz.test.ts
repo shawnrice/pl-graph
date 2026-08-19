@@ -225,22 +225,21 @@ const UNARY_FN = [
 // 1e-21). That is a known, reported deviation, not something this fuzzer should
 // rediscover on every run. Every other math function agrees exactly.
 //
-// KNOWN ERROR-TIMING DEVIATIONS (both rare, both error-vs-value, NOT wrong answers).
-// They exist because the native engine is a columnar OPTIMIZER and pure-TS is a naive
-// row-by-row interpreter, so a genuine type error is evaluated over a different row-set:
-//   1. `(NOT <non-bool>) AND (<prop cmp numlit that matches no row>)` — the engine seeds
-//      the numeric conjunct via its typed-scan fast path, gets 0 rows, and never evaluates
-//      the `NOT` residual (empty batch → no error, the same short-circuit that makes
-//      `LIMIT 0 RETURN 1/0` safe) → []. TS evaluates `NOT` per row → throws. `NOT <non-bool>`
-//      ALONE throws in both.
-//   2. A fallible RETURN projection (`CAST(CASE …)`) under `ORDER BY … SKIP/LIMIT` — the
-//      engine projects ALL rows before paging, so a row that would be PAGED OUT but whose
-//      projection faults throws; TS pages first and only projects survivors.
-// Deferred deliberately: both fixes are architectural (evaluate the doomed conjunct
-// eagerly / defer projection past paging) and disproportionate to the pathological inputs.
-// Fixing either LATER is non-breaking (each relaxes an error into a value) — except newly
-// making #1 THROW, which only affects malformed queries. If a fuzzer run surfaces one of
-// these, it is expected, not a regression.
+// KNOWN ERROR-TIMING DEVIATION (rare, error-vs-value, NOT a wrong answer). It exists
+// because the native engine is a columnar OPTIMIZER and pure-TS is a naive row-by-row
+// interpreter, so a genuine type error is evaluated over a different row-set:
+//   `(NOT <non-bool>) AND (<prop cmp numlit that matches no row>)` — the engine seeds the
+//   numeric conjunct via its typed-scan fast path, gets 0 rows, and never evaluates the
+//   `NOT` residual (empty batch → no error, the same short-circuit that makes
+//   `LIMIT 0 RETURN 1/0` safe) → []. TS evaluates `NOT` per row → throws. `NOT <non-bool>`
+//   ALONE throws in both.
+// Deferred deliberately: the fix (evaluate the doomed conjunct eagerly) fights the typed-
+// scan seed optimization and is disproportionate to the pathological input. Fixing it later
+// is non-breaking in the lenient direction (both return []); only newly making it THROW is
+// a (malformed-query-only) breaking change. If a fuzzer run surfaces it, it is expected.
+// (The sibling paged-out-projection deviation — a fallible `CAST` under `ORDER BY … SKIP`
+// reaching the end — was FIXED: `try_late_materialize` now fires when a SKIP drops the
+// prefix, so only surviving rows are projected.)
 const BINARY_FN = [
   'mod',
   'log',
