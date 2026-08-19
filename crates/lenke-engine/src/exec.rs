@@ -666,7 +666,7 @@ fn run_insert_from(
 ) -> Result<(), String> {
     // Read phase: pull the rows and materialize every template property to an OWNED
     // per-row value vector, so the immutable borrow ends before the write phase.
-    let (node_props, edge_props, nrows) = {
+    let (node_props, edge_props, bound_ids, nrows) = {
         let batch = pull(input, store, needs_lineage(input))?;
         let nrows = batch.rows();
         let eval_props = |props: &[(String, Expr)]| -> Result<Vec<(String, Vec<Value>)>, String> {
@@ -686,7 +686,22 @@ fn run_insert_from(
             .iter()
             .map(|e| eval_props(&e.props))
             .collect::<Result<_, _>>()?;
-        (node_props, edge_props, nrows)
+        // A bound pattern node (`MATCH (a) INSERT (a)-[:E]->…`) resolves to the matched
+        // node ids at its slot — captured per row now, used instead of creating a node.
+        let bound_ids: Vec<Option<Vec<u32>>> = nodes
+            .iter()
+            .map(|n| {
+                n.bound
+                    .map(|slot| match batch.slot(slot) {
+                        Col::Nodes(ids) => Ok(ids.clone()),
+                        _ => Err(
+                            "INSERT references a bound variable that is not a node".to_string()
+                        ),
+                    })
+                    .transpose()
+            })
+            .collect::<Result<_, _>>()?;
+        (node_props, edge_props, bound_ids, nrows)
     };
     // Write phase: create every row's nodes/edges under one per-statement scope. A
     // string `id` property is the node's external identity (unique) — a duplicate
@@ -696,6 +711,11 @@ fn run_insert_from(
         for i in 0..nrows {
             let mut row_ids = Vec::with_capacity(nodes.len());
             for (t, n) in nodes.iter().enumerate() {
+                // A bound reference reuses the matched node's id; otherwise create one.
+                if let Some(ids) = &bound_ids[t] {
+                    row_ids.push(ids[i]);
+                    continue;
+                }
                 let labels: Vec<&str> = n.labels.iter().map(String::as_str).collect();
                 let props: Vec<(&str, Value)> = node_props[t]
                     .iter()
@@ -21213,6 +21233,26 @@ mod tests {
         };
         assert!(execute(&plan, &mut store).is_err());
         assert_eq!(store.node_count(), 0); // both rolled back
+    }
+
+    /// `MATCH (a),(b) INSERT (a)-[:E]->(b)` CONNECTS the matched nodes — a bare pattern node
+    /// naming a bound variable is a reference, not a fresh node. Previously it created two
+    /// NEW nodes and an edge between them, leaving the matched nodes untouched (which also
+    /// silently skipped their edge-cardinality constraints, since no edge reached them).
+    #[test]
+    fn insert_edge_between_bound_match_vars_connects_them() {
+        let nd = "{\"id\":\"1\",\"labels\":[\"A\"],\"props\":{\"id\":\"a1\"}}\n\
+                  {\"id\":\"2\",\"labels\":[\"B\"],\"props\":{\"id\":\"b1\"}}";
+        let mut store = crate::ndjson::from_ndjson(nd).unwrap();
+        let plan = crate::opt::optimize_indexed(
+            crate::gql::parse("MATCH (a:A {id:'a1'}), (b:B {id:'b1'}) INSERT (a)-[:E]->(b)")
+                .unwrap(),
+            &store,
+        );
+        execute(&plan, &mut store).unwrap();
+        // No new nodes (still 2), exactly one edge, and it joins the two MATCHED nodes.
+        assert_eq!(store.node_count(), 2);
+        assert_eq!(store.edge_count(), 1);
     }
 
     /// A `SET` that collides with a unique constraint is REJECTED and rolled back —

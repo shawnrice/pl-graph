@@ -2190,9 +2190,28 @@ impl Parser {
                 }
                 return Ok(idx);
             }
+            // A bare `(v)` naming a variable BOUND by an enclosing MATCH references that
+            // matched node — `MATCH (a),(b) INSERT (a)-[:E]->(b)` connects them, it does not
+            // create fresh nodes. Labels/properties on a bound reference are not supported.
+            if labels.is_empty() && props.is_empty() {
+                if let Some(&slot) = self.scope.get(v) {
+                    let idx = nodes.len();
+                    nodes.push(crate::ir::InsertNodeExpr {
+                        labels,
+                        props,
+                        bound: Some(slot),
+                    });
+                    var_to_idx.insert(v.clone(), idx);
+                    return Ok(idx);
+                }
+            }
         }
         let idx = nodes.len();
-        nodes.push(crate::ir::InsertNodeExpr { labels, props });
+        nodes.push(crate::ir::InsertNodeExpr {
+            labels,
+            props,
+            bound: None,
+        });
         if let Some(v) = var {
             var_to_idx.insert(v, idx);
         }

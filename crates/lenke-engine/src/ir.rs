@@ -1055,6 +1055,11 @@ pub struct InsertEdge {
 pub struct InsertNodeExpr {
     pub labels: Vec<String>,
     pub props: Vec<(String, Expr)>,
+    /// `Some(slot)` when this pattern node REFERENCES a variable already bound by an
+    /// enclosing MATCH (e.g. `MATCH (a),(b) INSERT (a)-[:E]->(b)` connects the matched
+    /// nodes) — the exec reads the node id from that slot per row instead of creating a
+    /// new node. `None` = create a fresh node from `labels`/`props`.
+    pub bound: Option<usize>,
 }
 
 /// An edge to create in an `InsertFrom`, per input row: a typed relationship from
