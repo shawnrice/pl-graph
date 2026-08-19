@@ -3844,16 +3844,24 @@ impl Parser {
     /// IN … END` *expression* (parsed in `expr`), which this never reaches: here the
     /// binding value runs to the next clause, with no `IN`/`END`.
     fn let_clause(&mut self, plan: Plan) -> Result<Plan, String> {
+        // Bindings are SEQUENTIAL, left-to-right (ISO): a later binding sees the
+        // earlier ones in the SAME LET (`LET x = p.age, y = x + 1`). Each parsed
+        // binding is pushed onto the inline-`lets` stack so a following reference
+        // substitutes it (`y`'s expr becomes `p.age + 1`); the stack is truncated
+        // after the loop, since the LET-clause names become COLUMNS, not inline locals.
+        let let_base = self.lets.len();
         let mut new_binds: Vec<(String, Expr)> = Vec::new();
         loop {
             let name = self.ident()?;
             self.expect(&Tok::Eq)?;
             let e = self.expr()?;
+            self.lets.push((name.clone(), e.clone()));
             new_binds.push((name, e));
             if !self.eat(&Tok::Comma) {
                 break;
             }
         }
+        self.lets.truncate(let_base);
         // Pass every existing binding through, in slot order (a HashMap iteration is
         // unordered — the slot index is the stable key), then append the new ones.
         let mut existing: Vec<(usize, String)> =
