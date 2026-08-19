@@ -14153,7 +14153,9 @@ fn call_scalar_checked(name: &str, args: &[Value]) -> Result<Value, String> {
     // (a string, bool, temporal, list) is a data exception, never coerced (the same
     // SQL rule as arithmetic and the temporal accessors above). `sqrt('1e300')`
     // throws rather than silently returning NULL or coercing the string. A NULL arg
-    // still propagates to NULL inside `call_scalar`.
+    // still propagates to NULL inside `call_scalar`. Unlike an arithmetic OPERATOR
+    // (which propagates null before type-checking), a named function VALIDATES its
+    // non-null arguments even beside a null: `atan2(null, duration)` is a type error.
     if matches!(
         name,
         "abs"

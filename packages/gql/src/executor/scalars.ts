@@ -748,7 +748,14 @@ export const callScalar = (
   const binaryNum = BINARY_NUM[name];
 
   if (binaryNum) {
-    return isNullish(a) || isNullish(b) ? null : binaryNum(numArg(a), numArg(b));
+    // Validate BOTH non-null arguments before the null short-circuit: a named numeric
+    // function faults on a non-numeric argument even beside a null (`atan2(null, duration)`
+    // is a type error), matching the engine's gate. An arithmetic OPERATOR differs — it
+    // propagates null before type-checking (see `arithStep`).
+    const na = isNullish(a) ? null : numArg(a);
+    const nb = isNullish(b) ? null : numArg(b);
+
+    return na === null || nb === null ? null : binaryNum(na, nb);
   }
 
   if (name in NUM_CONSTANTS) {
@@ -760,17 +767,8 @@ export const callScalar = (
   }
 
   switch (name) {
-    case 'round': {
-      // round(num, [digits]) — digits default 0; half away from zero.
-      if (isNullish(a)) {
-        return null;
-      }
-
-      const digits = isNullish(b) ? 0 : Math.trunc(numArg(b));
-      const f = 10 ** digits;
-
-      return roundHalfAway(numArg(a) * f) / f;
-    }
+    case 'round':
+      return roundScalar(a, b);
     // `cardinality` is the ISO GQL / SQL name; `size` is the openCypher spelling.
     case 'cardinality':
     case 'size':
@@ -896,6 +894,24 @@ export const toFloatScalar = (a: unknown): number | null => {
 
   // Number, boolean, or string only — see the note in `toIntScalar`.
   return typeof a === 'string' ? numericStringToFloat(a) : null;
+};
+
+// `round(num, [digits])` — digits default 0; half away from zero. A non-null `digits` is
+// validated BEFORE the null short-circuit, so `round(null, 'abc')` faults like the engine
+// (a named function validates its non-null args even beside a null).
+export const roundScalar = (a: unknown, b: unknown): number | null => {
+  if (!isNullish(b)) {
+    numArg(b);
+  }
+
+  if (isNullish(a)) {
+    return null;
+  }
+
+  const digits = isNullish(b) ? 0 : Math.trunc(numArg(b));
+  const f = 10 ** digits;
+
+  return roundHalfAway(numArg(a) * f) / f;
 };
 
 export const substringScalar = (a: unknown, b: unknown, len: unknown): string | null => {

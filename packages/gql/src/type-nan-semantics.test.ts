@@ -48,6 +48,20 @@ describe('GQL type/NaN semantics (the reference the Rust engine matches)', () =>
     expect(v(`null / 0`)).toBe(null);
   });
 
+  test('a named numeric function validates non-null args even beside a null', () => {
+    // Unlike an arithmetic OPERATOR (null-first), a named function faults on a non-numeric
+    // argument even when another argument is null — `atan2(null, duration)` is a type error,
+    // matching the engine's gate. A null beside a VALID-typed arg still propagates to null.
+    const v = (e: string): unknown =>
+      query(fixture(), `MATCH (n:T) RETURN ${e} AS x LIMIT 1`)[0].x;
+    expect(() => v(`atan2(null, duration('P1Y'))`)).toThrow(/number/i);
+    expect(() => v(`power(null, 'abc')`)).toThrow(/number/i);
+    expect(() => v(`round(null, 'abc')`)).toThrow(/number/i);
+    // A null beside a valid number still short-circuits to null.
+    expect(v(`atan2(null, 5)`)).toBe(null);
+    expect(v(`round(5, null)`)).toBe(5);
+  });
+
   test('min/max use the total order: max keeps NaN (largest), min skips it', () => {
     // sqrt(score) over [-1, 4, 9] → [NaN, 2, 3]. Total order (NaN last): max is
     // NaN, min is 2 — deterministic regardless of scan order.
