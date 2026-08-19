@@ -224,6 +224,23 @@ const UNARY_FN = [
 // engines differ in the last ulp (`power(1e-7, 3)` → 9.999999999999997e-22 vs
 // 1e-21). That is a known, reported deviation, not something this fuzzer should
 // rediscover on every run. Every other math function agrees exactly.
+//
+// KNOWN ERROR-TIMING DEVIATIONS (both rare, both error-vs-value, NOT wrong answers).
+// They exist because the native engine is a columnar OPTIMIZER and pure-TS is a naive
+// row-by-row interpreter, so a genuine type error is evaluated over a different row-set:
+//   1. `(NOT <non-bool>) AND (<prop cmp numlit that matches no row>)` — the engine seeds
+//      the numeric conjunct via its typed-scan fast path, gets 0 rows, and never evaluates
+//      the `NOT` residual (empty batch → no error, the same short-circuit that makes
+//      `LIMIT 0 RETURN 1/0` safe) → []. TS evaluates `NOT` per row → throws. `NOT <non-bool>`
+//      ALONE throws in both.
+//   2. A fallible RETURN projection (`CAST(CASE …)`) under `ORDER BY … SKIP/LIMIT` — the
+//      engine projects ALL rows before paging, so a row that would be PAGED OUT but whose
+//      projection faults throws; TS pages first and only projects survivors.
+// Deferred deliberately: both fixes are architectural (evaluate the doomed conjunct
+// eagerly / defer projection past paging) and disproportionate to the pathological inputs.
+// Fixing either LATER is non-breaking (each relaxes an error into a value) — except newly
+// making #1 THROW, which only affects malformed queries. If a fuzzer run surfaces one of
+// these, it is expected, not a regression.
 const BINARY_FN = [
   'mod',
   'log',

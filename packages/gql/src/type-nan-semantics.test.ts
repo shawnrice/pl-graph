@@ -38,8 +38,7 @@ describe('GQL type/NaN semantics (the reference the Rust engine matches)', () =>
     // null regardless of the other operand's type. The type error only fires when NEITHER
     // side is null. So `true + 1` throws (above), but `null + true` / `null - 'abc'` are
     // null, NOT a type error.
-    const v = (e: string): unknown =>
-      query(fixture(), `MATCH (n:T) RETURN ${e} AS x LIMIT 1`)[0].x;
+    const v = (e: string): unknown => query(fixture(), `MATCH (n:T) RETURN ${e} AS x LIMIT 1`)[0].x;
     expect(v(`null - 'abc'`)).toBe(null);
     expect(v(`null + true`)).toBe(null);
     expect(v(`null - [1, 2]`)).toBe(null);
@@ -52,8 +51,7 @@ describe('GQL type/NaN semantics (the reference the Rust engine matches)', () =>
     // Unlike an arithmetic OPERATOR (null-first), a named function faults on a non-numeric
     // argument even when another argument is null — `atan2(null, duration)` is a type error,
     // matching the engine's gate. A null beside a VALID-typed arg still propagates to null.
-    const v = (e: string): unknown =>
-      query(fixture(), `MATCH (n:T) RETURN ${e} AS x LIMIT 1`)[0].x;
+    const v = (e: string): unknown => query(fixture(), `MATCH (n:T) RETURN ${e} AS x LIMIT 1`)[0].x;
     expect(() => v(`atan2(null, duration('P1Y'))`)).toThrow(/number/i);
     expect(() => v(`power(null, 'abc')`)).toThrow(/number/i);
     expect(() => v(`round(null, 'abc')`)).toThrow(/number/i);
