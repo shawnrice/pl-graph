@@ -75,9 +75,11 @@ export const BOOL3: Record<'and' | 'or' | 'xor', (a: Truth, b: Truth) => Truth> 
   xor: xor3,
 };
 
-/** Raise an ISO data exception (SQLSTATE class 22): a runtime value/type fault. */
+/** Raise a runtime value/type fault. Uses `E_INVALID_VALUE` — the single code the native
+ *  engine surfaces for every runtime evaluation error at its FFI boundary — so a caught
+ *  error carries the same `code` from the pure-TS and native engines (a drop-in must). */
 export const dataException = (message: string): never => {
-  throw new LenkeError(message, { code: ErrorCode.DataException });
+  throw new LenkeError(message, { code: ErrorCode.InvalidValue });
 };
 
 /** Lexicographic compare of two field-name strings (matches the native key sort). */
@@ -588,7 +590,7 @@ export const unsupportedTemporalAgg = (): LenkeError =>
     "unsupported temporal aggregate: sum() is defined only for DURATION (dates/times aren't " +
       'summable), and avg() over DURATION would need duration/count (often non-representable, ' +
       'e.g. avg(P1M,P2M)=P1.5M); use min()/max(), or sum() + host division',
-    { code: ErrorCode.DataException },
+    { code: ErrorCode.InvalidValue },
   );
 
 /** `sum`/`avg` over a list/map is not numeric — throw loud rather than element-sum
@@ -597,7 +599,7 @@ export const nonNumericAgg = (): LenkeError =>
   new LenkeError(
     'sum()/avg() require numeric values; a list/map is not summable — reduce it first ' +
       '(Gremlin sum(local), or GQL UNWIND + sum)',
-    { code: ErrorCode.DataException },
+    { code: ErrorCode.InvalidValue },
   );
 
 /** `sum` over gathered temporal values: fold DURATIONs via the same `dur + dur`

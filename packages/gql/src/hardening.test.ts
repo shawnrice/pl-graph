@@ -405,14 +405,14 @@ describe('hardening: ISO data exceptions in arithmetic', () => {
   for (const q of ['RETURN 1 / 0 AS r', 'RETURN 5 % 0 AS r', 'RETURN 1.0 / 0 AS r']) {
     test(`division by zero raises: ${q}`, () => {
       const e = thrown(() => query(g0, q));
-      expect(hasErrorCode(e, ErrorCode.DataException)).toBe(true);
+      expect(hasErrorCode(e, ErrorCode.InvalidValue)).toBe(true);
     });
   }
 
   for (const q of ["RETURN 'abc' + 1 AS r", 'RETURN true * 2 AS r']) {
     test(`non-numeric operand raises: ${q}`, () => {
       const e = thrown(() => query(g0, q));
-      expect(hasErrorCode(e, ErrorCode.DataException)).toBe(true);
+      expect(hasErrorCode(e, ErrorCode.InvalidValue)).toBe(true);
     });
   }
 

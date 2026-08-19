@@ -1393,7 +1393,18 @@ const typeRank = (v: unknown): number => {
     case 'boolean':
       return 2;
     default:
-      return isTemporal(v) ? 3 : 4; // temporal, then graph elements/lists/objects
+      // Num < Str < Bool < Temporal < List < Record < Map < Null — the SAME cross-type
+      // total order as the native engine's `Value::rank`, so `list_sort`/ORDER BY/min/max
+      // over a mixed-compound column agree (e.g. a list sorts before a map).
+      if (isTemporal(v)) {
+        return 3;
+      }
+
+      if (Array.isArray(v)) {
+        return 4;
+      }
+
+      return v instanceof LenkeRecord ? 5 : 6; // Record, then Map / plain object
   }
 };
 

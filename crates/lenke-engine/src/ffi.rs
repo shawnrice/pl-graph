@@ -558,7 +558,13 @@ pub unsafe extern "C" fn lnk_query(
             let plan = match crate::gql::parse_with_params(q, &params) {
                 Ok(plan) => plan,
                 Err(e) => {
-                    crate::ffi_error::set("E_SYNTAX", &e);
+                    // A genuine parse error is E_SYNTAX; an unknown function name (caught
+                    // while resolving the call) carries its own more specific code.
+                    if let Some(rest) = e.strip_prefix("E_UNKNOWN_FUNCTION: ") {
+                        crate::ffi_error::set("E_UNKNOWN_FUNCTION", rest);
+                    } else {
+                        crate::ffi_error::set("E_SYNTAX", &e);
+                    }
                     return std::ptr::null_mut();
                 }
             };
@@ -583,7 +589,13 @@ pub unsafe extern "C" fn lnk_query(
             let plan = match crate::gremlin::parse(q) {
                 Ok(plan) => plan,
                 Err(e) => {
-                    crate::ffi_error::set("E_SYNTAX", &e);
+                    // A genuine parse error is E_SYNTAX; an unknown function name (caught
+                    // while resolving the call) carries its own more specific code.
+                    if let Some(rest) = e.strip_prefix("E_UNKNOWN_FUNCTION: ") {
+                        crate::ffi_error::set("E_UNKNOWN_FUNCTION", rest);
+                    } else {
+                        crate::ffi_error::set("E_SYNTAX", &e);
+                    }
                     return std::ptr::null_mut();
                 }
             };

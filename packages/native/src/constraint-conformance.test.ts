@@ -833,7 +833,7 @@ suite('graph-level invariant differential (TS vs native)', () => {
 // Round 15: a temporal value ANYWHERE in a numeric aggregate makes it
 // unrepresentable — a heterogeneous numeric+temporal column must throw, not
 // silently coerce the temporal to null (native faulted per-value; TS only checked
-// the first row). Both engines now throw E_DATA_EXCEPTION identically.
+// the first row). Both engines now throw E_INVALID_VALUE identically.
 suite('temporal-in-aggregate differential (TS vs native)', () => {
   const MIXED = [
     '{"type":"node","id":"a","labels":["P"],"properties":{"k":5}}',
@@ -850,7 +850,7 @@ suite('temporal-in-aggregate differential (TS vs native)', () => {
       const native = outcome(() => nativeGraph.query(q));
 
       expect(native).toEqual(ts);
-      expect(native).toEqual({ code: 'E_DATA_EXCEPTION' });
+      expect(native).toEqual({ code: 'E_INVALID_VALUE' });
     });
   }
 });
@@ -874,7 +874,7 @@ suite('list-in-aggregate differential (TS vs native)', () => {
   };
 
   for (const agg of ['sum', 'avg']) {
-    test(`${agg}() over a list column throws E_DATA_EXCEPTION on both engines`, () => {
+    test(`${agg}() over a list column throws E_INVALID_VALUE on both engines`, () => {
       const { tsGraph, nativeGraph } = seed([`INSERT (:P {k: [3]})`, `INSERT (:P {k: [1]})`]);
       const q = `MATCH (n:P) RETURN ${agg}(n.k) AS v`;
 
@@ -882,7 +882,7 @@ suite('list-in-aggregate differential (TS vs native)', () => {
       const native = outcome(() => nativeGraph.query(q));
 
       expect(native).toEqual(ts);
-      expect(native).toEqual({ code: 'E_DATA_EXCEPTION' });
+      expect(native).toEqual({ code: 'E_INVALID_VALUE' });
     });
   }
 

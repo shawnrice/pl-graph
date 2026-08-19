@@ -5494,7 +5494,10 @@ impl Parser {
             "substring" => args.len() == 2 || args.len() == 3,
             // variadic (≥1)
             "coalesce" => !args.is_empty(),
-            _ => return Err(format!("unknown function `{name}`")),
+            // Prefixed so the FFI codes it `E_UNKNOWN_FUNCTION` (more specific than the
+            // generic parse `E_SYNTAX`), matching the pure-TS engine — a caught error tells
+            // the host it was an unknown name, not a malformed query.
+            _ => return Err(format!("E_UNKNOWN_FUNCTION: unknown function `{name}`")),
         };
         if !arity_ok {
             return Err(format!(

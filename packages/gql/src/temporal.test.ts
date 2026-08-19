@@ -190,7 +190,7 @@ describe('GQL: temporal arithmetic', () => {
     expect(String(query(g, `RETURN DURATION 'P10D' * 2 AS d`)[0].d)).toBe('P20D');
   });
 
-  test('a date arithmetic result outside the representable range raises E_DATA_EXCEPTION', () => {
+  test('a date arithmetic result outside the representable range raises E_INVALID_VALUE', () => {
     const g = new Graph();
 
     // A LocalDate is i32 days from 1970 (≈±5.88M years), so an astronomical shift
@@ -206,7 +206,7 @@ describe('GQL: temporal arithmetic', () => {
       expect(
         hasErrorCode(
           thrown(() => query(g, q)),
-          ErrorCode.DataException,
+          ErrorCode.InvalidValue,
         ),
       ).toBe(true);
     }
