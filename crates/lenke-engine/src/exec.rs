@@ -4864,26 +4864,47 @@ fn fold_grouped(
             tally.into_iter().map(Value::Num).collect()
         }
         AggFn::Sum | AggFn::Avg => {
-            // total + count of non-null NUMERIC values. A non-null NON-numeric value
-            // (duration/date/string/list) is a DATA EXCEPTION — sum()/avg() never
-            // coerce (the same SQL rule as binary arithmetic). NULLs are skipped. SUM
-            // of an empty/all-null group is 0, AVG is NULL (no values to divide).
+            use crate::temporal::{Duration, Temporal};
+            // total + count of non-null NUMERIC values. SUM ALSO folds a group of DURATIONs
+            // component-wise (ISO-8601 duration addition is always well-defined — months,
+            // days, seconds and nanos add independently; only an i64 overflow faults). AVG
+            // cannot: dividing months by an arbitrary count is ill-defined, so a duration
+            // under AVG stays a DATA EXCEPTION. A group that MIXES numbers and durations, a
+            // non-DURATION temporal (date/time), or any other non-null non-numeric value is
+            // a data exception — sum()/avg() never coerce (the SQL rule of binary
+            // arithmetic). NULLs are skipped. SUM of an empty/all-null group is 0, AVG NULL.
             let mut total = vec![0f64; n_groups];
             let mut cnt = vec![0u64; n_groups];
+            let mut dur: Vec<Option<Duration>> = vec![None; n_groups];
             for (i, &g) in group_of.iter().enumerate() {
+                let g = g as usize;
                 match col.value_at(i) {
                     Value::Null => {}
                     Value::Num(x) => {
-                        total[g as usize] += x;
-                        cnt[g as usize] += 1;
+                        if dur[g].is_some() {
+                            return Err("sum() cannot mix numbers and durations".into());
+                        }
+                        total[g] += x;
+                        cnt[g] += 1;
+                    }
+                    Value::Temporal(Temporal::Duration(d)) if agg.func == AggFn::Sum => {
+                        if cnt[g] > 0 {
+                            return Err("sum() cannot mix numbers and durations".into());
+                        }
+                        dur[g] = Some(match dur[g] {
+                            Some(acc) => acc
+                                .add(&d)
+                                .ok_or_else(|| "duration sum is out of range".to_string())?,
+                            None => d,
+                        });
                     }
                     // A Gremlin multi-key `values('v','k')` arg is a LIST — flatten it,
                     // summing each numeric element (skipping non-numeric/null).
                     Value::List(items) if agg.null_on_empty => {
                         for el in &items {
                             if let Value::Num(x) = el {
-                                total[g as usize] += x;
-                                cnt[g as usize] += 1;
+                                total[g] += x;
+                                cnt[g] += 1;
                             }
                         }
                     }
@@ -4895,7 +4916,9 @@ fn fold_grouped(
             }
             (0..n_groups)
                 .map(|g| {
-                    if agg.func == AggFn::Sum {
+                    if let Some(d) = dur[g] {
+                        Value::Temporal(Temporal::Duration(d)) // SUM of durations
+                    } else if agg.func == AggFn::Sum {
                         if cnt[g] == 0 && agg.null_on_empty {
                             Value::Null // Gremlin sum() of nothing is NULL
                         } else {
@@ -22318,6 +22341,33 @@ mod tests {
         assert_eq!(num(&out.rows[0][0]), 0.0); // count(*) = 0
         assert_eq!(num(&out.rows[0][1]), 0.0); // sum = 0
         assert!(out.rows[0][2].is_null()); // avg = NULL
+    }
+
+    /// SUM folds a group of DURATIONs component-wise (ISO-8601 addition is total — months
+    /// and days add independently, no normalization). AVG over durations (fractional months
+    /// are ill-defined), a mixed number+duration group, and a non-DURATION temporal fault.
+    #[test]
+    fn sum_over_durations_folds_component_wise() {
+        let nd = "{\"id\":\"1\",\"labels\":[\"T\"],\"props\":{\"d\":{\"@duration\":\"P1M\"}}}\n\
+                  {\"id\":\"2\",\"labels\":[\"T\"],\"props\":{\"d\":{\"@duration\":\"P2M\"}}}\n\
+                  {\"id\":\"3\",\"labels\":[\"T\"],\"props\":{\"d\":{\"@duration\":\"P1D\"}}}";
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let ok = |q: &str| {
+            try_run(
+                &crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store),
+                &store,
+            )
+        };
+        // P1M + P2M + P1D = P3M1D — months (3) and days (1) accumulate independently.
+        match &ok("MATCH (n:T) RETURN sum(n.d) AS x").unwrap().rows[0][0] {
+            Value::Temporal(crate::temporal::Temporal::Duration(d)) => {
+                assert_eq!((d.months, d.days, d.secs), (3, 1, 0));
+            }
+            other => panic!("want a duration, got {other:?}"),
+        }
+        // AVG over durations faults; a non-DURATION temporal in SUM faults.
+        assert!(ok("MATCH (n:T) RETURN avg(n.d) AS x").is_err());
+        assert!(ok("MATCH (n:T) RETURN sum(date('2020-01-01')) AS x").is_err());
     }
 
     /// A grouped aggregate over empty input emits ZERO rows (unlike the scalar
