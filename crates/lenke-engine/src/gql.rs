@@ -1257,7 +1257,16 @@ impl Parser {
             if !has_agg {
                 for it in &items {
                     if let RetItem::Key(name, e) = it {
-                        self.lets.push((name.clone(), e.clone()));
+                        // Do NOT shadow a bound graph variable that is projected bare
+                        // (`RETURN a … ORDER BY a.name`): `a.name` must read the node's
+                        // property from the binding scope, and bare `ORDER BY a` already
+                        // takes the visible-column fast path in `order_keys`. Inlining `a`
+                        // here would resolve it to its output column and orphan the
+                        // trailing `.name`. Only inline aliases that are NOT graph vars
+                        // (computed expressions like `RETURN u.n AS a … ORDER BY a * 2`).
+                        if !self.scope.contains_key(name) {
+                            self.lets.push((name.clone(), e.clone()));
+                        }
                     }
                 }
             }
