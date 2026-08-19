@@ -569,8 +569,10 @@ export const BINARY_NUM: Record<string, (x: number, y: number) => number> = {
   mod: (x, y) => x % y,
   log: (base, value) => Math.log(value) / Math.log(base),
   // atan2(y, x): the ISO GQL binary arctangent (quadrant-correct). Mirrors the
-  // native `y.atan2(x)`.
-  atan2: (y, x) => Math.atan2(y, x),
+  // native `y.atan2(x)`. atan2 is the one math fn whose result distinguishes the sign
+  // of a zero operand (`atan2(-0, -1) = -PI` vs `+PI`); we treat -0 and +0 as one value,
+  // so fold -0 to +0 on both inputs (`+ 0`), exactly as the native engine does.
+  atan2: (y, x) => Math.atan2(y + 0, x + 0),
 };
 
 /** The loud data exception for `avg` over a temporal, or `sum` over a
@@ -974,8 +976,8 @@ export const replaceScalar = (a: unknown, b: unknown, repl: unknown): string | n
 };
 
 // ISO GQL `to_boolean`: bool → itself; number → (x != 0), NaN → null; string →
-// case-insensitive true/false variants ('true'/'yes'/'1' | 'false'/'no'/'0'),
-// anything else → null. Mirrors the Rust `ToBoolean` arm.
+// case-insensitive 'true'/'false' only, anything else → null (no 'yes'/'no'/'1'/'0'
+// coercion). Mirrors the Rust `to_boolean_fn` arm.
 export const toBooleanScalar = (a: unknown): boolean | null => {
   if (isNullish(a)) {
     return null;
@@ -1001,13 +1003,16 @@ export const toBooleanScalar = (a: unknown): boolean | null => {
     return null;
   }
 
+  // Only the two boolean literals convert (case-insensitive, trimmed) — matching the
+  // native engine. `'yes'`/`'no'`/`'1'`/`'0'` are NOT booleans; they yield null (an
+  // invalid conversion), not a JS-style coercion. Use CAST for a checked conversion.
   const t = a.trim().toLowerCase();
 
-  if (t === 'true' || t === 'yes' || t === '1') {
+  if (t === 'true') {
     return true;
   }
 
-  return t === 'false' || t === 'no' || t === '0' ? false : null;
+  return t === 'false' ? false : null;
 };
 
 // Parse a string to a number the way Rust's `str::parse::<f64>()` does — what the engine's

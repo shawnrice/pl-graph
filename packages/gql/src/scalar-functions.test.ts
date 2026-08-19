@@ -277,7 +277,11 @@ describe('GQL: byte-identity regressions from the differential fuzzer', () => {
     expect(val(`RETURN to_integer('42') AS x`)).toBe(42);
     expect(val(`RETURN to_integer(3.9) AS x`)).toBe(3);
     expect(val(`RETURN to_float('1.5') AS x`)).toBe(1.5);
-    expect(val(`RETURN to_boolean('yes') AS x`)).toBe(true);
+    expect(val(`RETURN to_boolean('true') AS x`)).toBe(true);
+    // Only 'true'/'false' convert — 'yes'/'no'/'1'/'0' are not booleans (→ null),
+    // matching the native engine (no JS-style coercion).
+    expect(val(`RETURN to_boolean('yes') AS x`)).toBe(null);
+    expect(val(`RETURN to_boolean('0') AS x`)).toBe(null);
   });
 
   test('a numeric string that overflows to Infinity is not a number', () => {
