@@ -2903,6 +2903,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             yields,
             outer_width,
             optional,
+            parts,
         } => {
             // Inline correlated (lateral) subquery: run `body` over the outer rows
             // (it is rooted at `Plan::Row`, which yields them), then emit one row
@@ -2919,6 +2920,11 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             let mut seed_slots = outer.slots.clone();
             seed_slots.push(Col::Num((0..n).map(|i| i as f64).collect()));
             let seed = Batch::of(seed_slots);
+            if !parts.is_empty() {
+                return call_inline_setop(
+                    store, &outer, &seed, ow, n, body, yields, parts, *optional,
+                );
+            }
             let sub = pull_body(body, store, &seed)?;
             let mut out_slots: Vec<Col> = (0..ow).map(|i| sub.slot(i).clone()).collect();
             for (_, e) in yields {
@@ -14322,9 +14328,154 @@ fn concat_cols(cols: &[&Col]) -> Col {
     }
 }
 
+/// The per-outer-row set-op combine for an inline CALL body with a `UNION`/`EXCEPT`/
+/// `INTERSECT` tail. Each arm is provenance-tagged; its yield tuples are grouped by the
+/// outer row that produced them, then combined left-associatively PER GROUP with the same
+/// multiset semantics as the top-level set operators. Output rows are laid out in outer
+/// order: each outer row's combined tuples (or one NULL-yield row under OPTIONAL when its
+/// group is empty). The outer columns are gathered natively (kept as Nodes/Edges cols) so
+/// downstream `x.name` still resolves; the yield columns are materialized (`Gen`) like the
+/// top-level set-op, which is what the dedup keys already compare.
+#[allow(clippy::too_many_arguments)]
+fn call_inline_setop(
+    store: &Store,
+    outer: &Batch,
+    seed: &Batch,
+    ow: usize,
+    n: usize,
+    body: &Plan,
+    yields: &[(String, Expr)],
+    parts: &[crate::ir::CallPart],
+    optional: bool,
+) -> Result<Batch, String> {
+    let ny = yields.len();
+    let key_of = |t: &[Value]| -> Vec<u8> {
+        let mut buf = Vec::new();
+        for v in t {
+            value::group_key_into(v, &mut buf);
+        }
+        buf
+    };
+    // Collect one arm's yield tuples, grouped by provenance (the outer row index each
+    // sub-row came from). A fresh-scan arm carries prov through the cross-join too.
+    let collect =
+        |arm_body: &Plan, arm_yields: &[(String, Expr)]| -> Result<Vec<Vec<Vec<Value>>>, String> {
+            let sub = pull_body(arm_body, store, seed)?;
+            let ycols: Vec<Col> = arm_yields
+                .iter()
+                .map(|(_, e)| eval(e, store, &sub))
+                .collect::<Result<_, _>>()?;
+            let prov = sub.slot(ow);
+            let mut groups: Vec<Vec<Vec<Value>>> = vec![Vec::new(); n];
+            for r in 0..sub.rows() {
+                let p = match prov.value_at(r) {
+                    Value::Num(x) => x as usize,
+                    _ => continue,
+                };
+                if p < n {
+                    groups[p].push(ycols.iter().map(|c| render_cell(c, r, store)).collect());
+                }
+            }
+            Ok(groups)
+        };
+    let mut acc = collect(body, yields)?;
+    for part in parts {
+        let rhs = collect(&part.body, &part.yields)?;
+        for (p, rgroup) in rhs.into_iter().enumerate() {
+            let lgroup = std::mem::take(&mut acc[p]);
+            acc[p] = combine_call_groups(part.op, part.all, lgroup, rgroup, &key_of);
+        }
+    }
+    // Lay out output rows in outer order: each group's tuples, then a NULL-yield row
+    // under OPTIONAL for an empty group.
+    let mut provs: Vec<usize> = Vec::new();
+    let mut ycols_out: Vec<Vec<Value>> = vec![Vec::new(); ny];
+    for (p, group) in acc.iter().enumerate() {
+        if group.is_empty() {
+            if optional {
+                provs.push(p);
+                for col in ycols_out.iter_mut() {
+                    col.push(Value::Null);
+                }
+            }
+            continue;
+        }
+        for tuple in group {
+            provs.push(p);
+            for (k, v) in tuple.iter().enumerate() {
+                ycols_out[k].push(v.clone());
+            }
+        }
+    }
+    let mut out_slots: Vec<Col> = (0..ow).map(|j| outer.slot(j).gather(&provs)).collect();
+    for col in ycols_out {
+        out_slots.push(Col::Gen(col));
+    }
+    Ok(Batch::of(out_slots))
+}
+
+/// Combine two provenance groups' yield tuples under one set operator — the multiset
+/// rules of the top-level `Plan::Union` exec, applied within a single outer-row group.
+fn combine_call_groups(
+    op: crate::ir::CombineOp,
+    all: bool,
+    mut l: Vec<Vec<Value>>,
+    r: Vec<Vec<Value>>,
+    key_of: &impl Fn(&[Value]) -> Vec<u8>,
+) -> Vec<Vec<Value>> {
+    use crate::ir::CombineOp;
+    match op {
+        CombineOp::Union => {
+            l.extend(r);
+            if !all {
+                let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
+                l.retain(|t| seen.insert(key_of(t)));
+            }
+            l
+        }
+        CombineOp::Except | CombineOp::Intersect => {
+            let mut rkeys: FnvSet<Vec<u8>> = FnvSet::default();
+            for t in &r {
+                rkeys.insert(key_of(t));
+            }
+            let want_present = matches!(op, CombineOp::Intersect);
+            let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
+            let mut out = Vec::new();
+            for t in l {
+                let k = key_of(&t);
+                if rkeys.contains(&k) == want_present && seen.insert(k) {
+                    out.push(t);
+                }
+            }
+            out
+        }
+    }
+}
+
 fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> {
     Ok(match plan {
         Plan::Row => seed.clone(),
+        // A correlated fresh Scan (a CALL set-op arm that starts from `(x:Label)` rather
+        // than a scope variable): cross-join every seed row with every matching node,
+        // appending the node at the next slot. Ignores its position as a "leaf" — the
+        // seed IS its input, so the prov column the seed carries fans out with it.
+        Plan::Scan { label } => {
+            let nodes: Vec<u32> = match label {
+                Some(l) => store.nodes_with_label(l).to_vec(),
+                None => (0..store.node_count() as u32).collect(),
+            };
+            let mut keep: Vec<usize> = Vec::with_capacity(seed.rows() * nodes.len());
+            let mut ncol: Vec<u32> = Vec::with_capacity(seed.rows() * nodes.len());
+            for r in 0..seed.rows() {
+                for &nd in &nodes {
+                    keep.push(r);
+                    ncol.push(nd);
+                }
+            }
+            let mut out = seed.gather(&keep);
+            out.slots.push(Col::Nodes(ncol));
+            out
+        }
         Plan::Expand {
             input,
             from,

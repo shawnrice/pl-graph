@@ -900,6 +900,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             yields,
             outer_width,
             optional,
+            parts,
         } => {
             let (i, c) = rewrite(*input, idx);
             (
@@ -909,6 +910,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                     yields,
                     outer_width,
                     optional,
+                    parts,
                 },
                 c,
             )

@@ -413,6 +413,18 @@ pub enum CombineOp {
     Intersect,
 }
 
+/// One set-op-tail arm of an inline `CALL` body (see `Plan::CallInline::parts`). `op`
+/// is how this arm combines with the accumulated result to its left; `all` is the
+/// `UNION ALL` flag (ignored for EXCEPT/INTERSECT, which always dedup). `body` is the
+/// arm's provenance-tagged plan and `yields` its RETURN projection.
+#[derive(Clone, Debug)]
+pub struct CallPart {
+    pub op: CombineOp,
+    pub all: bool,
+    pub body: Plan,
+    pub yields: Vec<(String, Expr)>,
+}
+
 /// An aggregate function. `Count` with no argument (`arg: None`, `distinct:
 /// false`) is `count(*)`; with an argument it counts non-null values; with
 /// `distinct` it counts non-null distinct values.
@@ -902,6 +914,12 @@ pub enum Plan {
         yields: Vec<(String, Expr)>,
         outer_width: usize,
         optional: bool,
+        /// Set-operator tail: additional body arms combined with the first one PER
+        /// OUTER ROW (`UNION`/`EXCEPT`/`INTERSECT`, left-associative). Empty for the
+        /// single-arm form (Phase 0/1). Each part carries its own body + yields; the
+        /// output column names come from the first arm's `yields`. Every part's body
+        /// is provenance-tagged at slot `outer_width` exactly like `body`.
+        parts: Vec<CallPart>,
     },
     /// `CALL name(config)` — a named built-in procedure (a graph algorithm). A leaf
     /// that runs the algorithm over the whole store and produces a two-slot batch:

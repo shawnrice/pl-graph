@@ -4029,71 +4029,35 @@ impl Parser {
         }
 
         self.expect(&Tok::LBrace)?;
-        if !self.eat_kw("MATCH") {
-            return Err("a CALL subquery must begin with MATCH".into());
+        // Parse the first arm, then any `UNION`/`EXCEPT`/`INTERSECT` tail (each a full
+        // MATCH…RETURN arm). call_arm leaves `self.scope` restored to the outer scope,
+        // so each following arm re-imports the scope variables cleanly.
+        let (body, items) = self.call_arm(&scope_vars, outer_width)?;
+        let mut parts_raw: Vec<(crate::ir::CombineOp, bool, Plan, Vec<RetItem>)> = Vec::new();
+        loop {
+            let op = if self.eat_kw("UNION") {
+                crate::ir::CombineOp::Union
+            } else if self.eat_kw("EXCEPT") {
+                crate::ir::CombineOp::Except
+            } else if self.eat_kw("INTERSECT") {
+                crate::ir::CombineOp::Intersect
+            } else {
+                break;
+            };
+            let all = self.eat_kw("ALL");
+            let (b, it) = self.call_arm(&scope_vars, outer_width)?;
+            parts_raw.push((op, all, b, it));
         }
-        let (var, label, props, start_where, _le) = self.node_plain()?;
-        let Some(v) = var else {
-            return Err("a CALL subquery pattern must start from a scope variable".into());
-        };
-        if start_where.is_some() {
-            return Err("inline WHERE on a CALL subquery start variable is not supported".into());
-        }
-        if label.is_some() {
-            return Err(format!(
-                "scope variable `{v}` cannot be re-labeled inside a CALL subquery"
-            ));
-        }
-        if !props.is_empty() {
-            return Err(format!(
-                "scope variable `{v}` cannot be re-constrained with inline properties inside a \
-                 CALL subquery; use WHERE"
-            ));
-        }
-        if !scope_vars.contains(&v) {
-            return Err(format!(
-                "a CALL subquery must start from a scope variable; `{v}` is not in scope"
-            ));
-        }
-        let from = self.scope[&v];
-        // The sub-scope imports ONLY the declared scope variables (at their outer
-        // slots); body variables append from `outer_width` onward.
-        let mut sub_scope: HashMap<String, usize> = scope_vars
-            .iter()
-            .map(|s| (s.clone(), self.scope[s]))
-            .collect();
-        // Slot `outer_width` is RESERVED for the per-outer-row PROVENANCE column the exec
-        // seeds (the same layout `correlated_subquery_body` uses); the body's own
-        // variables append from `outer_width + 1`. This lets the correlated body be run
-        // ONCE over all outer rows and grouped back per outer row — the foundation for
-        // OPTIONAL / set-op / aggregate CALL bodies.
-        let mut sub_slots = outer_width + 1;
-        let body = self.extend_chain(Plan::Row, &mut sub_scope, &mut sub_slots, from)?;
+        self.expect(&Tok::RBrace)?;
 
-        // Parse WHERE/RETURN against the sub-scope. A parse error discards the
-        // whole parser, so there is no need to restore scope on the error paths.
-        let outer_scope = std::mem::replace(&mut self.scope, sub_scope);
-        self.slots = sub_slots;
-        let body = if self.eat_kw("WHERE") {
-            body.filter(self.expr()?)
-        } else {
-            body
-        };
-        if !self.eat_kw("RETURN") {
-            return Err("a CALL subquery needs a RETURN".into());
-        }
-        let items = self.return_items()?;
-        // A single `COUNT(...)` aggregate RETURN is a correlated COUNT subquery: for
-        // each outer row, the number of body sub-matches (0 if none — LEFT semantics,
-        // so the outer row survives). Appended via a projection that passes the outer
-        // columns through and adds the count. (Other aggregates in a CALL stay
-        // unsupported.)
-        if items.len() == 1 {
+        // A single `COUNT(...)` aggregate RETURN (no set-op tail) is a correlated COUNT
+        // subquery: for each outer row, the number of body sub-matches (0 if none — LEFT
+        // semantics, so the outer row survives). Appended via a projection that passes
+        // the outer columns through and adds the count. (Other aggregates stay unsupported.)
+        if parts_raw.is_empty() && items.len() == 1 {
             if let RetItem::Agg(agg) = &items[0] {
                 if agg.func == crate::ir::AggFn::Count && !agg.distinct {
                     let name = agg.name.clone();
-                    self.expect(&Tok::RBrace)?;
-                    self.scope = outer_scope;
                     let mut by_slot: Vec<Option<String>> = vec![None; outer_width];
                     for (n, &s) in self.scope.iter() {
                         if s < outer_width {
@@ -4118,23 +4082,21 @@ impl Parser {
                 }
             }
         }
-        if items.iter().any(RetItem::has_agg) {
-            return Err("an aggregating RETURN inside CALL { … } is not supported".into());
-        }
-        let yields: Vec<(String, Expr)> = items
+        let yields = call_items_to_yields(items)?;
+        let parts: Vec<crate::ir::CallPart> = parts_raw
             .into_iter()
-            .map(|it| match it {
-                RetItem::Key(name, e) => (name, e),
-                RetItem::Agg(_) | RetItem::AggExpr { .. } => {
-                    unreachable!("aggregates rejected above")
-                }
+            .map(|(op, all, b, it)| {
+                Ok(crate::ir::CallPart {
+                    op,
+                    all,
+                    body: b,
+                    yields: call_items_to_yields(it)?,
+                })
             })
-            .collect();
-        self.expect(&Tok::RBrace)?;
+            .collect::<Result<_, String>>()?;
 
-        // Restore the outer scope and bind the yields as its new trailing columns;
-        // the subquery's internal variables do not survive.
-        self.scope = outer_scope;
+        // Bind the (first arm's) yields as the outer scope's new trailing columns; the
+        // subquery's internal variables do not survive.
         for (i, (name, _)) in yields.iter().enumerate() {
             self.scope.insert(name.clone(), outer_width + i);
         }
@@ -4145,7 +4107,89 @@ impl Parser {
             yields,
             outer_width,
             optional,
+            parts,
         })
+    }
+
+    /// Parse ONE arm of an inline correlated CALL body: `MATCH <pattern> [WHERE …]
+    /// RETURN <items>`. The pattern may start from a declared scope variable (an Expand
+    /// rooted at it) or from a FRESH `(x:Label)` node (a Scan cross-joined with the
+    /// prov-seed — every seed row × every matching node). The body is provenance-tagged:
+    /// slot `outer_width` is RESERVED for the per-outer-row id (the layout the exec
+    /// seeds), so body variables append from `outer_width + 1`. Returns the arm's body
+    /// plan (before projection) and its raw RETURN items; `self.scope` is left restored
+    /// to the outer scope.
+    fn call_arm(
+        &mut self,
+        scope_vars: &[String],
+        outer_width: usize,
+    ) -> Result<(Plan, Vec<RetItem>), String> {
+        if !self.eat_kw("MATCH") {
+            return Err("a CALL subquery must begin with MATCH".into());
+        }
+        // Import the scope variables at their OUTER slots; the prov id sits at
+        // `outer_width`, so fresh body variables start at `outer_width + 1`.
+        let mut sub_scope: HashMap<String, usize> = scope_vars
+            .iter()
+            .map(|s| (s.clone(), self.scope[s]))
+            .collect();
+        let mut sub_slots = outer_width + 1;
+        let (var, label, props, start_where, le) = self.node_plain()?;
+        if start_where.is_some() {
+            return Err("inline WHERE on a CALL subquery start node is not supported".into());
+        }
+        // A start node naming a declared scope variable roots an Expand from it (and may
+        // not be re-labeled or re-constrained); anything else is a fresh correlated Scan.
+        let scope_root = match &var {
+            Some(v) if scope_vars.contains(v) => {
+                if label.is_some() || le.is_some() {
+                    return Err(format!(
+                        "scope variable `{v}` cannot be re-labeled inside a CALL subquery"
+                    ));
+                }
+                if !props.is_empty() {
+                    return Err(format!(
+                        "scope variable `{v}` cannot be re-constrained with inline properties \
+                         inside a CALL subquery; use WHERE"
+                    ));
+                }
+                true
+            }
+            _ => false,
+        };
+        let (mut body, from) = if scope_root {
+            (Plan::Row, self.scope[var.as_ref().unwrap()])
+        } else {
+            // Fresh scan: the new node lands at `outer_width + 1`; when pull_body reaches
+            // this leaf the prov-seed carries exactly `outer_width + 1` columns, so the
+            // Scan cross-joins each seed row with every matching node.
+            if le.is_some() {
+                return Err(
+                    "a compound label on a CALL fresh-scan start node is not supported".into(),
+                );
+            }
+            let node_slot = sub_slots; // outer_width + 1
+            if let Some(v) = &var {
+                sub_scope.insert(v.clone(), node_slot);
+            }
+            sub_slots += 1;
+            let b = node_prop_filters(Plan::Scan { label }, node_slot, props);
+            (b, node_slot)
+        };
+        body = self.extend_chain(body, &mut sub_scope, &mut sub_slots, from)?;
+
+        let outer_scope = std::mem::replace(&mut self.scope, sub_scope);
+        self.slots = sub_slots;
+        if self.eat_kw("WHERE") {
+            body = body.filter(self.expr()?);
+        }
+        if !self.eat_kw("RETURN") {
+            self.scope = outer_scope;
+            return Err("a CALL subquery needs a RETURN".into());
+        }
+        let items = self.return_items()?;
+        self.scope = outer_scope;
+        Ok((body, items))
     }
 
     /// `CALL () { <subquery> }` — an UNCORRELATED (empty-scope) inline subquery. The
@@ -4174,7 +4218,47 @@ impl Parser {
             return Err("a CALL subquery needs a RETURN".into());
         }
         let items = self.return_items()?;
-        let (body_out, out_names) = apply_items(body, &items);
+        let (mut body_out, out_names) = apply_items(body, &items);
+
+        // A `UNION`/`EXCEPT`/`INTERSECT` tail: each arm is an INDEPENDENT global query
+        // (fresh slot space, same outer-var isolation), combined with the ordinary
+        // top-level set operator. The whole combined body is a single GLOBAL result set
+        // that then cross-joins the outer table — no per-outer-row grouping needed
+        // (nothing correlates).
+        loop {
+            let op = if self.eat_kw("UNION") {
+                crate::ir::CombineOp::Union
+            } else if self.eat_kw("EXCEPT") {
+                crate::ir::CombineOp::Except
+            } else if self.eat_kw("INTERSECT") {
+                crate::ir::CombineOp::Intersect
+            } else {
+                break;
+            };
+            let all = self.eat_kw("ALL");
+            // A fresh arm scope (the outer-var isolation lets stay in place).
+            self.scope = HashMap::new();
+            self.slots = 0;
+            self.path_vars = HashSet::new();
+            self.group_node_slots = HashSet::new();
+            self.group_edge_slots = HashSet::new();
+            self.group_var_depth = HashMap::new();
+            if !self.eat_kw("MATCH") {
+                return Err("a CALL subquery must begin with MATCH".into());
+            }
+            let arm_body = self.match_body()?;
+            if !self.eat_kw("RETURN") {
+                return Err("a CALL subquery needs a RETURN".into());
+            }
+            let arm_items = self.return_items()?;
+            let (arm_out, _) = apply_items(arm_body, &arm_items);
+            body_out = Plan::Union {
+                left: Box::new(body_out),
+                right: Box::new(arm_out),
+                all,
+                op,
+            };
+        }
         self.expect(&Tok::RBrace)?;
 
         // Restore the outer scope; the yields append as its new trailing columns
@@ -5964,6 +6048,21 @@ fn rewrite_agg_slots(e: Expr, base: usize) -> Expr {
     }
 }
 
+/// Convert an inline-CALL arm's RETURN items into `(name, Expr)` yields, rejecting any
+/// aggregate (a set-op / plain CALL body may not aggregate — only the single-arm
+/// `COUNT(*)` special case, handled by the caller before this).
+fn call_items_to_yields(items: Vec<RetItem>) -> Result<Vec<(String, Expr)>, String> {
+    items
+        .into_iter()
+        .map(|it| match it {
+            RetItem::Key(name, e) => Ok((name, e)),
+            RetItem::Agg(_) | RetItem::AggExpr { .. } => {
+                Err("an aggregating RETURN inside CALL { … } is not supported".to_string())
+            }
+        })
+        .collect()
+}
+
 fn apply_items(plan: Plan, items: &[RetItem]) -> (Plan, Vec<String>) {
     let has_agg = items.iter().any(RetItem::has_agg);
     let has_agg_expr = items.iter().any(|it| matches!(it, RetItem::AggExpr { .. }));
@@ -7127,6 +7226,7 @@ mod tests {
             )],
             outer_width: 1,
             optional: false,
+            parts: Vec::new(),
         };
         let hand = call.project(vec![
             (

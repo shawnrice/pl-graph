@@ -148,9 +148,26 @@ outer_width + 1`); adapt the current `CallInline` exec + non-aggregate yields to
   (node/edge yields stay node/edge columns via the `u32::MAX` sentinel so `f.name`
   resolves to NULL rather than downgrading to `Gen`). **Closed "inline subquery CALL with
   RETURN \* / element columns".**
-- **Phase 2:** fresh-scan body start + set operators (`UNION [ALL]`/`EXCEPT`/`INTERSECT`),
-  correlated and uncorrelated. **Closes "inline subquery CALL with set operators".** This
-  is the bulk of the byte-identity risk (per-outer-row combine).
+- **Phase 2 (done):** fresh-scan body start + set operators (`UNION [ALL]`/`EXCEPT`/
+  `INTERSECT`), correlated and uncorrelated. **Closed "inline subquery CALL with set
+  operators".** Implementation:
+  - Parser: `call_inline` now parses arm 0 + a set-op tail via a shared `call_arm` that
+    dispatches on the arm's first node — a declared scope var roots an Expand (as before),
+    anything else is a fresh `(x:Label)` Scan. Arms with a tail build `Plan::CallInline`
+    with a `parts: Vec<CallPart>` set-op tail; single-arm bodies keep `parts` empty and
+    the exact Phase-0/1 fast path (incl. the single-`COUNT(*)` special case). The
+    uncorrelated `CALL () { … }` handles its tail by combining arms with the ordinary
+    top-level `Plan::Union` operator and cross-joining the whole global result.
+  - Exec: a fresh-scan arm runs through a new `pull_body` `Plan::Scan` arm (a correlated
+    cross-join of the prov-seed with the label's nodes). `call_inline_setop` collects each
+    arm's yield tuples grouped by provenance, combines them left-associatively per group
+    (`combine_call_groups`, the same multiset rules as the top-level set-op), then lays
+    out rows in outer order (imported columns gathered natively so `x.name` resolves; yield
+    columns materialized to `Gen` like the top-level set-op) with OPTIONAL null-fill.
+  - Byte-identity: verified against the two conformance tests (UNION/UNION ALL/EXCEPT with
+    a fresh-scan arm/INTERSECT/OPTIONAL+set-op/uncorrelated/three-part, all ORDER BY'd).
+    The differential fuzzer still generates no inline-CALL — extending it is the remaining
+    open coverage item.
 - **Phase 3 (optional):** fold in the scalar-aggregate CALL body (`sum`/`avg`/`min`/`max`).
 
 ## Effort
