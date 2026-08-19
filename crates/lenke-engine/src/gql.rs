@@ -5921,6 +5921,13 @@ impl Parser {
                 return format!("{var}.{key}");
             }
         }
+        // A bare bound path (`RETURN p`) takes the path variable's name. There is
+        // exactly one path per row (the lineage), so the single declared path var is it.
+        if matches!(e, Expr::Path) {
+            if let Some(name) = self.path_vars.iter().next() {
+                return name.clone();
+            }
+        }
         default_name(e, idx)
     }
 }
@@ -7069,6 +7076,29 @@ mod tests {
         b.build()
     }
 
+    /// The `id` field of each element map in a path-accessor result list. `chain()`
+    /// nodes/edges carry no external id, so the rendered id is the dense-id fallback
+    /// ("0".."3" for nodes, "e0".."e2" for edges).
+    fn elem_ids(list: &Value) -> Vec<String> {
+        let Value::List(items) = list else {
+            panic!("not a list: {list:?}")
+        };
+        items
+            .iter()
+            .map(|e| match e {
+                Value::Map(m) => match m
+                    .iter()
+                    .find(|(k, _)| matches!(k, Value::Str(s) if &**s == "id"))
+                    .map(|(_, v)| v)
+                {
+                    Some(Value::Str(s)) => s.to_string(),
+                    o => panic!("id not a string: {o:?}"),
+                },
+                o => panic!("not an element map: {o:?}"),
+            })
+            .collect()
+    }
+
     #[test]
     fn any_shortest_path_length() {
         use crate::ir::{Dir, Expr, PathPart, Plan};
@@ -7120,17 +7150,8 @@ mod tests {
                  WHERE x.name = 'a' AND y.name = 'd' RETURN nodes(p) AS ns";
         let out = run(&super::parse(q).unwrap(), &store);
         assert_eq!(out.rows.len(), 1);
-        let ids: Vec<f64> = match &out.rows[0][0] {
-            Value::List(items) => items
-                .iter()
-                .map(|v| match v {
-                    Value::Num(x) => *x,
-                    o => panic!("expected Num in path, got {o:?}"),
-                })
-                .collect(),
-            o => panic!("expected a List from nodes(p), got {o:?}"),
-        };
-        assert_eq!(ids, vec![0.0, 1.0, 2.0, 3.0]);
+        // nodes(p) materializes the four vertices in chain order.
+        assert_eq!(elem_ids(&out.rows[0][0]), vec!["0", "1", "2", "3"]);
     }
 
     #[test]
@@ -7142,17 +7163,8 @@ mod tests {
                  WHERE x.name = 'a' AND y.name = 'd' RETURN relationships(p) AS es";
         let out = run(&super::parse(q).unwrap(), &store);
         assert_eq!(out.rows.len(), 1);
-        let eids: Vec<f64> = match &out.rows[0][0] {
-            Value::List(items) => items
-                .iter()
-                .map(|v| match v {
-                    Value::Num(x) => *x,
-                    o => panic!("expected Num edge id, got {o:?}"),
-                })
-                .collect(),
-            o => panic!("expected a List from relationships(p), got {o:?}"),
-        };
-        assert_eq!(eids, vec![0.0, 1.0, 2.0]);
+        // relationships(p) materializes the three traversed edges, in order.
+        assert_eq!(elem_ids(&out.rows[0][0]), vec!["e0", "e1", "e2"]);
     }
 
     #[test]
@@ -7165,17 +7177,11 @@ mod tests {
                  WHERE x.name = 'a' AND y.name = 'd' RETURN elements(p) AS els";
         let out = run(&super::parse(q).unwrap(), &store);
         assert_eq!(out.rows.len(), 1);
-        let seq: Vec<f64> = match &out.rows[0][0] {
-            Value::List(items) => items
-                .iter()
-                .map(|v| match v {
-                    Value::Num(x) => *x,
-                    o => panic!("expected Num, got {o:?}"),
-                })
-                .collect(),
-            o => panic!("expected a List from elements(p), got {o:?}"),
-        };
-        assert_eq!(seq, vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0]);
+        // elements(p) interleaves n0,e0,n1,e1,n2,e2,n3 — each a full element map.
+        assert_eq!(
+            elem_ids(&out.rows[0][0]),
+            vec!["0", "e0", "1", "e1", "2", "e2", "3"]
+        );
     }
 
     #[test]

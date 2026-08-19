@@ -1699,6 +1699,28 @@ fn resolve_node_cols<'a>(
 
 /// The canonical result map for a node — `{id, labels(sorted), properties(sorted by
 /// key)}`, byte-identical to lenke-core's `val_to_value(Node)`.
+/// Map a lineage node-id slice (`Value::Num(dense_id)` entries) to full vertex
+/// element maps — the materialization behind `nodes(p)` and a Path's `vertices`.
+fn path_node_values(store: &Store, ids: &[Value]) -> Vec<Value> {
+    ids.iter()
+        .map(|v| match v {
+            Value::Num(n) => node_result_value(store, *n as u32),
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// Map a lineage edge-id slice to full edge element maps — behind `edges(p)` and a
+/// Path's `edges`.
+fn path_edge_values(store: &Store, ids: &[Value]) -> Vec<Value> {
+    ids.iter()
+        .map(|v| match v {
+            Value::Num(n) => edge_result_value(store, *n as u32),
+            other => other.clone(),
+        })
+        .collect()
+}
+
 fn node_result_value(store: &Store, id: u32) -> Value {
     use std::sync::Arc;
     let ext = store
@@ -2390,10 +2412,12 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // Map, keyed level-by-level by each element's full element map (bare tree)
             // or its `by` property. Force lineage tracking (Expr::Path reads it).
             let b = pull(input, store, true)?;
-            let paths = eval(&Expr::Path, store, &b)?;
+            // Read the node-id lineage DIRECTLY (not via `eval(Expr::Path)`, whose GQL
+            // value is now a rich Path object, not a bare id list).
             let mut tree = GremlinTree::default();
-            for i in 0..b.rows() {
-                if let Value::List(ids) = paths.value_at(i) {
+            if let Some(lin) = &b.lineage {
+                for i in 0..b.rows() {
+                    let ids = lin.path_at(i);
                     let mut keys: Vec<Value> = ids
                         .iter()
                         .map(|v| match v {
@@ -12805,11 +12829,22 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             }
         }
         Expr::Path => match &batch.lineage {
-            // Each row's path as a List of node ids; NULL when the plan tracks no
-            // lineage (which `needs_lineage` prevents when Path is actually read).
+            // A bound path RETURNs as a rich Path object `{vertices, edges, length}`
+            // (key order matches the pure-TS Path serialization), each vertex/edge a
+            // full element map. NULL when the plan tracks no lineage (which
+            // `needs_lineage` prevents when Path is actually read).
             Some(lin) => Col::Gen(
                 (0..batch.rows())
-                    .map(|i| Value::List(lin.path_at(i).to_vec()))
+                    .map(|i| {
+                        let vertices = path_node_values(store, lin.path_at(i));
+                        let edges = path_edge_values(store, lin.edges_at(i));
+                        let len = edges.len() as f64;
+                        Value::Map(std::sync::Arc::new(vec![
+                            (Value::Str("vertices".into()), Value::List(vertices)),
+                            (Value::Str("edges".into()), Value::List(edges)),
+                            (Value::Str("length".into()), Value::Num(len)),
+                        ]))
+                    })
                     .collect(),
             ),
             None => Col::Gen(vec![Value::Null; batch.rows()]),
@@ -12864,16 +12899,22 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                             let nodes = lin.path_at(i);
                             let edges = lin.edges_at(i);
                             match part {
-                                PathPart::Nodes => Value::List(nodes.to_vec()),
-                                PathPart::Relationships => Value::List(edges.to_vec()),
+                                // `nodes(p)` / `edges(p)` materialize the full element
+                                // maps (a vertex/edge object each), not bare ids.
+                                PathPart::Nodes => Value::List(path_node_values(store, nodes)),
+                                PathPart::Relationships => {
+                                    Value::List(path_edge_values(store, edges))
+                                }
                                 // Hops == number of relationships.
                                 PathPart::Length => Value::Num(edges.len() as f64),
                                 PathPart::Elements => {
-                                    // n0, e0, n1, e1, …, nk
-                                    let mut items = Vec::with_capacity(nodes.len() + edges.len());
-                                    for (j, node) in nodes.iter().enumerate() {
+                                    // n0, e0, n1, e1, …, nk — each a full element map.
+                                    let ns = path_node_values(store, nodes);
+                                    let es = path_edge_values(store, edges);
+                                    let mut items = Vec::with_capacity(ns.len() + es.len());
+                                    for (j, node) in ns.iter().enumerate() {
                                         items.push(node.clone());
-                                        if let Some(e) = edges.get(j) {
+                                        if let Some(e) = es.get(j) {
                                             items.push(e.clone());
                                         }
                                     }
@@ -13301,27 +13342,21 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             // (a per-row list of node-id Nums); a Null row (no lineage) stays Null.
             // Gremlin-only — not in the GQL whitelist.
             if name == "path_nodes" {
-                let arg = eval(&args[0], store, batch)?;
+                // The Gremlin vertex path: each hop's node as its full element map.
+                // Read the node-id lineage DIRECTLY — `args[0]` is `Expr::Path` (kept so
+                // `needs_lineage` fires), but its GQL value is now a rich Path object.
                 let n = batch.rows();
-                let out: Vec<Value> = (0..n)
-                    .map(|i| match arg.value_at(i) {
-                        Value::List(ids) => Value::List(
-                            ids.into_iter()
-                                .map(|v| match v {
-                                    Value::Num(id) => node_result_value(store, id as u32),
-                                    other => other,
-                                })
-                                .collect(),
-                        ),
-                        other => other,
-                    })
-                    .collect();
+                let out: Vec<Value> = match &batch.lineage {
+                    Some(lin) => (0..n)
+                        .map(|i| Value::List(path_node_values(store, lin.path_at(i))))
+                        .collect(),
+                    None => vec![Value::Null; n],
+                };
                 return Ok(Col::Gen(out));
             }
             // `path_values(path, 'k')` → Gremlin `path().by('k')`: render each path
             // element as its `k` property instead of the whole vertex element map.
             if name == "path_values" {
-                let arg = eval(&args[0], store, batch)?;
                 let key = match &args[1] {
                     Expr::Lit(Value::Str(s)) => s.clone(),
                     _ => return Err("path().by(...) key must be a literal string".into()),
@@ -13339,19 +13374,23 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                         _ => store.prop(id, &key),
                     }
                 };
-                let out: Vec<Value> = (0..n)
-                    .map(|i| match arg.value_at(i) {
-                        Value::List(ids) => Value::List(
-                            ids.into_iter()
-                                .map(|v| match v {
-                                    Value::Num(id) => map_elem(id as u32),
-                                    other => other,
-                                })
-                                .collect(),
-                        ),
-                        other => other,
-                    })
-                    .collect();
+                // Read the node-id lineage directly (see `path_nodes`).
+                let out: Vec<Value> = match &batch.lineage {
+                    Some(lin) => (0..n)
+                        .map(|i| {
+                            Value::List(
+                                lin.path_at(i)
+                                    .iter()
+                                    .map(|v| match v {
+                                        Value::Num(id) => map_elem(*id as u32),
+                                        other => other.clone(),
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                    None => vec![Value::Null; n],
+                };
                 return Ok(Col::Gen(out));
             }
             // `path_has_dup(path)` → Gremlin `cyclicPath`/`simplePath` support: TRUE if
@@ -13359,22 +13398,23 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             // argument is `Expr::Path` (a per-row list of node-id Nums); a Null row
             // (no lineage) is Null. Gremlin-only — not in the GQL whitelist.
             if name == "path_has_dup" {
-                let arg = eval(&args[0], store, batch)?;
+                // Read the node-id lineage directly (see `path_nodes`): TRUE if a vertex
+                // repeats, FALSE if all distinct, NULL when no lineage is tracked.
                 let n = batch.rows();
-                let out: Vec<Value> = (0..n)
-                    .map(|i| match arg.value_at(i) {
-                        Value::List(ids) => {
+                let out: Vec<Value> = match &batch.lineage {
+                    Some(lin) => (0..n)
+                        .map(|i| {
                             let mut seen: std::collections::HashSet<u64> =
                                 std::collections::HashSet::new();
-                            let dup = ids.iter().any(|v| match v {
+                            let dup = lin.path_at(i).iter().any(|v| match v {
                                 Value::Num(id) => !seen.insert(id.to_bits()),
                                 _ => false,
                             });
                             Value::Bool(dup)
-                        }
-                        other => other,
-                    })
-                    .collect();
+                        })
+                        .collect(),
+                    None => vec![Value::Null; n],
+                };
                 return Ok(Col::Gen(out));
             }
             // `list_{sum,mean,min,max}(list)` → Gremlin's scope-LOCAL aggregates over
@@ -23636,8 +23676,53 @@ mod tests {
 
     // --- Lineage (path) ---
 
-    /// A chain a->b->c. `RETURN path` over the 2-hop expand yields the hand-
-    /// computed path [a, b, c] (node ids), and the path grows one node per hop.
+    /// Look up a key in a rich Path object `{vertices, edges, length}` (a `Value::Map`).
+    fn path_field<'a>(v: &'a Value, k: &str) -> &'a Value {
+        match v {
+            Value::Map(m) => {
+                &m.iter()
+                    .find(|(key, _)| matches!(key, Value::Str(s) if &**s == k))
+                    .unwrap_or_else(|| panic!("path map has no `{k}`: {v:?}"))
+                    .1
+            }
+            other => panic!("not a path map: {other:?}"),
+        }
+    }
+    /// The `name` property of each element map in a `vertices`/`edges` list.
+    fn elem_names(list: &Value) -> Vec<String> {
+        let Value::List(items) = list else {
+            panic!("not a list: {list:?}")
+        };
+        items
+            .iter()
+            .map(|e| match path_field(e, "properties") {
+                Value::Map(pm) => match pm
+                    .iter()
+                    .find(|(k, _)| matches!(k, Value::Str(s) if &**s == "name"))
+                {
+                    Some((_, Value::Str(s))) => s.to_string(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            })
+            .collect()
+    }
+    /// The `id` field of each element map in a list.
+    fn elem_ids(list: &Value) -> Vec<String> {
+        let Value::List(items) = list else {
+            panic!("not a list: {list:?}")
+        };
+        items
+            .iter()
+            .map(|e| match path_field(e, "id") {
+                Value::Str(s) => s.to_string(),
+                other => panic!("id not a string: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A chain a->b->c. `RETURN path` over the 2-hop expand yields a rich Path whose
+    /// vertices are [a, b, c] and length grows one hop per expand.
     #[test]
     fn path_is_the_hop_sequence() {
         let mut b = Builder::default();
@@ -23655,20 +23740,11 @@ mod tests {
             .project(vec![("p".into(), Expr::Path)]);
         let out = run(&plan, &store);
         assert_eq!(out.rows.len(), 1);
-        // path = [a, b, c] as node ids (a=0, b=1, c=2).
-        match &out.rows[0][0] {
-            Value::List(items) => {
-                let ids: Vec<f64> = items
-                    .iter()
-                    .map(|v| match v {
-                        Value::Num(x) => *x,
-                        other => panic!("path element not a node id: {other:?}"),
-                    })
-                    .collect();
-                assert_eq!(ids, vec![f64::from(a), f64::from(bb), f64::from(c)]);
-            }
-            other => panic!("expected a path list, got {other:?}"),
-        }
+        // A rich Path `{vertices:[a,b,c], edges:[e0,e1], length:2}`.
+        let p = &out.rows[0][0];
+        let _ = (a, bb, c);
+        assert_eq!(elem_names(path_field(p, "vertices")), vec!["a", "b", "c"]);
+        assert!(matches!(path_field(p, "length"), Value::Num(x) if *x == 2.0));
     }
 
     /// Expand tracks the traversed EDGE in the lineage too: over a->b->c the
@@ -23696,19 +23772,9 @@ mod tests {
             )]);
         let out = run(&plan, &store);
         assert_eq!(out.rows.len(), 1);
-        match &out.rows[0][0] {
-            Value::List(items) => {
-                let eids: Vec<f64> = items
-                    .iter()
-                    .map(|v| match v {
-                        Value::Num(x) => *x,
-                        other => panic!("edge element not an id: {other:?}"),
-                    })
-                    .collect();
-                assert_eq!(eids, vec![0.0, 1.0]);
-            }
-            other => panic!("expected an edge list, got {other:?}"),
-        }
+        // `edges(p)` materializes each traversed edge; these have no ext id, so the
+        // rendered id is the dense id as a string ("e0", "e1" — the store's fallback).
+        assert_eq!(elem_ids(&out.rows[0][0]), vec!["e0", "e1"]);
     }
 
     /// A one-hop path is two nodes; the source's own path (length-0 walk via a
@@ -23724,10 +23790,11 @@ mod tests {
         let out = run(&plan, &store);
         assert_eq!(out.rows.len(), 2); // alice->bob, alice->carol
         for row in &out.rows {
-            match &row[0] {
-                Value::List(items) => assert_eq!(items.len(), 2), // [alice, neighbour]
-                other => panic!("expected path list, got {other:?}"),
-            }
+            let Value::List(verts) = path_field(&row[0], "vertices") else {
+                panic!("expected a path map, got {:?}", row[0])
+            };
+            assert_eq!(verts.len(), 2); // [alice, neighbour]
+            assert!(matches!(path_field(&row[0], "length"), Value::Num(x) if *x == 1.0));
         }
     }
 
@@ -23780,15 +23847,12 @@ mod tests {
         // sorted by neighbour age: c(2) then b(3). Each path ends at its own node.
         assert_eq!(as_str(&out.rows[0][0]), "c");
         assert_eq!(as_str(&out.rows[1][0]), "b");
-        let last_of = |row: &[Value]| match &row[1] {
-            Value::List(items) => match items.last() {
-                Some(Value::Num(x)) => *x,
-                other => panic!("path tail not a node: {other:?}"),
-            },
-            other => panic!("expected path, got {other:?}"),
-        };
-        assert_eq!(last_of(&out.rows[0]), f64::from(c)); // path for c ends at c
-        assert_eq!(last_of(&out.rows[1]), f64::from(bb)); // path for b ends at b
+        // Each row's path ends at its own neighbour (lineage stays aligned after the
+        // reorder) — check the last vertex's `name`.
+        let last_name = |row: &[Value]| elem_names(path_field(&row[1], "vertices")).pop().unwrap();
+        let _ = (a, bb, c);
+        assert_eq!(last_name(&out.rows[0]), "c"); // path for c ends at c
+        assert_eq!(last_name(&out.rows[1]), "b"); // path for b ends at b
     }
 }
 
