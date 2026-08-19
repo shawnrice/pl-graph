@@ -32,7 +32,7 @@ let mut out = (0..outer_width).map(|i| sub.slot(i)) ++ yields.map(eval);
 
 It is an **inner** lateral join: the body extends each outer row, and outer rows with no
 sub-match simply vanish (they carry no sub-row). Outer-row identity is only the outer
-slot *values* — there is no per-outer provenance id.
+slot _values_ — there is no per-outer provenance id.
 
 ## What ISO / pure-TS requires (the two failing conformance tests)
 
@@ -52,13 +52,13 @@ flatMap((outer) => {
 
 The two red tests need, beyond today's shape:
 
-| feature | "RETURN * / element columns" | "set operators" |
-|---|---|---|
-| `RETURN *` (yield every body binding) | ✅ | — |
-| `OPTIONAL CALL` (left-outer null-fill) | ✅ | ✅ |
-| body from a FRESH `MATCH (s:Software)` (not a scope var) | — | ✅ (the EXCEPT case) |
-| `UNION [ALL]` / `EXCEPT` / `INTERSECT` in the body | — | ✅ |
-| uncorrelated `CALL () { … UNION … }` | — | ✅ |
+| feature                                                  | "RETURN \* / element columns" | "set operators"      |
+| -------------------------------------------------------- | ----------------------------- | -------------------- |
+| `RETURN *` (yield every body binding)                    | ✅                            | —                    |
+| `OPTIONAL CALL` (left-outer null-fill)                   | ✅                            | ✅                   |
+| body from a FRESH `MATCH (s:Software)` (not a scope var) | —                             | ✅ (the EXCEPT case) |
+| `UNION [ALL]` / `EXCEPT` / `INTERSECT` in the body       | —                             | ✅                   |
+| uncorrelated `CALL () { … UNION … }`                     | —                             | ✅                   |
 
 ## The architectural problem
 
@@ -78,12 +78,13 @@ set-op combination and OPTIONAL left-outer, all grouped on `prov`.
 
 Note the **prerequisite**: the CALL body is currently built at `sub_slots = outer_width`,
 but a provenance-tagged body needs `sub_slots = outer_width + 1` (prov reserved at
-`outer_width`, exactly like `correlated_subquery_body`). This is the *same* slot-layout
+`outer_width`, exactly like `correlated_subquery_body`). This is the _same_ slot-layout
 blocker that stalls the CALL-body scalar-aggregate work — doing it here unblocks that too.
 
 ## Design (recommended: provenance-tagged, engine-native)
 
 1. **IR** — extend `Plan::CallInline`:
+
    ```rust
    CallInline {
      input, body, yields, outer_width,
@@ -92,6 +93,7 @@ blocker that stalls the CALL-body scalar-aggregate work — doing it here unbloc
      return_columns: Vec<String>,             // for OPTIONAL null-fill
    }
    ```
+
    Every `body`/`part` built with `prov` reserved at `outer_width` and yields at `+1…`.
 
 2. **Parser** (`call_inline`):
@@ -105,12 +107,12 @@ blocker that stalls the CALL-body scalar-aggregate work — doing it here unbloc
      lines ~335–359) into a reusable `parse_setop_tail` and call it for the body,
      re-seeding each arm's scope from the same scope vars.
    - **`RETURN *`**: expand to yields over every body-bound sub-scope variable (needs a
-     RETURN-* path the engine doesn't have yet — small addition).
+     RETURN-\* path the engine doesn't have yet — small addition).
 
 3. **Exec** (`Plan::CallInline`):
    - Provenance-tag: seed `outer + prov(0..n)`, run `body` and each `part` → each carries `prov`.
    - **Combine set-op parts per outer row**: group each part's rows by `prov`, then apply
-     `combineRows(op, all)` on the yield-tuples *within each prov group* (UNION distinct/all,
+     `combineRows(op, all)` on the yield-tuples _within each prov group_ (UNION distinct/all,
      EXCEPT, INTERSECT multiset rules).
    - **Inner vs OPTIONAL**: per outer row — ≥1 result → emit outer + yields per result;
      0 results and `optional` → emit outer + null yields; 0 and not optional → drop.
@@ -121,6 +123,7 @@ blocker that stalls the CALL-body scalar-aggregate work — doing it here unbloc
 ## Byte-identity risks (the hard part)
 
 Row **order** and set-op semantics must match pure-TS's `combineRows` exactly:
+
 - UNION distinct dedup **order** (first-seen), UNION ALL multiplicity, EXCEPT / INTERSECT
   multiset rules — per outer row.
 - `RETURN *` column order (which sub-scope vars, in what order).
@@ -135,10 +138,16 @@ extension of the differential fuzzer (it currently generates no inline-CALL).
 ## Suggested phasing
 
 - **Phase 0 (prerequisite):** build the CALL body with `prov` reserved (`sub_slots =
-  outer_width + 1`); adapt the current `CallInline` exec + non-aggregate yields to the new
+outer_width + 1`); adapt the current `CallInline` exec + non-aggregate yields to the new
   layout. No behavior change; unblocks everything below (and the scalar-aggregate work).
-- **Phase 1:** `RETURN *` + `OPTIONAL CALL` (correlated-from-scope-var only, no set-ops).
-  **Closes "inline subquery CALL with RETURN * / element columns".**
+- **Phase 1 (done):** `RETURN *` + `OPTIONAL CALL` (correlated-from-scope-var only, no
+  set-ops). `RETURN *` / bare-element yields already worked via `return_items`'s `*`
+  expansion; the only new work was `OPTIONAL CALL` — the parser dispatch (`OPTIONAL` +
+  `CALL` lookahead) and a left-outer null-fill in the exec that reads the Phase-0
+  provenance column, keeping imported scope vars intact and nulling only fresh body vars
+  (node/edge yields stay node/edge columns via the `u32::MAX` sentinel so `f.name`
+  resolves to NULL rather than downgrading to `Gen`). **Closed "inline subquery CALL with
+  RETURN \* / element columns".**
 - **Phase 2:** fresh-scan body start + set operators (`UNION [ALL]`/`EXCEPT`/`INTERSECT`),
   correlated and uncorrelated. **Closes "inline subquery CALL with set operators".** This
   is the bulk of the byte-identity risk (per-outer-row combine).

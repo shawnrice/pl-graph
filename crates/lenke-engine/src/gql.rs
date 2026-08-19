@@ -1071,11 +1071,17 @@ impl Parser {
             } else if self.eat_kw("LET") {
                 plan = self.let_clause(plan)?;
             } else if self.eat_kw("OPTIONAL") {
-                plan = self.optional_match(plan)?;
+                // `OPTIONAL CALL (…) { … }` is a LEFT-outer correlated subquery;
+                // `OPTIONAL MATCH …` is the single-hop left join.
+                if self.eat_kw("CALL") {
+                    plan = self.call_inline(plan, true)?;
+                } else {
+                    plan = self.optional_match(plan)?;
+                }
             } else if self.eat_kw("MATCH") {
                 plan = self.match_continue(plan)?;
             } else if self.eat_kw("CALL") {
-                plan = self.call_inline(plan)?;
+                plan = self.call_inline(plan, false)?;
             } else if self.eat_kw("FOR") {
                 plan = self.for_clause(plan)?;
             } else if self.eat_kw("FILTER") {
@@ -3991,7 +3997,7 @@ impl Parser {
     /// from one of them, and its `RETURN` columns are appended to each outer row
     /// (a lateral join). The named-procedure form (`CALL name(cfg) YIELD …`) is
     /// deferred to the algorithms phase — its catalog is those procedures.
-    fn call_inline(&mut self, plan: Plan) -> Result<Plan, String> {
+    fn call_inline(&mut self, plan: Plan, optional: bool) -> Result<Plan, String> {
         let outer_width = self.slots;
         // The inline form opens with a `(scope)`; anything else (a bare name) is
         // the deferred named-procedure call.
@@ -4011,6 +4017,9 @@ impl Parser {
         }
         self.expect(&Tok::RParen)?;
         if scope_vars.is_empty() {
+            if optional {
+                return Err("OPTIONAL CALL () { … } (uncorrelated) is not supported".into());
+            }
             return self.call_inline_uncorrelated(plan, outer_width);
         }
         for v in &scope_vars {
@@ -4135,6 +4144,7 @@ impl Parser {
             body: Box::new(body),
             yields,
             outer_width,
+            optional,
         })
     }
 
@@ -7116,6 +7126,7 @@ mod tests {
                 },
             )],
             outer_width: 1,
+            optional: false,
         };
         let hand = call.project(vec![
             (

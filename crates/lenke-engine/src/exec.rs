@@ -2902,17 +2902,17 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             body,
             yields,
             outer_width,
+            optional,
         } => {
             // Inline correlated (lateral) subquery: run `body` over the outer rows
             // (it is rooted at `Plan::Row`, which yields them), then emit one row
             // per sub-row — the outer slots the sub-row still carries, followed by
             // the yield expressions. Outer rows with no sub-row drop out (inner
-            // lateral join). The subquery's internal variables are NOT surfaced.
+            // lateral join), UNLESS `optional`.
             //
             // Slot `ow` seeds a PROVENANCE id (the outer row index) the body carries
-            // through; today the inner join reads it from nothing, but it is the hook
-            // for grouping results back per outer row (OPTIONAL / set-op / aggregate
-            // bodies). The body's own variables land at `ow + 1…`.
+            // through; OPTIONAL reads it to find which outer rows produced no sub-row.
+            // The body's own variables land at `ow + 1…`.
             let outer = pull(input, store, track)?;
             let ow = *outer_width;
             let n = outer.rows();
@@ -2924,10 +2924,65 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             for (_, e) in yields {
                 out_slots.push(eval(e, store, &sub)?);
             }
-            let mut out = Batch::of(out_slots);
+            let mut matched = Batch::of(out_slots);
             // Carry any path the sub-rows accumulated (present only under lineage).
-            out.lineage = sub.lineage;
-            out
+            matched.lineage = sub.lineage.clone();
+            if *optional {
+                // LEFT-outer: an outer row that produced no sub-row survives once,
+                // with every yield column NULL. The prov column (slot `ow` of `sub`)
+                // records which outer row each sub-row came from.
+                let prov = sub.slot(ow);
+                let mut seen = vec![false; n];
+                for r in 0..sub.rows() {
+                    if let Value::Num(p) = prov.value_at(r) {
+                        let i = p as usize;
+                        if i < n {
+                            seen[i] = true;
+                        }
+                    }
+                }
+                let missing: Vec<usize> = (0..n).filter(|&i| !seen[i]).collect();
+                if !missing.is_empty() {
+                    // Build a fill SEED shaped like the body's row: the imported
+                    // scope vars (slots < ow) keep their outer value; every body slot
+                    // (prov and the subquery's own variables, >= ow) is NULL. Evaluate
+                    // the yields over it — so a `RETURN *` that re-yields an imported
+                    // var keeps it, while a fresh body var yields NULL (ISO: the outer
+                    // row survives with the imported binding intact, the new one unbound).
+                    let sub_width = sub.slots.len();
+                    let k = missing.len();
+                    let fill_seed = Batch::of(
+                        (0..sub_width)
+                            .map(|j| {
+                                if j < ow {
+                                    outer.slot(j).gather(&missing)
+                                } else {
+                                    // NULL of the body slot's own variant, so a node/edge
+                                    // yield stays a node/edge column (u32::MAX sentinel → NULL)
+                                    // rather than downgrading to Gen — which keeps `f.name`
+                                    // (property access on a node column) resolving to NULL.
+                                    match sub.slot(j) {
+                                        Col::Nodes(_) => Col::Nodes(vec![u32::MAX; k]),
+                                        Col::Edges(_) => Col::Edges(vec![u32::MAX; k]),
+                                        _ => Col::Gen(vec![Value::Null; k]),
+                                    }
+                                }
+                            })
+                            .collect(),
+                    );
+                    let mut fill_slots: Vec<Col> =
+                        (0..ow).map(|j| fill_seed.slot(j).clone()).collect();
+                    for (_, e) in yields {
+                        fill_slots.push(eval(e, store, &fill_seed)?);
+                    }
+                    let fill = Batch::of(fill_slots);
+                    // The null-fill rows carry no path; drop lineage rather than
+                    // desync it (OPTIONAL CALL over a path binding is niche).
+                    matched.lineage = None;
+                    matched = concat_batches(&[matched, fill]);
+                }
+            }
+            matched
         }
         Plan::CallProcedure { name, config } => {
             // A bad config (unknown key / wrong-type value) is a data exception — not

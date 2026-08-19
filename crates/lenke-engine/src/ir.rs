@@ -891,14 +891,17 @@ pub enum Plan {
     /// from a scope variable) and emit one output row per sub-row: the `input`
     /// row's first `outer_width` slots followed by the `yields` expressions
     /// evaluated over the sub-row. An outer row with no sub-row is dropped (inner
-    /// lateral join); the `OPTIONAL` variant and an aggregating subquery are
-    /// deferred. Only the `yields` columns (not the subquery's internal variables)
-    /// survive into the outer scope.
+    /// lateral join) UNLESS `optional` — `OPTIONAL CALL` is a LEFT-outer join, so
+    /// an outer row with no sub-row survives once with every yield column NULL.
+    /// (An aggregating subquery is still deferred.) Only the `yields` columns (not
+    /// the subquery's internal variables) survive into the outer scope. The body is
+    /// built with a provenance id reserved at slot `outer_width` (see the exec).
     CallInline {
         input: Box<Plan>,
         body: Box<Plan>,
         yields: Vec<(String, Expr)>,
         outer_width: usize,
+        optional: bool,
     },
     /// `CALL name(config)` — a named built-in procedure (a graph algorithm). A leaf
     /// that runs the algorithm over the whole store and produces a two-slot batch:
