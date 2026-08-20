@@ -1492,6 +1492,9 @@ impl Parser {
                 // so the union is a continuable node frontier.
                 let from = self.current;
                 let width = self.slots;
+                // Seed the arms with the outer edge hop so a leading `otherV()`/`inV()`
+                // off `V().outE()` resolves against its origin (see parse_sub_body_seeded).
+                self.edge_hop = prev_edge_hop;
                 let mut bodies = Vec::new();
                 loop {
                     // A `<hop>.count()` branch is a PER-ELEMENT count (each input keeps
@@ -1517,6 +1520,7 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 self.current = 0;
                 self.slots = 1;
+                self.edge_hop = None; // the reconverged frontier is not a just-hopped edge
                 plan.branch(bodies)
             }
             "optional" => {
@@ -1528,6 +1532,9 @@ impl Parser {
                 // single hop.
                 let from = self.current;
                 let slots = self.slots;
+                // Seed the arm with the outer edge hop (see parse_sub_body_seeded) so a
+                // leading `otherV()`/`inV()` off `V().outE()` resolves against its origin.
+                self.edge_hop = prev_edge_hop;
                 // The fallback fires where the body produced NOTHING — a correlated
                 // EXISTS over the body. The general EXISTS eval inserts a provenance
                 // column at slot `slots`, which would shift a multi-hop body's
@@ -1551,6 +1558,7 @@ impl Parser {
                     .reconverge(from);
                 self.current = 0;
                 self.slots = 1;
+                self.edge_hop = None; // the reconverged frontier is not a just-hopped edge
                 plan.branch(vec![body.reconverge(oc), fallback])
             }
             "coalesce" => {
@@ -1607,6 +1615,9 @@ impl Parser {
                 // fires only where every earlier body did NOT — an exclusion guard on the
                 // seed `Row`, then the body's own steps (a hop chain, a projection, …).
                 let slots = self.slots;
+                // Seed the arms with the outer edge hop so a leading `otherV()`/`inV()`
+                // off `V().outE()` resolves against its origin (see parse_sub_body_seeded).
+                self.edge_hop = prev_edge_hop;
                 let mut bodies = Vec::new();
                 let mut prior: Option<Expr> = None; // OR of the earlier branches' existence
                 let mut any_edge = false; // an edge-hop body → coalesce yields an edge frontier
@@ -1680,6 +1691,7 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 self.current = 0;
                 self.slots = 1;
+                self.edge_hop = None; // the reconverged frontier is not a just-hopped edge
                 self.on_edge = any_edge;
                 // An edge-yielding coalesce keeps the interleaved edge-path answerable
                 // (its edge lands in the lineage); a non-edge coalesce breaks it.
@@ -2012,6 +2024,9 @@ impl Parser {
                 // absent else is implicit identity — the source element passes through.
                 let from = self.current;
                 let slots = self.slots;
+                // Seed the arms with the outer edge hop so a leading `otherV()`/`inV()`
+                // off `V().outE()` resolves against its origin (see parse_sub_body_seeded).
+                self.edge_hop = prev_edge_hop;
                 // The cond is a per-row PREDICATE (`has`/`where`/`values('k').is(…)`/
                 // `outE().count().is(…)` — everything `child_filter_expr` parses) OR a
                 // bare NAVIGATING traversal (`out('K')`, `outE('K')`) whose truth is
@@ -2101,6 +2116,7 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 self.current = 0;
                 self.slots = 1;
+                self.edge_hop = None; // the reconverged frontier is not a just-hopped edge
                 plan.branch(vec![then_body.reconverge(then_oc), else_arm])
             }
             "and" | "or" => {
@@ -5353,7 +5369,12 @@ impl Parser {
     ) -> Result<(Plan, usize, usize), String> {
         let saved_current = self.current;
         let saved_slots = self.slots;
-        let saved_edge = self.edge_hop.take();
+        // The body INHERITS the current edge-hop record (usually None), so a branch arm
+        // whose outer frontier is an edge reached THROUGH a vertex (`V().outE()`) lets a
+        // leading `otherV()`/`inV()` resolve against that origin — the branch handlers
+        // seed `edge_hop` with the outer hop before calling. A bare-edge outer frontier
+        // (`E()`) has no such record, so the arm's `otherV()` still faults.
+        let saved_edge = self.edge_hop;
         let saved_repeat = self.pending_repeat.take();
         let saved_path_ok = self.path_ok;
         let saved_on_edge = self.on_edge;
@@ -8556,6 +8577,31 @@ mod tests {
             "optional fallback: {:?}",
             opt.rows[0][0]
         );
+    }
+
+    /// `otherV()` inside a branch arm resolves against the edge's ORIGIN when the edge
+    /// was reached THROUGH a vertex (`V().outE().optional(otherV())`) — matching real
+    /// TinkerPop (verified against gremlin-console on createModern(): count 2, names
+    /// [josh,vadas]). Off a BARE edge frontier (`E().otherV()`) there is no origin, so it
+    /// faults (TinkerPop throws "path history ... does not contain a previous vertex").
+    #[test]
+    fn otherv_in_branch_resolves_against_edge_origin() {
+        let st = social(); // 3 KNOWS edges (a->bob, a->c, bob->c), 1 WORKS_ON
+                           // Reached through a vertex → otherV resolves the far endpoint for every edge.
+        let c = gremlin_rows("g.V().outE('KNOWS').optional(otherV()).count()", &st);
+        assert!(
+            matches!(c.rows[0][0], Value::Num(n) if n == 3.0),
+            "got {:?}",
+            c.rows[0][0]
+        );
+        // A bare edge frontier has no origin → otherV faults, as in TinkerPop.
+        for q in [
+            "g.E().otherV()",
+            "g.E().optional(otherV()).count()",
+            "g.V().optional(otherV()).count()",
+        ] {
+            assert!(super::parse(q).is_err(), "expected fault: {q}");
+        }
     }
 
     /// coalesce falls through EXACTLY: an arm whose leading hop exists but whose FULL
