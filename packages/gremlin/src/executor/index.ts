@@ -176,10 +176,10 @@ const assertFrontierTypes = (plan: Plan): void => {
       }
     }
 
-    if (
-      (k === 'inV' || k === 'outV' || k === 'bothV' || k === 'otherV') &&
-      (f === 'vertex' || f === 'scalar')
-    ) {
+    // Only a VERTEX frontier is a definite fault — the engine rejects `g.V().otherV()`
+    // but is LENIENT on a scalar frontier (`E().label().inV()` is fine — it just matches
+    // nothing). An 'edge' frontier is the valid case; 'unknown' never faults.
+    if ((k === 'inV' || k === 'outV' || k === 'bothV' || k === 'otherV') && f === 'vertex') {
       throw new LenkeError(
         `${k}() requires an edge — a vertex has no incident edge to move across; ` +
           `use an edge step (outE()/inE()/bothE()) before ${k}()`,
