@@ -23,6 +23,7 @@ import { Graph, parseDate, parseDateTime } from '@lenke/core';
 import { query as tsQuery } from '@lenke/gql';
 import { deserialize as tsDeserialize } from '@lenke/serialization';
 
+import { createFfiEngineBackend } from './backend-ffi-engine.js';
 import { createFfiBackend } from './backend-ffi.js';
 import { graphFromNdjson } from './graph.js';
 
@@ -31,6 +32,13 @@ const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dyli
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
 const LIB = new URL(
   `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
+  import.meta.url,
+).pathname;
+// The retiring lenke-core collapses non-finite → null (Model A); the engine keeps it as
+// a distinct value (Model B), which pure-TS now matches. The D1 suite below therefore
+// runs against the ENGINE backend, not core.
+const ENGINE_LIB = new URL(
+  `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
   import.meta.url,
 ).pathname;
 const hasLib = existsSync(LIB);
@@ -2446,12 +2454,16 @@ suite('GQL differential: LIMIT/OFFSET $param + label-test predicate (TS vs nativ
   });
 });
 
-// --- D1: a non-finite JSON number in a loaded document coerces to null on BOTH
-// engines. TS coerces via `normalizeBag` on decode; native's ndjson/pg-json
-// codecs map ±Infinity / NaN → null at the parse boundary. Storing a real
-// non-finite float would corrupt count/sum/min/max/`IS NULL` and diverge.
-suite('GQL differential: non-finite number coerces to null (D1)', () => {
-  const backend = createFfiBackend(LIB);
+// --- Non-finite numbers are DISTINCT present values (Model B), not null. A non-finite
+// (±Infinity from overflow, NaN from an invalid op) is a real IEEE-754 value: ordered
+// (−∞ < finite < +∞), comparable, present to `IS NULL` and aggregates — exactly like
+// PostgreSQL / Neo4j / MS Fabric GQL, and unlike the retiring lenke-core, which collapses
+// it to null. It converts to null ONLY at JSON egress (JSON has no NaN/Infinity), which is
+// expected and lossy. GQL has no NaN/Infinity literal or `IS NAN` predicate, so the
+// `_is_nan` / `_is_infinite` / `_is_finite` extension functions (leading-underscore sigil,
+// non-conformant) are the way to test for them. This suite runs against the ENGINE.
+suite('GQL differential: non-finite is a distinct value (Model B)', () => {
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   // `1e400` overflows an f64 to +Infinity; `-1e400` to -Infinity.
   const NF_NDJSON = [
     '{"type":"node","id":"1","labels":["N"],"properties":{"k":1,"v":1e400}}',
@@ -2466,24 +2478,55 @@ suite('GQL differential: non-finite number coerces to null (D1)', () => {
     JSON.stringify(nativeGraph.query(q)),
   ];
 
-  test('an overflowing literal reads back as a PRESENT null', () => {
+  test('a stored ±Infinity renders as null at JSON egress (lossy, as designed)', () => {
     const [ts, native] = both(`MATCH (n:N) RETURN n.v AS v ORDER BY n.k`);
     expect(ts).toBe(native);
     expect(ts).toBe(`[{"v":null},{"v":null},{"v":2.5}]`);
   });
 
-  test('IS NULL sees the coerced value as null (the repro)', () => {
+  test('IS NULL is FALSE for a non-finite — it is a present value', () => {
     const [ts, native] = both(`MATCH (n:N) WHERE n.v IS NULL RETURN count(*) AS c`);
     expect(ts).toBe(native);
-    expect(ts).toBe(`[{"c":2}]`);
+    expect(ts).toBe(`[{"c":0}]`);
   });
 
-  test('aggregates ignore the coerced nulls identically (no NaN poisoning)', () => {
+  test('comparisons order it: −∞ < finite < +∞', () => {
+    const [gt, gtn] = both(`MATCH (n:N) WHERE n.v > 5 RETURN n.k AS k ORDER BY k`);
+    expect(gt).toBe(gtn);
+    expect(gt).toBe(`[{"k":1}]`); // only +∞ is > 5
+    const [ord, ordn] = both(`MATCH (n:N) RETURN n.k AS k ORDER BY n.v, n.k`);
+    expect(ord).toBe(ordn);
+    expect(ord).toBe(`[{"k":2},{"k":3},{"k":1}]`); // −∞, 2.5, +∞
+  });
+
+  test('aggregates see the non-finite (counted; sum NaN-poisons to null)', () => {
     const [ts, native] = both(
       `MATCH (n:N) RETURN count(n.v) AS c, sum(n.v) AS s, min(n.v) AS mn, max(n.v) AS mx`,
     );
     expect(ts).toBe(native);
-    expect(ts).toBe(`[{"c":1,"s":2.5,"mn":2.5,"mx":2.5}]`);
+    // count = 3 (all present); sum = +∞ + −∞ = NaN → null; min = −∞ → null; max = +∞ → null.
+    expect(ts).toBe(`[{"c":3,"s":null,"mn":null,"mx":null}]`);
+  });
+
+  test('_is_nan / _is_infinite / _is_finite are TOTAL booleans (never null)', () => {
+    const [cls, clsn] = both(
+      `RETURN _is_nan(sqrt(-1)) AS a, _is_nan(2.5) AS b, _is_nan(1e400) AS c, ` +
+        `_is_infinite(1e400) AS d, _is_infinite(2.5) AS e, _is_infinite(null) AS f, ` +
+        `_is_finite(2.5) AS g, _is_finite(1e400) AS h, _is_finite('x') AS i`,
+    );
+    expect(cls).toBe(clsn);
+    expect(cls).toBe(
+      `[{"a":true,"b":false,"c":false,"d":true,"e":false,"f":false,"g":true,"h":false,"i":false}]`,
+    );
+  });
+
+  test('the classifiers filter the non-finite rows by kind', () => {
+    const [fin, finn] = both(`MATCH (n:N) WHERE _is_finite(n.v) RETURN n.k AS k ORDER BY k`);
+    expect(fin).toBe(finn);
+    expect(fin).toBe(`[{"k":3}]`);
+    const [inf, infn] = both(`MATCH (n:N) WHERE _is_infinite(n.v) RETURN n.k AS k ORDER BY k`);
+    expect(inf).toBe(infn);
+    expect(inf).toBe(`[{"k":1},{"k":2}]`);
   });
 });
 

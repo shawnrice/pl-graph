@@ -457,6 +457,18 @@ export const NUM_CONSTANTS: Record<string, number> = {
   e: Math.E,
 };
 
+// Non-finite CLASSIFIERS (leading-underscore extensions — NOT ISO): TOTAL boolean
+// predicates. True iff the argument IS that IEEE-754 kind, false for everything else (a
+// finite number, null, a string, any non-matching value). Never null, never throw — GQL
+// has no NaN/Infinity literal or `IS NAN` predicate, so these are how you test for the
+// special values (which otherwise render as null only at JSON egress). The caller runs
+// these BEFORE null-propagation so `_is_nan(null)` is `false`, not `null`.
+export const NONFINITE_CLASSIFIER: Record<string, (a: unknown) => boolean> = {
+  _is_nan: (a) => Number.isNaN(a),
+  _is_infinite: (a) => a === Infinity || a === -Infinity,
+  _is_finite: (a) => Number.isFinite(a),
+};
+
 /**
  * Render one element of a list/path: a null element joins as the EMPTY string
  * (`String([1,null,3])` === `"1,,3"`), unlike a top-level null, which renders as
@@ -737,6 +749,7 @@ export const callScalar = (
   assertScalarArgTypes(name, args);
 
   const [a, b] = args;
+
   const unaryNum = UNARY_NUM[name];
 
   if (unaryNum) {
@@ -1707,6 +1720,16 @@ export const callExtendedScalar = (
   limits: GraphLimits = DEFAULT_CONFIG.limits,
 ): unknown => {
   const [a, b] = args;
+
+  // Non-finite classifiers (total booleans, never null) — see NONFINITE_CLASSIFIER. They
+  // reach here via callScalar's default arm, ahead of any null-propagation, so
+  // `_is_nan(null)` is `false`, not `null`. (Homed in this second dispatcher to keep
+  // callScalar under its complexity budget.)
+  const classifier = NONFINITE_CLASSIFIER[name];
+
+  if (classifier) {
+    return classifier(a);
+  }
 
   // The STRICT scalar `CAST(a AS <b>)` (`b` is the target category literal) — faults on a
   // failed conversion, unlike the lenient to_integer/… forms the parser used to desugar to.

@@ -5856,7 +5856,12 @@ impl Parser {
             | "cardinality" | "head" | "last"
             // Temporal component accessors carry the leading-underscore extension sigil
             // (`_year`), matching core; the bare ISO spellings are NOT in the grammar.
-            | "_year" | "_month" | "_day" | "_hour" | "_minute" | "_second" | "date"
+            | "_year" | "_month" | "_day" | "_hour" | "_minute" | "_second"
+            // Non-finite CLASSIFIERS (leading-underscore extensions — NOT ISO). Total
+            // boolean predicates over the IEEE-754 special values that GQL has no
+            // literal or predicate for: `_is_nan`/`_is_infinite`/`_is_finite`. Never
+            // null, never throw — a non-number argument is simply not that kind.
+            | "_is_nan" | "_is_infinite" | "_is_finite" | "date"
             | "local_time" | "datetime" | "local_datetime" | "zoned_time" | "zoned_datetime"
             | "duration" | "to_integer" | "tointeger" | "to_float" | "tofloat" | "to_string"
             | "tostring" | "to_boolean" | "toboolean" | "char_length" | "character_length"
@@ -9852,6 +9857,87 @@ mod tests {
             &store,
         );
         assert!(matches!(col(&out, 0, "s"), crate::value::Value::Num(x) if x.is_nan()));
+    }
+
+    /// `_is_nan` / `_is_infinite` / `_is_finite` — TOTAL boolean classifiers over the
+    /// IEEE-754 special values (leading-underscore extensions). True iff the argument IS
+    /// that kind; false for everything else (a finite number, null, a string). Never NULL,
+    /// never a fault — GQL has no NaN/Infinity literal or `IS NAN`, so these are the way to
+    /// test for the non-finite values that only render as null at JSON egress.
+    #[test]
+    fn nonfinite_classifiers() {
+        use crate::value::Value;
+        let store = social();
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) WHERE p.name='alice' RETURN \
+                 _is_nan(sqrt(0 - p.age)) AS a, _is_nan(p.age) AS b, _is_nan(1e400) AS c, \
+                 _is_infinite(1e400) AS d, _is_infinite(0 - 1e400) AS e, _is_infinite(p.age) AS f, \
+                 _is_finite(p.age) AS g, _is_finite(1e400) AS h, _is_finite(sqrt(0 - p.age)) AS i, \
+                 _is_nan(null) AS j, _is_infinite(null) AS k, _is_finite('x') AS l",
+            )
+            .unwrap(),
+            &store,
+        );
+        let t = |k: &str| matches!(col(&out, 0, k), Value::Bool(true));
+        assert!(t("a")); // sqrt(-30) is NaN
+        assert!(!t("b") && !t("c")); // a finite / an infinity is not NaN
+        assert!(t("d") && t("e")); // ±1e400 overflow to ±∞
+        assert!(!t("f")); // a finite is not infinite
+        assert!(t("g")); // a finite is finite
+        assert!(!t("h") && !t("i")); // ∞ / NaN are not finite
+                                     // Total: null / non-number → the DEFINITE boolean false, never null.
+        assert!(matches!(col(&out, 0, "j"), Value::Bool(false)));
+        assert!(matches!(col(&out, 0, "k"), Value::Bool(false)));
+        assert!(matches!(col(&out, 0, "l"), Value::Bool(false)));
+    }
+
+    /// A stored ±Infinity (an overflowing property literal) is a DISTINCT present value
+    /// (Model B): `IS NULL` is false, it orders (−∞ < finite < +∞), aggregates count it,
+    /// and it renders null only at egress. (`sum` NaN-poisons on +∞ + −∞.)
+    #[test]
+    fn stored_infinity_is_a_value() {
+        use crate::value::Value;
+        let mut b = crate::store::Builder::default();
+        b.node(
+            &["N"],
+            &[("k", Value::Num(1.0)), ("v", Value::Num(f64::INFINITY))],
+        );
+        b.node(
+            &["N"],
+            &[("k", Value::Num(2.0)), ("v", Value::Num(f64::NEG_INFINITY))],
+        );
+        b.node(&["N"], &[("k", Value::Num(3.0)), ("v", Value::Num(2.5))]);
+        let store = b.build();
+        // IS NULL is false for the ±∞ rows — they are present values.
+        let out = run(
+            &super::parse("MATCH (n:N) WHERE n.v IS NULL RETURN count(*) AS c").unwrap(),
+            &store,
+        );
+        assert_eq!(num(&col(&out, 0, "c")), 0.0);
+        // Ordered: −∞ (k=2), 2.5 (k=3), +∞ (k=1).
+        let out = run(
+            &super::parse("MATCH (n:N) RETURN n.k AS k ORDER BY n.v, n.k").unwrap(),
+            &store,
+        );
+        let ks: Vec<f64> = (0..out.rows.len())
+            .map(|i| num(&col(&out, i, "k")))
+            .collect();
+        assert_eq!(ks, vec![2.0, 3.0, 1.0]);
+        // Aggregate: count all 3; sum = +∞ + −∞ = NaN.
+        let out = run(
+            &super::parse("MATCH (n:N) RETURN count(n.v) AS c, sum(n.v) AS s").unwrap(),
+            &store,
+        );
+        assert_eq!(num(&col(&out, 0, "c")), 3.0);
+        assert!(matches!(col(&out, 0, "s"), Value::Num(x) if x.is_nan()));
+        // `_is_finite` filters to just the finite row.
+        let out = run(
+            &super::parse("MATCH (n:N) WHERE _is_finite(n.v) RETURN n.k AS k").unwrap(),
+            &store,
+        );
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(num(&col(&out, 0, "k")), 3.0);
     }
 
     /// `CONTAINS` / `STARTS WITH` / `ENDS WITH` infix predicates desugar to the

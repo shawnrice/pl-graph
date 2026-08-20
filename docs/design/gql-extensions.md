@@ -327,3 +327,46 @@ wall clock). A string is **not coerced** — it throws `E_INVALID_VALUE` (wrap w
 component, or a duration, throws likewise; `null` → `null`. **Migration:** if a
 future GQL edition standardizes component extraction, add the bare conformant name
 then and keep `_year` as a deprecated alias (per §1's migration rule).
+
+## 7. Extension functions — non-finite classifiers (`_is_nan`, `_is_infinite`, `_is_finite`)
+
+Status: **implemented** (2026-08-19).
+
+### 7.1 The non-finite value model (Model B)
+
+A non-finite floating-point value — `±Infinity` (from an overflowing literal like
+`1e400`, or an operation like `1e308 * 10`) or `NaN` (from `sqrt(-1)`, `ln(0)`, `∞ − ∞`,
+…) — is a **distinct present value**, not `null`. It is ordered (`−∞ < finite < +∞`),
+comparable (`∞ > 5` is true, `∞ = ∞` is true), present to `IS NULL` (`x IS NULL` is
+**false** for a non-finite), counted by aggregates, and a distinct `GROUP BY` / `DISTINCT`
+key. `NaN` uses the total order lenke already applies in `ORDER BY`/`min`/`max` (`NaN`
+sorts last, `NaN = NaN`); as a predicate operand it stays IEEE-unordered (a comparison
+against `NaN` is not true, so it filters out).
+
+This is the IEEE-754 model shared by PostgreSQL, Neo4j (Cypher), and MS Fabric GQL. GQL's
+own grammar (ISO/IEC 39075) has **no** NaN/Infinity literal and **no** `IS NAN` predicate —
+its only special-value predicate is `IS NULL` — so the special values are only reachable
+through arithmetic and only testable through the classifiers below.
+
+**JSON egress is lossy, by design.** JSON has no NaN/Infinity, so a non-finite value
+renders as `null` when it leaves through JSON (`RETURN n.v` on a stored `+∞` yields
+`null`). That is a rendering coercion at the boundary only — the value is still a present,
+non-null, ordered number inside the graph. (Storing it and dumping back to NDJSON is
+therefore lossy: the reloaded value is `null`.) The retiring `lenke-core` collapsed
+non-finite to `null` at _ingest_ (Model A); the engine and pure-TS keep it (Model B).
+
+### 7.2 The classifiers
+
+`_is_nan(x)`, `_is_infinite(x)`, `_is_finite(x)` are **total boolean** predicates: each
+returns `true` iff `x` IS that kind of value, and `false` for everything else — a finite
+number, the other non-finite kinds, `null`, a string, any non-number. They **never return
+`null` and never throw** (like `IS NULL`, a classifier is a definite boolean, never
+unknown — returning `null` from `is-x` would be pathological). So they run _before_ the
+usual nullish-propagation/type-error machinery.
+
+They wear the sigil because **testing for a non-finite is not in the ISO GQL function
+catalogue** (the grammar cannot even express the values). Neo4j spells them `isNaN` /
+`gds.util.isInfinite`; there is no single conformant form, which is exactly what the sigil
+marks. `WHERE _is_finite(n.v)` is the portable way to drop the overflow/NaN rows;
+`WHERE _is_infinite(n.v)` finds them. **Migration:** if a future GQL edition standardizes
+these, add the bare names and keep the `_`-forms as deprecated aliases (per §1).

@@ -85,6 +85,10 @@ const NUMS = [
   '1e-7',
   '1e100',
   '1e-300',
+  // Overflows an f64 to +Infinity — a DISTINCT present value (Model B), not null. Both
+  // engines keep it (ordered, comparable, IS-NULL-false), coercing to null only at JSON
+  // egress, so it must stay byte-identical through comparisons/aggregates/sort.
+  '1e400',
   '123456.789',
   '9007199254740992',
   '2',

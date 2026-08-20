@@ -93,7 +93,12 @@ const normalizeAt = (value: unknown, depth: number): PropertyValue => {
   }
 
   if (typeof value === 'number') {
-    return Number.isFinite(value) ? value : null;
+    // Non-finite (±Infinity, NaN) is a DISTINCT present value (IEEE 754 / Postgres /
+    // Neo4j model), NOT null — it is ordered (−∞ < finite < +∞), comparable, and
+    // survives IS NULL / aggregates as a real value. It converts to null only when it
+    // leaves through JSON (JSON has no NaN/Infinity), which is expected and lossy. Use
+    // `_is_nan` / `_is_infinite` / `_is_finite` to test for it in a query.
+    return value;
   }
 
   if (typeof value === 'undefined') {

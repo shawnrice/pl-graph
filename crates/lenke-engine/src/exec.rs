@@ -15033,6 +15033,15 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             }
             acc
         }
+        // Non-finite CLASSIFIERS (leading-underscore extensions): TOTAL boolean
+        // predicates — true iff the argument IS that kind of IEEE-754 value, false for
+        // everything else (finite / null / string / any non-matching number). Never null,
+        // never throw. GQL has no NaN/Infinity literal or `IS NAN` predicate, so these are
+        // the way to test for the special values that are otherwise only visible via
+        // comparisons/ordering. (Non-finite renders as null only at JSON egress.)
+        "_is_nan" => Value::Bool(matches!(&args[0], Value::Num(x) if x.is_nan())),
+        "_is_infinite" => Value::Bool(matches!(&args[0], Value::Num(x) if x.is_infinite())),
+        "_is_finite" => Value::Bool(matches!(&args[0], Value::Num(x) if x.is_finite())),
         // numeric constants (0 args)
         "e" => Value::Num(std::f64::consts::E),
         "pi" => Value::Num(std::f64::consts::PI),

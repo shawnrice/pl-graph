@@ -69,8 +69,12 @@ describe('serialization error codes', () => {
         ErrorCode.InvalidValue,
       ),
     ).toBe(true);
-    expect(normalizeValue(Number.NaN)).toBeNull();
-    expect(normalizeValue(Infinity)).toBeNull();
+    // Non-finite is a DISTINCT present value (Model B — IEEE 754 / Postgres / Neo4j),
+    // kept through ingest, not coerced to null. It renders as null only at JSON egress.
+    // Test for it with `_is_nan` / `_is_infinite` / `_is_finite`.
+    expect(normalizeValue(Number.NaN)).toBeNaN();
+    expect(normalizeValue(Infinity)).toBe(Infinity);
+    expect(normalizeValue(-Infinity)).toBe(-Infinity);
   });
 
   test('a lone UTF-16 surrogate is rejected (match native serde)', () => {
