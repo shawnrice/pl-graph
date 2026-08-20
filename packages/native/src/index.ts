@@ -56,6 +56,10 @@ export {
   type SchemaOp,
 } from './graph.js';
 export { createStore, inferDeps, type Store, type LiveQuery } from './store.js';
+// The engine-backed builder + thin ABI shape, re-exported so an out-of-tree host
+// (the `@lenke/node` napi adapter) can drive the same `Backend`-assembling logic
+// over its own `lnk_*` transport instead of reimplementing it.
+export { buildEngineBackend, encodeInput, type EngineAbi } from './backend-engine.js';
 // The napi adapter rebuilds coded LenkeErrors from the wire-code tag its N-API
 // exceptions carry, matching the errors the bun:ffi / wasm backends throw.
 export { errorFromNapi } from './marshal.js';

@@ -1,41 +1,36 @@
-// Adapter: expose the napi `Graph` class as the shared `Backend` contract from
-// `@lenke/native`. The contract is handle-based (an opaque numeric token), while
-// the addon hands back live `Graph` objects — so we keep a small id→object
-// registry and let napi's GC reclaim a graph once its handle is dropped. The
-// per-call Map lookup is nanoseconds against query compute; the doc's own
-// measurements put the compute-to-transfer ratio around 2000:1.
-import { errorFromNapi } from '@lenke/native';
+// Adapter: drive the shared `Backend` contract from `@lenke/native` over the napi
+// addon. The addon exposes the engine's THIN abi (`Graph` = the 12 `lnk_*`
+// primitives: open / clone / config / stat / query / tx / schemaApply /
+// schemaDump / encode / command / commandAsync + the free `abiVersion`), and
+// `buildEngineBackend` assembles the full high-level Backend (codecs, schema DDL,
+// algorithms, prepared statements, CDC) over it — the exact same builder the
+// bun:ffi and wasm backends use, so this addon inherits their behavior for free.
+//
+// The Backend contract is handle-based (an opaque numeric token) while the addon
+// hands back live `Graph` objects, so we keep a small id→object registry and let
+// napi's GC reclaim a graph (`Drop` → `lnk_close`) once its handle is dropped. The
+// per-call Map lookup is nanoseconds against query compute.
+import { buildEngineBackend, encodeInput, errorFromNapi } from '@lenke/native';
 
-import { Graph, abiVersion, prepare } from './index.js';
+import { Graph, abiVersion } from './index.js';
 
 // The facade passes Uint8Array; the addon wants a Node Buffer. Wrap (no copy)
 // rather than reallocate when we already hold a Uint8Array view.
 const asBuffer = (u8) =>
   Buffer.isBuffer(u8) ? u8 : Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength);
 
-// Decodes the JSON MergeReport the addon returns from mergeNdjson.
-const mergeDecoder = new TextDecoder();
+const encoder = new TextEncoder();
 
 // The addon throws N-API exceptions tagged with the stable wire code
 // (`… [E_SYNTAX]`); rebuild them as coded LenkeErrors so a consumer matches
-// `hasErrorCode(e, ErrorCode.Syntax)` identically to the bun:ffi / wasm
-// backends. (The getters — counts / version / epoch — are infallible in the
-// addon, so only the fallible ops are wrapped.)
+// `hasErrorCode(e, ErrorCode.Syntax)` identically to the bun:ffi / wasm backends.
+const toLenkeError = (e) =>
+  errorFromNapi(e && typeof e.message === 'string' ? e.message : undefined);
 const coded = (fn) => {
   try {
     return fn();
   } catch (e) {
-    throw errorFromNapi(e && typeof e.message === 'string' ? e.message : undefined);
-  }
-};
-
-// Async twin of `coded`: rebuild an addon rejection (or a synchronous throw before
-// the promise is returned) as a coded LenkeError.
-const codedAsync = async (fn) => {
-  try {
-    return await fn();
-  } catch (e) {
-    throw errorFromNapi(e && typeof e.message === 'string' ? e.message : undefined);
+    throw toLenkeError(e);
   }
 };
 
@@ -61,81 +56,52 @@ export function createNodeBackend() {
     return graph;
   };
 
-  // A parallel registry for prepared statements (their own opaque handle,
-  // independent of any graph — matching the C ABI's `*mut Prepared`).
-  /** @type {Map<number, InstanceType<typeof import('./index.js').PreparedQuery>>} */
-  const prepared = new Map();
-  let nextPrepared = 1;
-  const putPrepared = (pq) => {
-    const handle = nextPrepared++;
-    prepared.set(handle, pq);
-
-    return handle;
-  };
-  const getPrepared = (handle) => {
-    const pq = prepared.get(handle);
-
-    if (pq === undefined) {
-      throw new Error(`lenke: invalid prepared handle ${handle}`);
-    }
-
-    return pq;
-  };
-
-  return {
+  // The thin engine abi, one method per `lnk_*` primitive, mapped onto the napi
+  // `Graph`. Every fallible call is `coded()` so a native fault surfaces as the
+  // same LenkeError the FFI/wasm abis throw — `buildEngineBackend` relies on that.
+  /** @type {import('@lenke/native').EngineAbi} */
+  const abi = {
     abiVersion: abiVersion(),
-
-    graphFromNdjson: (bytes, parallel) =>
-      coded(() => put(Graph.fromNdjson(asBuffer(bytes), parallel))),
-    mergeNdjson: (handle, bytes) =>
-      coded(() => JSON.parse(mergeDecoder.decode(get(handle).mergeNdjson(asBuffer(bytes))))),
-    // Drop the reference; the underlying lenke-core graph is freed when napi GCs
-    // the object. No explicit native free to call.
-    graphClone: (handle) => coded(() => put(get(handle).cloneGraph())),
-    graphFree: (handle) => {
+    open: (bytes, format) =>
+      coded(() => put(Graph.open(bytes ? asBuffer(bytes) : undefined, format))),
+    // Dropping the reference frees the underlying store when napi GCs the object
+    // (`Graph`'s `Drop` → `lnk_close`); there is no explicit native free to call.
+    close: (handle) => {
       registry.delete(handle);
     },
+    clone: (handle) => coded(() => put(get(handle).cloneGraph())),
+    config: (handle, id, value) => get(handle).config(id, value),
+    stat: (handle, which) => get(handle).stat(which),
+    query: (handle, lang, query, params, format) =>
+      coded(() => get(handle).query(lang, query, params ?? undefined, format)),
+    tx: (handle, action) => coded(() => get(handle).tx(action)),
+    schemaApply: (handle, json) => coded(() => get(handle).schemaApply(json)),
+    schemaDump: (handle) => coded(() => get(handle).schemaDump()),
+    encode: (handle, format) => coded(() => get(handle).encode(format)),
+    command: (handle, name, input) =>
+      coded(() => {
+        const bytes = encodeInput(input);
 
-    vertexCount: (handle) => get(handle).vertexCount,
-    edgeCount: (handle) => get(handle).edgeCount,
-    version: (handle) => get(handle).version(),
-    epoch: (handle, name) => get(handle).epoch(name),
-    // napi-rs camelCases the Rust `create_vertex_index` / `create_edge_index`.
-    createIndex: (handle, on, kind, keys) => get(handle).createIndex(on, kind, keys),
-    setConfig: (handle, id, value) => get(handle).setConfig(id, value),
-    dropVertexIndex: (handle, key) => get(handle).dropVertexIndex(key),
-    dropEdgeIndex: (handle, key) => get(handle).dropEdgeIndex(key),
-    vertexIndexes: (handle) => get(handle).vertexIndexes(),
-    lastWriteScope: (handle, key) => get(handle).lastWriteScope(key),
-    edgeIndexes: (handle) => get(handle).edgeIndexes(),
-    // JSON string over the addon boundary (like the C ABI's lnk_dump_schema), parsed
-    // to the SchemaOp[] the Backend contract returns.
-    dumpSchema: (handle) => JSON.parse(get(handle).dumpSchema()),
-
-    // `prepare` is a module-level addon function (a Prepared needs no graph);
-    // execute binds it to a graph at call time.
-    prepare: (text, maxOperatorChain) => coded(() => putPrepared(prepare(text, maxOperatorChain))),
-    preparedFree: (handle) => {
-      prepared.delete(handle);
-    },
-    preparedQueryRows: (prep, graph, params) =>
-      coded(() => getPrepared(prep).query(get(graph), params)),
-    preparedQueryArrow: (prep, graph, params) =>
-      coded(() => getPrepared(prep).queryArrow(get(graph), params)),
-
-    // `params` arrives pre-serialized (a flat JSON object of $name bindings)
-    // per the Backend contract; the addon decodes it crate-side.
-    queryRows: (handle, query, params) => coded(() => get(handle).query(query, params)),
-    queryArrow: (handle, query, params) => coded(() => get(handle).queryArrow(query, params)),
-    queryArrowIpc: (handle, query, file, params) =>
-      coded(() => get(handle).queryArrowIpc(query, params, file)),
-    gremlinJson: (handle, query) => coded(() => get(handle).gremlin(query)),
-    algo: (handle, name, config) => coded(() => get(handle).algo(name, config)),
-    // Off-thread on a libuv worker → Promise<Buffer>; the event loop stays free.
-    algoAsync: (handle, name, config) => codedAsync(() => get(handle).algoAsync(name, config)),
-
-    encodeNdjson: (handle) => get(handle).encodeNdjson(),
-    serialize: (handle, format) => coded(() => get(handle).serialize(format)),
-    deserialize: (bytes, format) => coded(() => put(Graph.deserialize(asBuffer(bytes), format))),
+        return get(handle).command(name, bytes ? asBuffer(bytes) : undefined);
+      }),
   };
+
+  const backend = buildEngineBackend(abi);
+
+  // `buildEngineBackend` has no off-thread algorithm path (the FFI/wasm hosts are
+  // single-threaded). Node has a libuv threadpool, so add the async twin over the
+  // addon's `commandAsync`, wrapping the same `{name, config}` payload `algo` uses.
+  backend.algoAsync = async (handle, name, config) => {
+    try {
+      const payload = encoder.encode(
+        JSON.stringify({ name, config: config ? JSON.parse(config) : {} }),
+      );
+
+      return await get(handle).commandAsync('algo', asBuffer(payload));
+    } catch (e) {
+      throw toLenkeError(e);
+    }
+  };
+
+  return backend;
 }
