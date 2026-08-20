@@ -33,14 +33,14 @@ import {
 } from '@lenke/core';
 import { deserialize as tsDeserialize } from '@lenke/serialization';
 
-import { createFfiBackend } from './backend-ffi.js';
+import { createFfiEngineBackend } from './backend-ffi-engine.js';
 import { graphFromNdjson } from './graph.js';
 
-const LIB = new URL('../../../crates/lenke-core/target/release/liblenke_core.so', import.meta.url)
+const LIB = new URL('../../../crates/lenke-engine/target/release/liblenke_engine.so', import.meta.url)
   .pathname;
 const hasLib = existsSync(LIB);
 const suite = hasLib ? describe : describe.skip;
-const ffi = hasLib ? createFfiBackend(LIB) : null;
+const ffi = hasLib ? createFfiEngineBackend(LIB) : null;
 
 const mulberry32 = (seed: number): (() => number) => {
   let a = seed >>> 0;
