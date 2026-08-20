@@ -4,7 +4,7 @@
 //
 // One source of truth per case, exactly like gremlin-conformance.test.ts: build a
 // random `Plan`, run it on the TS engine directly, emit it to Groovy via
-// `planToGremlin` and run THAT on the Rust core, then compare canonicalized JSON.
+// `planToGremlin` and run THAT on the Rust ENGINE, then compare canonicalized JSON.
 // Every iteration therefore also exercises the emitter and `parse.rs`.
 //
 // It immediately earned its keep: the conformance harness's `canonJson` claimed
@@ -62,7 +62,7 @@ import {
   type Plan,
 } from '@lenke/gremlin';
 
-import { createFfiBackend } from './backend-ffi.js';
+import { createFfiEngineBackend } from './backend-ffi-engine.js';
 
 // Normalize a TS result to the Rust JSON-carrier shape (a copy of the
 // conformance suite's `canonJson`; importing it from a *.test.ts pulls in
@@ -124,11 +124,11 @@ const canonJson = (v: unknown): unknown => {
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
 const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
+  `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
   import.meta.url,
 ).pathname;
 const suite = existsSync(LIB) ? describe : describe.skip;
-const backend = existsSync(LIB) ? createFfiBackend(LIB) : null;
+const backend = existsSync(LIB) ? createFfiEngineBackend(LIB) : null;
 const decoder = new TextDecoder();
 const MODERN = [
   '{"type":"node","id":"1","labels":["PERSON"],"properties":{"name":"marko","age":29}}',
@@ -553,7 +553,7 @@ const nativeRun = (text: string): unknown[] => {
   }
 };
 
-suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
+suite('differential fuzz: gremlin (TS engine vs Rust ENGINE)', () => {
   // ONE fixture for both engines. The TS side used to build from
   // `createTestTinkerGraph()` while the native side decoded `MODERN`, so the two
   // definitions could drift and any drift read as a divergence — which is
@@ -586,7 +586,6 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
     let skippedUnordered = 0;
     let skippedUnbuildable = 0;
     let skippedLazySlice = 0;
-    let skippedCoreDrift = 0;
 
     for (let i = 0; i < ITERATIONS && divergences.length < 5; i++) {
       const r = mulberry32(caseSeed(SEED, i));
@@ -651,19 +650,6 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
       const ts = outcome(() => canonOrder(toArray(plan, tsGraph).map(canonJson), unordered));
       const native = outcome(() => canonOrder(nativeRun(text), unordered));
 
-      // TS now statically rejects an aggregate/sort/vertex-move on the wrong frontier KIND
-      // (`g.V().sum()`, `g.V().otherV()`, …) with E_SYNTAX — matching the ENGINE, which
-      // faults these at parse time (verified byte-identical, incl. the empty-frontier case).
-      // The retiring lenke-core is LENIENT here, so this fuzzer — still wired to core —
-      // sees a TS-only E_SYNTAX where core succeeds. That is the documented "TS aligns to
-      // the engine, core drifts" migration behavior, not a real divergence: skip it (it
-      // goes green once this fuzzer flips to the engine backend, where both fault).
-      if (ts.startsWith('ERR E_SYNTAX') && !native.startsWith('ERR')) {
-        skippedCoreDrift += 1;
-
-        continue;
-      }
-
       // Both failing is acceptable — each rejects the query. A divergence is one
       // side succeeding, or both succeeding with different results.
       if (ts !== native && !(ts.startsWith('ERR') && native.startsWith('ERR'))) {
@@ -683,14 +669,6 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
       console.log(
         `  ${skippedLazySlice}/${ITERATIONS} plans skipped: a zero-row slice below an ` +
           'early-yielding step — the engines differ on whether the upstream runs',
-      );
-    }
-
-    if (skippedCoreDrift > 0) {
-      console.log(
-        `  ${skippedCoreDrift}/${ITERATIONS} plans skipped: TS statically faults an ` +
-          'element-frontier aggregate/sort/vertex-move (E_SYNTAX, matching the engine) ' +
-          'where the retiring core is lenient — remove this skip when the fuzzer flips to engine',
       );
     }
 
