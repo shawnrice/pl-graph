@@ -6,12 +6,16 @@ import { run } from './executor.js';
 import {
   E,
   V,
+  aggregate,
+  cap,
   count,
   dedupe,
   eq,
   gt,
   has,
   hasLabel,
+  inject,
+  limit,
   max,
   order,
   otherV,
@@ -20,6 +24,7 @@ import {
   inV,
   repeat,
   simplePath,
+  store,
   sum,
   take,
   toList,
@@ -189,5 +194,31 @@ describe('static frontier-type faults (parity with the native engine)', () => {
     ok(traversal(V(), values('age'), order())).not.toThrow();
     ok(traversal(V(), count())).not.toThrow();
     ok(traversal(V(), outE('knows'), otherV(), count())).not.toThrow();
+  });
+});
+
+describe('aggregate() is an eager collecting barrier (store() is lazy)', () => {
+  const g = buildSocialGraph(); // 4 vertices
+  const arr = (r: Iterable<unknown>): unknown[] => [...r];
+
+  test('a downstream limit(0) below inject cannot cancel aggregate — cap sees all 4', () => {
+    // The barrier drains the whole upstream at its point in the pipeline, so limit(0)
+    // (fed the injected 1 first) never gets to block the collection. TinkerPop: 4.
+    const capped = arr(
+      run(traversal(V(), aggregate('x'), inject(1), limit(0), cap('x')), g),
+    ) as unknown[][];
+    expect(capped).toHaveLength(1);
+    expect(capped[0]).toHaveLength(4);
+
+    // Same with a bare limit(0), no inject.
+    const capped2 = arr(run(traversal(V(), aggregate('x'), limit(0), cap('x')), g)) as unknown[][];
+    expect(capped2[0]).toHaveLength(4);
+  });
+
+  test('store() stays LAZY — a limit(0) below inject cancels the upstream, so cap is empty', () => {
+    const capped = arr(
+      run(traversal(V(), store('x'), inject(1), limit(0), cap('x')), g),
+    ) as unknown[][];
+    expect(capped[0]).toHaveLength(0);
   });
 });

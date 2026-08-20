@@ -498,10 +498,13 @@ export const applyStep = (
       });
 
     case 'aggregate':
+      // `aggregate` is a COLLECTING BARRIER (TinkerPop `aggregate(global)`): it drains the
+      // whole upstream into the side-effect eagerly, so a downstream slice/inject cannot
+      // cancel it. `store` is the LAZY, non-barrier form.
+      return aggregateStep(stream, step.key, ctx, true);
+
     case 'store':
-      // Today both append per-traverser without a barrier. Distinct AST kinds
-      // so a future optimizer can introduce a barrier on `aggregate` only.
-      return aggregateStep(stream, step.key, ctx);
+      return aggregateStep(stream, step.key, ctx, false);
 
     case 'barrier':
       return barrierStep(stream);

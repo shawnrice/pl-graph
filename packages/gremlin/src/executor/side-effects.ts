@@ -2,20 +2,43 @@ import { Graph, type Vertex } from '@lenke/core';
 
 import { isEdge, type RunContext, startTraverser, type Traverser } from './runtime.js';
 
-export const aggregateStep = function* (
+export const aggregateStep = (
   stream: Iterable<Traverser<unknown>>,
   key: string,
   ctx: RunContext,
-): Iterable<Traverser<unknown>> {
-  for (const t of stream) {
-    if (!ctx.sideEffects.has(key)) {
-      ctx.sideEffects.set(key, []);
+  eager: boolean,
+): Iterable<Traverser<unknown>> => {
+  if (!ctx.sideEffects.has(key)) {
+    ctx.sideEffects.set(key, []);
+  }
+
+  const bucket = ctx.sideEffects.get(key)!;
+
+  if (eager) {
+    // `aggregate('x')` is `aggregate(Scope.global, 'x')` — a COLLECTING BARRIER in
+    // TinkerPop: it drains the ENTIRE upstream into the side-effect at THIS point in the
+    // pipeline (a plain function that materializes `stream` NOW, not a lazy generator),
+    // so a downstream `limit(0)` — or an `inject`/branch step that yields early — cannot
+    // cancel the collection. `V().aggregate('x').inject(1).limit(0).cap('x')` is therefore
+    // the 6 vertices, not `[]`. A lazy generator here would never run: `limit(0)` never
+    // pulls it. `store` stays LAZY (the non-barrier form).
+    const buffered = [...stream];
+
+    for (const t of buffered) {
+      bucket.push(t.value);
     }
 
-    ctx.sideEffects.get(key)!.push(t.value);
-
-    yield t;
+    return buffered;
   }
+
+  // `store` — lazy, per-traverser, no barrier.
+  return (function* () {
+    for (const t of stream) {
+      bucket.push(t.value);
+
+      yield t;
+    }
+  })();
 };
 
 // Force eager materialization of the upstream stream. With v2's lack of
