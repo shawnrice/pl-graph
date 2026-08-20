@@ -127,7 +127,16 @@ export const compareTotal = (a: unknown, b: unknown): number => {
   return compareValues(a, b);
 };
 
-export const compareValues = (a: unknown, b: unknown): number => {
+/**
+ * The SAME-TYPE ordering: a negative/zero/positive number, `NaN` for a NaN
+ * operand (unordered), or `null` when the two are genuinely INCOMPARABLE (a
+ * number with a string, an element with a scalar, cross-kind temporals). The
+ * callers split on `null`: `compareValues` throws (for `max`/`min`), the
+ * predicate comparator returns `NaN` so the ordering predicate simply does not
+ * match (TinkerPop FILTERS a cross-type `has()`/`is()`/`where()`, it does not
+ * throw).
+ */
+const cmpSameType = (a: unknown, b: unknown): number | null => {
   if (typeof a === 'number' && typeof b === 'number') {
     // NaN is unordered: in JS every comparison with NaN is false, so a NaN
     // operand must satisfy no ordering predicate (`> 0`, `>= 0`, `< 0`, `<= 0`
@@ -154,8 +163,7 @@ export const compareValues = (a: unknown, b: unknown): number => {
   }
 
   // Temporals of the same instant kind (date/datetime) order chronologically;
-  // durations and cross-kind pairs are not orderable and fall through to the
-  // throw (mirrors the Rust Gremlin `gcmp` and the gql relational policy).
+  // durations and cross-kind pairs are not orderable.
   if (isTemporal(a) && isTemporal(b)) {
     const c = temporalRelCmp(a, b);
 
@@ -164,10 +172,33 @@ export const compareValues = (a: unknown, b: unknown): number => {
     }
   }
 
+  return null; // genuinely incomparable
+};
+
+/**
+ * Order two values the way TinkerPop's `Comparable` does. Genuinely incomparable
+ * types THROW (mirroring the `ClassCastException` `max()`/`min()` raise). The
+ * ordering PREDICATES do NOT use this — they filter instead (`predCmp`).
+ */
+export const compareValues = (a: unknown, b: unknown): number => {
+  const c = cmpSameType(a, b);
+
+  if (c !== null) {
+    return c;
+  }
+
   throw new LenkeError(`cannot order ${typeName(a)} with ${typeName(b)}`, {
     code: ErrorCode.InvalidValue,
   });
 };
+
+/**
+ * The comparator for ORDERING PREDICATES (`gt`/`gte`/`lt`/`lte`/`between`/…): a
+ * cross-type pair is `NaN`, so every comparison against it is false and the
+ * predicate FILTERS the value out rather than throwing — `g.V().has('name',
+ * gte(0))` returns nothing, exactly as TinkerPop (verified on createModern()).
+ */
+const predCmp = (a: unknown, b: unknown): number => cmpSameType(a, b) ?? Number.NaN;
 
 // Compile each regex pattern once (the predicate is re-applied per value). The
 // pattern is validated at build time in `regex()`, so this never throws here.
@@ -255,28 +286,24 @@ export const matches = (pred: Predicate, value: unknown): boolean => {
       return valueEq(value, pred.value);
     case 'neq':
       return !valueEq(value, pred.value);
-    // Ordering predicates: a missing value is filtered out (false), not an
-    // error; a present-but-incomparable value throws via `compareValues`.
+    // Ordering predicates: a missing OR incomparable value is filtered out
+    // (false), never an error — `predCmp` returns NaN for a cross-type pair, and
+    // every comparison against NaN is false. TinkerPop's has()/is()/where() do the
+    // same (a cross-type `has('name', gte(0))` matches nothing).
     case 'gt':
-      return value != null && compareValues(value, pred.value) > 0;
+      return value != null && predCmp(value, pred.value) > 0;
     case 'gte':
-      return value != null && compareValues(value, pred.value) >= 0;
+      return value != null && predCmp(value, pred.value) >= 0;
     case 'lt':
-      return value != null && compareValues(value, pred.value) < 0;
+      return value != null && predCmp(value, pred.value) < 0;
     case 'lte':
-      return value != null && compareValues(value, pred.value) <= 0;
+      return value != null && predCmp(value, pred.value) <= 0;
     case 'between':
-      return (
-        value != null && compareValues(value, pred.min) >= 0 && compareValues(value, pred.max) < 0
-      );
+      return value != null && predCmp(value, pred.min) >= 0 && predCmp(value, pred.max) < 0;
     case 'inside':
-      return (
-        value != null && compareValues(value, pred.min) > 0 && compareValues(value, pred.max) < 0
-      );
+      return value != null && predCmp(value, pred.min) > 0 && predCmp(value, pred.max) < 0;
     case 'outside':
-      return (
-        value != null && (compareValues(value, pred.min) < 0 || compareValues(value, pred.max) > 0)
-      );
+      return value != null && (predCmp(value, pred.min) < 0 || predCmp(value, pred.max) > 0);
     case 'within':
       return pred.values.some((x) => valueEq(value, x));
     case 'without':

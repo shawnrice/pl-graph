@@ -125,9 +125,11 @@ describe('hardening G7-G9: comparison/order/aggregation reject incomparable type
     expect(arr(run(traversal(inject(5, 1, 9), is(gt(3))), new Graph()))).toEqual([5, 9]);
   });
 
-  test('ordering a number against a string throws (not silent coercion)', () => {
-    const e = thrown(() => arr(run(traversal(inject(5), is(gt('x' as never))), new Graph())));
-    expect(hasErrorCode(e, ErrorCode.InvalidValue)).toBe(true);
+  test('an ordering PREDICATE over incomparable types FILTERS, it does not throw', () => {
+    // TinkerPop's has()/is()/where() filter a cross-type comparison (verified on
+    // createModern(): `g.V().has('name', gte(0))` matches nothing) — they do NOT
+    // throw. `max()`/`min()`/`sum()` still throw (below); order() total-orders.
+    expect(arr(run(traversal(inject(5), is(gt('x' as never))), new Graph()))).toEqual([]);
   });
 
   test('order() over mixed types throws', () => {
