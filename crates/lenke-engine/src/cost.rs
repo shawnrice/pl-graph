@@ -551,6 +551,7 @@ mod tests {
             name: "c".into(),
             frac: None,
             null_on_empty: false,
+            numeric_only: false,
         }
     }
 }

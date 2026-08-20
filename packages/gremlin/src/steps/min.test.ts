@@ -16,9 +16,12 @@ describe('Gremlin tests', () => {
       expect(arr(r)).toEqual([27]);
     });
 
-    test('min works with strings, again', () => {
-      const r = run(traversal(V(), values('name'), min()), tinkerGraph);
-      expect(arr(r)).toEqual(['josh']);
+    test('min over strings faults — min()/max() are numeric-only', () => {
+      // TinkerPop orders any Comparable, but a mixed/string max is decided by an
+      // arbitrary type rank, so we keep min()/max() to numbers (like sum()/mean()).
+      expect(() => arr(run(traversal(V(), values('name'), min()), tinkerGraph))).toThrow(
+        /numeric values/,
+      );
     });
 
     // doc: g.V().repeat(both()).times(3).values('age').min() — 27

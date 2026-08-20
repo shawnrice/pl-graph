@@ -3013,6 +3013,7 @@ impl Parser {
                             name: "count".into(),
                             frac: None,
                             null_on_empty: false,
+                            numeric_only: false,
                         }],
                     );
                     self.current = 0;
@@ -3078,6 +3079,8 @@ impl Parser {
                             // Gremlin numeric-agg semantics: sum() of nothing is NULL and
                             // a non-numeric sum()/mean() propagates NaN (never faults).
                             null_on_empty: matches!(func, AggFn::Sum | AggFn::Avg),
+                            // Gremlin min()/max() only compare numbers (GQL total-orders).
+                            numeric_only: matches!(func, AggFn::Min | AggFn::Max),
                         }],
                     );
                     self.current = 0;
@@ -3098,6 +3101,7 @@ impl Parser {
                         name: "fold".into(),
                         frac: None,
                         null_on_empty: false,
+                        numeric_only: false,
                     }],
                 );
                 self.current = 0;
@@ -3725,6 +3729,7 @@ impl Parser {
                             name: "count".into(),
                             frac: None,
                             null_on_empty: false,
+                            numeric_only: false,
                         }],
                     )
                     // Gremlin groupCount() is a single {key: count} Map, not (k,c) rows.
@@ -3913,6 +3918,7 @@ impl Parser {
                         name: "value".into(),
                         frac: None,
                         null_on_empty: false,
+                        numeric_only: false,
                     },
                     Some(GroupBy::Key(k)) => Agg {
                         func: AggFn::Collect,
@@ -3924,6 +3930,7 @@ impl Parser {
                         name: "value".into(),
                         frac: None,
                         null_on_empty: false,
+                        numeric_only: false,
                     },
                     Some(GroupBy::KeyExpr(_, e)) => Agg {
                         func: AggFn::Collect,
@@ -3932,6 +3939,7 @@ impl Parser {
                         name: "value".into(),
                         frac: None,
                         null_on_empty: false,
+                        numeric_only: false,
                     },
                     Some(GroupBy::Reduce(func, arg)) => Agg {
                         func: *func,
@@ -3942,6 +3950,8 @@ impl Parser {
                         // Gremlin numeric-agg semantics: sum() of nothing is NULL, and a
                         // non-numeric sum()/mean() propagates NaN (never faults).
                         null_on_empty: matches!(func, AggFn::Sum | AggFn::Avg),
+                        // Gremlin min()/max() only compare numbers (GQL total-orders).
+                        numeric_only: matches!(func, AggFn::Min | AggFn::Max),
                     },
                     // Default (no second by) or bare by(): fold the group's elements.
                     _ => Agg {
@@ -3951,6 +3961,7 @@ impl Parser {
                         name: "value".into(),
                         frac: None,
                         null_on_empty: false,
+                        numeric_only: false,
                     },
                 };
                 let p = plan
@@ -4506,6 +4517,7 @@ impl Parser {
                         name: key,
                         frac: None,
                         null_on_empty: false,
+                        numeric_only: false,
                     }],
                 );
                 self.current = 0;

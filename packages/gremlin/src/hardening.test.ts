@@ -140,8 +140,9 @@ describe('hardening G7-G9: comparison/order/aggregation reject incomparable type
     expect(arr(run(traversal(inject(3, 'a', 1), order()), new Graph()))).toEqual([1, 3, 'a']);
   });
 
-  test('min() over mixed types is the total-order minimum (a number), no throw', () => {
-    expect(arr(run(traversal(inject(3, 'a'), min()), new Graph()))).toEqual([3]);
+  test('min()/max() are NUMERIC-only — a non-numeric value faults (like sum/mean)', () => {
+    const e = thrown(() => arr(run(traversal(inject(3, 'a'), min()), new Graph())));
+    expect(hasErrorCode(e, ErrorCode.InvalidValue)).toBe(true);
   });
 
   test('sum() of a non-numeric value throws', () => {

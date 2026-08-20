@@ -1539,6 +1539,7 @@ impl Parser {
             name: format!("__h{idx}"),
             frac,
             null_on_empty: false,
+            numeric_only: false,
         });
         Ok(Expr::Slot(self.having_base + idx))
     }
@@ -4628,6 +4629,7 @@ impl Parser {
                         name,
                         frac,
                         null_on_empty: false,
+                        numeric_only: false,
                     })
                 }
             } else {
@@ -7082,6 +7084,7 @@ mod tests {
                 name: "n".into(),
                 frac: None,
                 null_on_empty: false,
+                numeric_only: false,
             }],
         )
         .filter(Expr::Compare {
@@ -8707,6 +8710,7 @@ mod tests {
                     name: "s".into(),
                     frac: None,
                     null_on_empty: false,
+                    numeric_only: false,
                 },
                 Agg {
                     func: AggFn::Avg,
@@ -8718,6 +8722,7 @@ mod tests {
                     name: "a".into(),
                     frac: None,
                     null_on_empty: false,
+                    numeric_only: false,
                 },
             ],
         );

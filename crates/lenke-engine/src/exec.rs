@@ -5308,12 +5308,23 @@ fn fold_grouped(
             lists.into_iter().map(Value::List).collect()
         }
         AggFn::Min | AggFn::Max => {
+            // min()/max() are NUMERIC reductions (like sum()/mean()): NULLs are skipped,
+            // a non-null NON-numeric value is a data exception. TinkerPop technically
+            // orders any Comparable (so `max('a','b')` is 'b'), but a mixed max is decided
+            // only by an arbitrary type rank — a meaningless result — so we fault instead,
+            // keeping min/max to numbers. NaN stays a number (cmp_total: NaN greatest, so
+            // max keeps it and min never picks it).
             let want_min = agg.func == AggFn::Min;
             let mut best: Vec<Option<Value>> = vec![None; n_groups];
             for (i, &g) in group_of.iter().enumerate() {
                 let v = col.value_at(i);
-                if v.is_null() {
-                    continue;
+                match v {
+                    Value::Null => continue,
+                    // Gremlin's min()/max() are numeric-only; GQL keeps the total order.
+                    _ if agg.numeric_only && !matches!(v, Value::Num(_)) => {
+                        return Err("min()/max() require numeric values".into());
+                    }
+                    _ => {}
                 }
                 match &best[g as usize] {
                     None => best[g as usize] = Some(v),
@@ -10649,6 +10660,7 @@ fn try_frontier_aggregate(
             name: a.name.clone(),
             frac: a.frac,
             null_on_empty: a.null_on_empty,
+            numeric_only: false,
         })
         .collect();
     Ok(Some(aggregate(&batch, store, &keys, &aggs)?))
@@ -23030,6 +23042,7 @@ mod tests {
             name: name.to_string(),
             frac: None,
             null_on_empty: false,
+            numeric_only: false,
         }
     }
 

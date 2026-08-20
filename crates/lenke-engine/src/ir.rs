@@ -483,6 +483,10 @@ pub struct Agg {
     /// `sum()` contract (no traversers → no value), vs GQL/SQL's `SUM = 0`. Only
     /// affects `Sum` (Min/Max/Avg already null on an empty set).
     pub null_on_empty: bool,
+    /// When true, `Min`/`Max` are NUMERIC reductions — a non-null non-numeric value
+    /// faults (the Gremlin contract: min()/max() only compare numbers). GQL/SQL keep
+    /// the total order (min/max over any orderable type). Only affects Min/Max.
+    pub numeric_only: bool,
 }
 
 /// One ORDER BY key: an expression, a direction, and where NULLs go. Null
