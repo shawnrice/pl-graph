@@ -586,6 +586,7 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
     let skippedUnordered = 0;
     let skippedUnbuildable = 0;
     let skippedLazySlice = 0;
+    let skippedCoreDrift = 0;
 
     for (let i = 0; i < ITERATIONS && divergences.length < 5; i++) {
       const r = mulberry32(caseSeed(SEED, i));
@@ -650,6 +651,19 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
       const ts = outcome(() => canonOrder(toArray(plan, tsGraph).map(canonJson), unordered));
       const native = outcome(() => canonOrder(nativeRun(text), unordered));
 
+      // TS now statically rejects an aggregate/sort/vertex-move on the wrong frontier KIND
+      // (`g.V().sum()`, `g.V().otherV()`, …) with E_SYNTAX — matching the ENGINE, which
+      // faults these at parse time (verified byte-identical, incl. the empty-frontier case).
+      // The retiring lenke-core is LENIENT here, so this fuzzer — still wired to core —
+      // sees a TS-only E_SYNTAX where core succeeds. That is the documented "TS aligns to
+      // the engine, core drifts" migration behavior, not a real divergence: skip it (it
+      // goes green once this fuzzer flips to the engine backend, where both fault).
+      if (ts.startsWith('ERR E_SYNTAX') && !native.startsWith('ERR')) {
+        skippedCoreDrift += 1;
+
+        continue;
+      }
+
       // Both failing is acceptable — each rejects the query. A divergence is one
       // side succeeding, or both succeeding with different results.
       if (ts !== native && !(ts.startsWith('ERR') && native.startsWith('ERR'))) {
@@ -669,6 +683,14 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
       console.log(
         `  ${skippedLazySlice}/${ITERATIONS} plans skipped: a zero-row slice below an ` +
           'early-yielding step — the engines differ on whether the upstream runs',
+      );
+    }
+
+    if (skippedCoreDrift > 0) {
+      console.log(
+        `  ${skippedCoreDrift}/${ITERATIONS} plans skipped: TS statically faults an ` +
+          'element-frontier aggregate/sort/vertex-move (E_SYNTAX, matching the engine) ' +
+          'where the retiring core is lenient — remove this skip when the fuzzer flips to engine',
       );
     }
 

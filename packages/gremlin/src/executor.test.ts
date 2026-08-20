@@ -12,11 +12,15 @@ import {
   gt,
   has,
   hasLabel,
+  max,
+  order,
+  otherV,
   out,
   outE,
   inV,
   repeat,
   simplePath,
+  sum,
   take,
   toList,
   traversal,
@@ -155,5 +159,35 @@ describe('executor', () => {
     const xs = arr(result) as any[];
     expect(xs).toHaveLength(1);
     expect(xs[0].id).toBe('2');
+  });
+});
+
+describe('static frontier-type faults (parity with the native engine)', () => {
+  const g = buildSocialGraph();
+  const throws = (plan: ReturnType<typeof traversal>) => expect(() => run(plan, g));
+  const ok = (plan: ReturnType<typeof traversal>) => expect(() => arr(run(plan, g)));
+
+  test('aggregate / order over a graph element faults — incl. an EMPTY frontier', () => {
+    // A vertex/edge is not a number and has no natural order.
+    throws(traversal(V(), sum())).toThrow(/graph elements/);
+    throws(traversal(V(), max())).toThrow(/graph elements/);
+    throws(traversal(V(), order())).toThrow(/graph elements/);
+    throws(traversal(V(), has('age', gt(1)), sum())).toThrow(/graph elements/); // filter preserves
+    // The empty-frontier case is why this is STATIC, not runtime: `out('NOPE')` yields no
+    // vertex, so a runtime check would give null — but the frontier KIND is still an element.
+    throws(traversal(V(), out('NOPE'), sum())).toThrow(/graph elements/);
+  });
+
+  test('inV/outV/bothV/otherV require an edge frontier — incl. an EMPTY frontier', () => {
+    throws(traversal(V(), otherV())).toThrow(/requires an edge/);
+    throws(traversal(V(), inV())).toThrow(/requires an edge/);
+    throws(traversal(V(), out('NOPE'), otherV())).toThrow(/requires an edge/);
+  });
+
+  test('projected / scalar frontiers are fine — no false positives', () => {
+    ok(traversal(V(), values('age'), sum())).not.toThrow();
+    ok(traversal(V(), values('age'), order())).not.toThrow();
+    ok(traversal(V(), count())).not.toThrow();
+    ok(traversal(V(), outE('knows'), otherV(), count())).not.toThrow();
   });
 });

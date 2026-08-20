@@ -42,6 +42,155 @@ import { applySource } from './sources.js';
  * turns a path into its elements, and `id()` on those is fine, so a scan that
  * merely looked for a later `id()` would reject working traversals.
  */
+/**
+ * Fault, statically, on an aggregate/sort/vertex-move applied to the WRONG frontier
+ * KIND — mirroring the native engine, whose parser rejects these at parse time.
+ *
+ * The engine is a static planner (it faults at parse); pure-TS is a streaming executor
+ * that would otherwise fault only at RUNTIME when a bad value flows through — so the two
+ * diverge on an EMPTY frontier (`g.V().out('NOPE').sum()` never sees a vertex, so a
+ * runtime check gives null while the engine still faults). This pass restores symmetry by
+ * classifying the frontier kind from the step chain (exactly what the engine's parser
+ * does) and faulting up front, regardless of data:
+ *
+ *  - `sum`/`min`/`max`/`mean` (global) and a bare `order()` / direction-only `order().by(desc)`
+ *    over a graph ELEMENT (vertex/edge): a Vertex/Edge is not a number and has no natural
+ *    order — TinkerPop faults; project with `values('<key>')` / `order().by('<key>')`.
+ *  - `inV`/`outV`/`bothV`/`otherV` on a NON-edge frontier: these move to an edge's endpoint,
+ *    so they require an edge traverser (`g.V().otherV()` is invalid; use `outE().otherV()`).
+ *
+ * Conservative: the frontier is only 'vertex'/'edge'/'scalar' when KNOWN; branch/collection/
+ * map producers reset it to 'unknown', where nothing faults — a missed fault is safe, a false
+ * one would break a valid query. Code is `E_SYNTAX`, matching the engine's parse-time fault.
+ */
+type Frontier = 'vertex' | 'edge' | 'scalar' | 'unknown';
+
+const VERTEX_STEPS = new Set(['V', 'out', 'in', 'both', 'inV', 'outV', 'bothV', 'otherV', 'addV']);
+const EDGE_STEPS = new Set(['E', 'outE', 'inE', 'bothE', 'addE']);
+const SCALAR_STEPS = new Set([
+  'values',
+  'value',
+  'id',
+  'label',
+  'count',
+  'sum',
+  'min',
+  'max',
+  'mean',
+  'math',
+  'loops',
+]);
+// Frontier-PRESERVING filters / barriers / side-effects / writes-that-pass-through.
+const PRESERVE_STEPS = new Set([
+  'has',
+  'hasLabel',
+  'hasId',
+  'hasKey',
+  'hasNot',
+  'hasValue',
+  'hasLabelAnd',
+  'where',
+  'and',
+  'or',
+  'not',
+  'is',
+  'dedupe',
+  'take',
+  'skip',
+  'range',
+  'tail',
+  'order',
+  'as',
+  'simplePath',
+  'cyclicPath',
+  'aggregate',
+  'store',
+  'barrier',
+  'sample',
+  'sideEffect',
+  'sideEffectFn',
+  'filter',
+  'filterFn',
+  'identity',
+  'none',
+  'withSack',
+  'drop',
+  'property',
+  'repeat',
+]);
+
+// Everything not classified (maps/collections/branches/OLAP/ambiguous) resets to 'unknown',
+// where nothing faults — a missed fault is safe; a false positive would break a valid query.
+const nextFrontier = (kind: Step['kind'], prev: Frontier): Frontier => {
+  if (VERTEX_STEPS.has(kind)) {
+    return 'vertex';
+  }
+
+  if (EDGE_STEPS.has(kind)) {
+    return 'edge';
+  }
+
+  if (SCALAR_STEPS.has(kind)) {
+    return 'scalar';
+  }
+
+  return PRESERVE_STEPS.has(kind) ? prev : 'unknown';
+};
+
+const isElement = (f: Frontier): boolean => f === 'vertex' || f === 'edge';
+
+const assertFrontierTypes = (plan: Plan): void => {
+  let f: Frontier = 'unknown';
+
+  for (const step of plan.steps) {
+    const k = step.kind;
+
+    if (
+      (k === 'sum' || k === 'min' || k === 'max' || k === 'mean') &&
+      (step as { scope?: string }).scope !== 'local' &&
+      isElement(f)
+    ) {
+      throw new LenkeError(
+        `${k}() over graph elements is not supported — a vertex/edge is not a number; ` +
+          `project with values('<key>') first`,
+        { code: ErrorCode.Syntax },
+      );
+    }
+
+    if (k === 'order' && isElement(f)) {
+      const o = step as { key?: string; bys?: readonly { kind: string }[]; scope?: string };
+      // Sorts the RAW element when there is no key projection and either no `by` or a
+      // direction-only `by(desc)` (an `identity` By). A `by('<key>')`/`by(<traversal>)`/
+      // `by(T.id)` projects a comparable value, so it is fine.
+      const sortsRawElement =
+        o.scope !== 'local' &&
+        !o.key &&
+        (!o.bys || o.bys.length === 0 || o.bys.some((b) => b.kind === 'identity'));
+
+      if (sortsRawElement) {
+        throw new LenkeError(
+          `order() over graph elements is not supported — elements have no natural order; ` +
+            `use order().by('<key>')`,
+          { code: ErrorCode.Syntax },
+        );
+      }
+    }
+
+    if (
+      (k === 'inV' || k === 'outV' || k === 'bothV' || k === 'otherV') &&
+      (f === 'vertex' || f === 'scalar')
+    ) {
+      throw new LenkeError(
+        `${k}() requires an edge — a vertex has no incident edge to move across; ` +
+          `use an edge step (outE()/inE()/bothE()) before ${k}()`,
+        { code: ErrorCode.Syntax },
+      );
+    }
+
+    f = nextFrontier(k, f);
+  }
+};
+
 const assertPlanIsSatisfiable = (plan: Plan): void => {
   // The step KINDS, which are not always the step names — `limit()` builds a
   // `take` and `dedup()` builds a `dedupe`.
@@ -84,8 +233,10 @@ const assertPlanIsSatisfiable = (plan: Plan): void => {
  * model and keeps `pipe(count(), is(gt(5)))` composable.
  */
 export const run = (plan: Plan, graph: Graph): Iterable<unknown> => {
-  // Before anything runs: a plan that cannot succeed on any graph.
+  // Before anything runs: static faults the engine raises at parse time — a plan that
+  // cannot succeed on any graph, and an aggregate/sort/vertex-move on the wrong frontier.
   assertPlanIsSatisfiable(plan);
+  assertFrontierTypes(plan);
 
   // Decide once whether any step observes the path; if not, traversers skip
   // path bookkeeping for the whole run (see planReadsPath / startTraverser).
