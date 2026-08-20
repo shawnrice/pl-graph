@@ -927,6 +927,10 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 c,
             )
         }
+        Plan::Reconverge { input, slot } => {
+            let (i, c) = rewrite(*input, idx);
+            (i.reconverge(slot), c)
+        }
     }
 }
 
@@ -1670,6 +1674,7 @@ fn width(plan: &Plan) -> usize {
         Plan::VarLength { input, .. }
         | Plan::ShortestPath { input, .. }
         | Plan::Branch { input, .. } => width(input) + 1,
+        Plan::Reconverge { .. } => 1,
         // A bound-edge OPTIONAL MATCH appends the edge column too.
         Plan::OptionalExpand {
             input, bind_edge, ..
@@ -2148,6 +2153,7 @@ mod tests {
             | Plan::Tail { input, .. }
             | Plan::Sample { input, .. }
             | Plan::Branch { input, .. }
+            | Plan::Reconverge { input, .. }
             | Plan::NullPadIfEmpty { input, .. }
             | Plan::OptionalScan { input, .. }
             | Plan::GroupToMap { input }

@@ -1475,18 +1475,20 @@ impl Parser {
                 let from = self.current;
                 let width = self.slots;
                 let mut bodies = Vec::new();
-                let mut land;
                 loop {
                     // A `<hop>.count()` branch is a PER-ELEMENT count (each input keeps
                     // its own degree), not a global fold — lower it to a Row-projected
                     // CountSubquery. Any other body parses as a Row-rooted sub-plan.
                     if let Some(body) = self.try_count_body(from, width)? {
-                        bodies.push(body);
-                        land = (0, 1);
+                        bodies.push(body.reconverge(0));
                     } else {
-                        let (body, oc, os) = self.parse_sub_body(from, width)?;
-                        bodies.push(body);
-                        land = (oc, os);
+                        let (body, oc, _os) = self.parse_sub_body(from, width)?;
+                        // Reconverge every arm to a UNIFORM width-1 frontier with its
+                        // element at slot 0 — a 2-hop arm beside a 1-hop arm otherwise
+                        // lands its element at a different slot, and a downstream
+                        // `values()` would read a mid-hop node. Lineage-preserving, so
+                        // path()-through-union still works.
+                        bodies.push(body.reconverge(oc));
                     }
                     if self.peek() == Some(&Tok::Comma) {
                         self.bump();
@@ -1495,24 +1497,43 @@ impl Parser {
                     }
                 }
                 self.expect(&Tok::RParen)?;
-                // Each body lands its result at the same slot (value bodies project to
-                // slot 0; single-hop bodies land the neighbour at the input width) —
-                // the concatenated frontier continues from there.
-                self.current = land.0;
-                self.slots = land.1;
+                self.current = 0;
+                self.slots = 1;
                 plan.branch(bodies)
             }
             "optional" => {
-                // optional(<hop>): advance to the hop's neighbour(s) if any, else keep
-                // the element unchanged. This is OptionalExpand with keep_source — a
-                // missed row lands the SOURCE element (not null), so the frontier
-                // continues either way. v1 is a single hop.
+                // optional(<body>) = coalesce(<body>, identity): the body's frontier for
+                // elements it produces output for, else the SOURCE element unchanged. The
+                // body arm runs unconditionally; the fallback keeps the source where the
+                // body is empty (NOT EXISTS body). A full sub-traversal, reconverging like
+                // union — so `optional(out('a').out('b'))` (multi-hop) works, not just a
+                // single hop.
                 let from = self.current;
-                let (dir, label) = self.hop_body()?;
+                let slots = self.slots;
+                // The fallback fires where the body produced NOTHING — a correlated
+                // EXISTS over the body. The general EXISTS eval inserts a provenance
+                // column at slot `slots`, which would shift a multi-hop body's
+                // intermediate slots; parse a SECOND copy of the body with that slot
+                // RESERVED (width `slots + 1`) so its hop sources stay aligned. Restore
+                // the cursor and re-parse for the actual output arm.
+                let guard = {
+                    let save = self.pos;
+                    let (gbody, _oc, _os) =
+                        self.parse_sub_body_seeded(Plan::Row, from, slots + 1)?;
+                    self.pos = save;
+                    Expr::Exists {
+                        body: Box::new(gbody),
+                        outer_width: slots,
+                    }
+                };
+                let (body, oc, _os) = self.parse_sub_body_seeded(Plan::Row, from, slots)?;
                 self.expect(&Tok::RParen)?;
-                self.current = self.slots;
-                self.slots += 1;
-                plan.optional_expand(from, dir, &etypes_of(label.as_deref()), true, false)
+                let fallback = Plan::Row
+                    .filter(Expr::Not(Box::new(guard)))
+                    .reconverge(from);
+                self.current = 0;
+                self.slots = 1;
+                plan.branch(vec![body.reconverge(oc), fallback])
             }
             "coalesce" => {
                 // coalesce(<hop>, <hop>, …): per element, the FIRST branch that
@@ -1570,7 +1591,6 @@ impl Parser {
                 let slots = self.slots;
                 let mut bodies = Vec::new();
                 let mut prior: Option<Expr> = None; // OR of the earlier branches' existence
-                let mut land;
                 let mut any_edge = false; // an edge-hop body → coalesce yields an edge frontier
                 loop {
                     if self.peek_leading_is_edge() {
@@ -1600,10 +1620,13 @@ impl Parser {
                             Box::new(this.clone()),
                         ),
                     };
-                    let (body, oc, os) =
+                    let (body, oc, _os) =
                         self.parse_sub_body_seeded(Plan::Row.filter(guard), from, slots)?;
-                    bodies.push(body);
-                    land = (oc, os);
+                    // Reconverge every arm to a uniform width-1 frontier at slot 0 so
+                    // arms of different depth land their element at the SAME slot (a
+                    // 2-hop arm beside a 1-hop arm otherwise diverges downstream);
+                    // lineage-preserving, so `coalesce(...).inV().path()` still answers.
+                    bodies.push(body.reconverge(oc));
                     prior = Some(match prior {
                         None => this,
                         Some(p) => Expr::Or(Box::new(p), Box::new(this)),
@@ -1615,8 +1638,8 @@ impl Parser {
                     }
                 }
                 self.expect(&Tok::RParen)?;
-                self.current = land.0;
-                self.slots = land.1;
+                self.current = 0;
+                self.slots = 1;
                 self.on_edge = any_edge;
                 // An edge-yielding coalesce keeps the interleaved edge-path answerable
                 // (its edge lands in the lineage); a non-edge coalesce breaks it.
@@ -1941,16 +1964,41 @@ impl Parser {
                 plan.branch(bodies)
             }
             "choose" => {
-                // choose(<pred>, <then>, <else>): route each element by a filter
-                // predicate. When both arms are single-VALUE bodies (`values('k')`,
-                // `constant(v)`, `id()`, `label()`) it is a per-row Case projection;
-                // otherwise both arms are hops reconverging like union.
+                // choose(<cond>, <then>[, <else>]): route each element by whether <cond>
+                // produces output. A filter-leading cond (`has`/`where`/…) IS the guard;
+                // a navigating cond (`out`/`outE`/…) becomes an EXISTS over its full
+                // sub-traversal. Then/else are full sub-traversals reconverging like union
+                // (both arms a single VALUE stays a fused per-row Case projection). An
+                // absent else is implicit identity — the source element passes through.
                 let from = self.current;
-                let pred = self.child_filter_expr()?;
+                let slots = self.slots;
+                // The cond is a per-row PREDICATE (`has`/`where`/`values('k').is(…)`/
+                // `outE().count().is(…)` — everything `child_filter_expr` parses) OR a
+                // bare NAVIGATING traversal (`out('K')`, `outE('K')`) whose truth is
+                // "produces output" = a correlated EXISTS. Try the predicate first;
+                // restore and take the EXISTS path only when it is not a predicate.
+                let save = self.pos;
+                let (guard, cond_is_filter): (Expr, bool) = match self.child_filter_expr() {
+                    Ok(pred) => (pred, true),
+                    Err(_) => {
+                        self.pos = save;
+                        // Reserve slot `slots` for the provenance column the EXISTS eval
+                        // inserts (parse at width `slots + 1`) so a multi-hop cond's
+                        // intermediate slots stay aligned.
+                        let (cond_body, _oc, _os) =
+                            self.parse_sub_body_seeded(Plan::Row, from, slots + 1)?;
+                        (
+                            Expr::Exists {
+                                body: Box::new(cond_body),
+                                outer_width: slots,
+                            },
+                            false,
+                        )
+                    }
+                };
                 self.expect(&Tok::Comma)?;
-                // A `drop()` then-arm (no else): delete the pred-matching elements —
-                // a terminal write, so nothing reconverges. `choose(identity(), drop())`
-                // deletes everything the predicate keeps.
+                // A `drop()` then-arm (no else): delete the elements the guard keeps —
+                // a terminal write, so nothing reconverges.
                 if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("drop"))
                     && self.toks.get(self.pos + 1) == Some(&Tok::LParen)
                 {
@@ -1959,88 +2007,61 @@ impl Parser {
                     self.expect(&Tok::RParen)?;
                     self.expect(&Tok::RParen)?; // close choose(...)
                     return Ok(Plan::Update {
-                        input: Box::new(plan.filter(pred)),
+                        input: Box::new(plan.filter(guard)),
                         ops: vec![crate::ir::SetOp::Delete {
                             slot: from,
                             detach: true,
                         }],
                     });
                 }
-                if let Some(then_val) = self.parse_single_value_body(from)? {
-                    self.expect(&Tok::Comma)?;
-                    let else_val = self.parse_single_value_body(from)?.ok_or(
-                        "choose(): mixing a value arm with a non-value arm is not supported",
-                    )?;
-                    self.expect(&Tok::RParen)?;
-                    let p = plan.project(vec![(
-                        "choose".to_string(),
-                        Expr::Case {
-                            branches: vec![(pred, then_val)],
-                            otherwise: Some(Box::new(else_val)),
-                        },
-                    )]);
-                    self.current = 0;
-                    self.slots = 1;
-                    return Ok(p);
-                }
-                // The THEN arm is a hop; its neighbour lands at the reconverge slot W.
-                let (t_dir, t_label) = self.hop_body()?;
-                let land = self.slots;
-                let then_body = Plan::Row.filter(pred.clone()).expand(
-                    from,
-                    t_dir,
-                    &etypes_of(t_label.as_deref()),
-                );
-                // The ELSE arm is a hop, `identity()`, or absent (implicit identity). An
-                // identity/absent arm passes the element through — copy it into slot W so
-                // both arms reconverge there.
-                let else_is_hop = self.peek() == Some(&Tok::Comma) && {
-                    // The else arm starts after the comma and an optional `__.`.
-                    let mut p = self.pos + 1;
-                    if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
-                        p += 1;
-                        if self.toks.get(p) == Some(&Tok::Dot) {
-                            p += 1;
-                        }
-                    }
-                    matches!(self.toks.get(p), Some(Tok::Ident(s)) if {
-                        let l = s.to_ascii_lowercase();
-                        l == "out" || l == "in" || l == "both"
-                    })
-                };
-                let else_body = if else_is_hop {
-                    self.expect(&Tok::Comma)?;
-                    let (e_dir, e_label) = self.hop_body()?;
-                    Plan::Row.filter(Expr::Not(Box::new(pred))).expand(
-                        from,
-                        e_dir,
-                        &etypes_of(e_label.as_deref()),
-                    )
-                } else {
-                    // `, identity()` or nothing → pass the element through at slot W.
-                    if self.peek() == Some(&Tok::Comma) {
-                        self.bump();
-                        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                // Fused Case projection: both arms a single VALUE (only when the guard is
+                // a plain filter predicate — a Case branch tests a row predicate, not a
+                // subquery). Restore the cursor if it is NOT a both-value choose.
+                if cond_is_filter {
+                    let save = self.pos;
+                    if let Some(then_val) = self.parse_single_value_body(from)? {
+                        if self.peek() == Some(&Tok::Comma) {
                             self.bump();
-                            self.expect(&Tok::Dot)?;
+                            if let Some(else_val) = self.parse_single_value_body(from)? {
+                                if self.peek() == Some(&Tok::RParen) {
+                                    self.bump();
+                                    let p = plan.project(vec![(
+                                        "choose".to_string(),
+                                        Expr::Case {
+                                            branches: vec![(guard.clone(), then_val)],
+                                            otherwise: Some(Box::new(else_val)),
+                                        },
+                                    )]);
+                                    self.current = 0;
+                                    self.slots = 1;
+                                    return Ok(p);
+                                }
+                            }
                         }
-                        let id = self.ident()?; // identity
-                        if !id.eq_ignore_ascii_case("identity") {
-                            return Err(format!("choose(): unsupported else arm `{id}`"));
-                        }
-                        self.expect(&Tok::LParen)?;
-                        self.expect(&Tok::RParen)?;
                     }
-                    Plan::Row.filter(Expr::Not(Box::new(pred))).map_slot(
-                        land,
-                        Expr::Slot(from),
-                        true,
-                    )
+                    self.pos = save; // not a both-value choose → general reconverge path
+                }
+                // General: THEN guarded by the cond, ELSE by its negation (or, if the else
+                // arm is absent, implicit identity — the source element). Both reconverge.
+                let (then_body, then_oc, _os) =
+                    self.parse_sub_body_seeded(Plan::Row.filter(guard.clone()), from, slots)?;
+                let else_arm = if self.peek() == Some(&Tok::Comma) {
+                    self.bump();
+                    let (else_body, else_oc, _os) = self.parse_sub_body_seeded(
+                        Plan::Row.filter(Expr::Not(Box::new(guard))),
+                        from,
+                        slots,
+                    )?;
+                    else_body.reconverge(else_oc)
+                } else {
+                    Plan::Row
+                        .filter(Expr::Not(Box::new(guard)))
+                        .reconverge(from)
                 };
                 self.expect(&Tok::RParen)?;
-                self.current = land;
-                self.slots = land + 1;
-                plan.branch(vec![then_body, else_body])
+                self.current = 0;
+                self.slots = 1;
+                plan.branch(vec![then_body.reconverge(then_oc), else_arm])
             }
             "and" | "or" => {
                 // and(f1, f2, …) / or(f1, f2, …): each child is an element filter
@@ -5033,9 +5054,6 @@ impl Parser {
         Ok(expr)
     }
 
-    /// Parse a single anonymous hop body — `[__.] (out|in|both) ( [label] )` — and
-    /// return its `(direction, edge label)`. Shared by the branch steps (union) that
-    /// take hop sub-traversals. Multi-label / multi-step bodies are deferred.
     /// Parse a Gremlin `math('…')` expression string into an engine `Expr`. `operand`
     /// resolves the `_` variable (and any named step-label variable via `var_slot`).
     /// Grammar precedence (mXparser/TinkerPop): `+ -` < `* / %` < `^` (right-assoc) <
@@ -5054,36 +5072,6 @@ impl Parser {
             return Err(format!("math('{src}'): trailing tokens"));
         }
         Ok(e)
-    }
-
-    fn hop_body(&mut self) -> Result<(Dir, Option<String>), String> {
-        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
-            self.bump();
-            self.expect(&Tok::Dot)?;
-        }
-        let name = self.ident()?;
-        let dir = match name.to_ascii_lowercase().as_str() {
-            "out" => Dir::Out,
-            "in" => Dir::In,
-            "both" => Dir::Both,
-            other => {
-                return Err(format!(
-                    "a branch traversal must be a single out/in/both hop, got `{other}`"
-                ))
-            }
-        };
-        self.expect(&Tok::LParen)?;
-        let label = if matches!(self.peek(), Some(Tok::Str(_))) {
-            let l = self.str_arg()?;
-            if self.peek() == Some(&Tok::Comma) {
-                return Err("a branch hop with multiple edge labels is not yet supported".into());
-            }
-            Some(l)
-        } else {
-            None
-        };
-        self.expect(&Tok::RParen)?;
-        Ok((dir, label))
     }
 
     /// Parse a match hop head `as('s').<hop>('L'?)[.as('e')]`, returning
@@ -8471,6 +8459,63 @@ mod tests {
         ] {
             let _ = gremlin_rows(q, &st); // parses AND runs without faulting
         }
+    }
+
+    /// Branch bodies of MORE than a single hop now parse and reconverge correctly: a
+    /// 2-hop arm beside a 1-hop arm lands its element at the SAME slot, so a downstream
+    /// `values()` reads the true endpoint (it used to read a mid-hop node). Each branch
+    /// is checked against its manually-unrolled equivalent, so the assertion needs no
+    /// hand-computed expected set.
+    #[test]
+    fn multi_hop_branch_bodies_reconverge() {
+        let st = social();
+        // union(A, B).values == A.values (multiset) + B.values.
+        let u = value_bag(&gremlin_rows(
+            "g.V().union(out('KNOWS').out('KNOWS'), out('KNOWS')).values('name')",
+            &st,
+        ));
+        let mut ab = value_bag(&gremlin_rows(
+            "g.V().out('KNOWS').out('KNOWS').values('name')",
+            &st,
+        ));
+        ab.extend(value_bag(&gremlin_rows(
+            "g.V().out('KNOWS').values('name')",
+            &st,
+        )));
+        ab.sort();
+        assert_eq!(u, ab);
+
+        // coalesce(A, B): the FIRST non-empty arm per element. Every result is a real
+        // name (not a dense id / mid-hop node) — a 2-hop then-arm reconverges cleanly.
+        let c = value_bag(&gremlin_rows(
+            "g.V().coalesce(out('KNOWS').out('KNOWS'), out('KNOWS')).values('name')",
+            &st,
+        ));
+        assert!(
+            c.iter().all(|s| s.starts_with("Str(")),
+            "coalesce values are names: {c:?}"
+        );
+
+        // choose with a 3-arm / traversal cond / multi-hop then-arm parses and runs.
+        for q in [
+            "g.V().choose(out('KNOWS'), out('KNOWS').out('KNOWS'), values('name')).count()",
+            "g.V().optional(out('KNOWS').out('KNOWS')).count()",
+        ] {
+            let _ = gremlin_rows(q, &st);
+        }
+
+        // optional keeps the SOURCE where the multi-hop body is empty: every input row is
+        // represented exactly once when the body reaches nothing new.
+        let opt = gremlin_rows(
+            "g.V().optional(out('WORKS_ON').out('WORKS_ON')).count()",
+            &st,
+        );
+        // No 2-hop WORKS_ON exists, so optional yields every source unchanged (4 nodes).
+        assert!(
+            matches!(opt.rows[0][0], Value::Num(n) if n == 4.0),
+            "optional fallback: {:?}",
+            opt.rows[0][0]
+        );
     }
 
     /// A coalesce/union whose arms reconverge at DIFFERENT widths (an `out()` expand

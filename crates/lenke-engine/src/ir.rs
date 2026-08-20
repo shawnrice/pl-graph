@@ -832,6 +832,14 @@ pub enum Plan {
     /// (the parser scopes each to a single hop, so every branch appends its element
     /// at the same slot and the concatenated column keeps its node/edge type).
     Branch { input: Box<Plan>, bodies: Vec<Plan> },
+    /// Collapse the input to ONE column — the element/value at `slot`, cloned so a
+    /// `Nodes`/`Edges` frontier keeps its type — while PRESERVING the lineage sidecar
+    /// (unlike `Project`, which drops it). Every arm of a `union`/`coalesce`/`choose`
+    /// is wrapped in this so bodies of DIFFERENT depths reconverge to a uniform width
+    /// with their element at the SAME slot 0; without it, a 2-hop arm beside a 1-hop
+    /// arm landed its element at a different slot and a downstream `values()` read a
+    /// mid-hop node. `path()`-through-branch still works because the sidecar survives.
+    Reconverge { input: Box<Plan>, slot: usize },
     /// Keep the LAST `n` rows of the input, in input order — Gremlin `tail(n)`. The
     /// symmetric partner of a keyless `OrderPage` limit (the FIRST n): both take a
     /// window of the committed row order, but `tail`'s start offset (`rows - n`) is
@@ -1410,6 +1418,14 @@ impl Plan {
         Self::Branch {
             input: Box::new(self),
             bodies,
+        }
+    }
+
+    #[must_use]
+    pub fn reconverge(self, slot: usize) -> Self {
+        Self::Reconverge {
+            input: Box::new(self),
+            slot,
         }
     }
 

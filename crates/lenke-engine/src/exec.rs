@@ -1909,6 +1909,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         }
         Plan::Unwind { input, list, .. } => reads_path(list) || needs_lineage(input),
         Plan::Branch { input, bodies } => needs_lineage(input) || bodies.iter().any(needs_lineage),
+        Plan::Reconverge { input, .. } => needs_lineage(input),
         Plan::IntervalExpand {
             input, qlo, qhi, ..
         } => reads_path(qlo) || reads_path(qhi) || needs_lineage(input),
@@ -2631,6 +2632,21 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .map(|b| pull_body(b, store, &inb))
                 .collect::<Result<_, _>>()?;
             concat_batches(&subs)
+        }
+        Plan::Reconverge { input, slot } => {
+            // Collapse to the single element/value column at `slot` (cloned, so a
+            // Nodes/Edges frontier keeps its type), PRESERVING the lineage sidecar so a
+            // reconverged branch arm still answers path(). A `slot` past the width (an
+            // empty/zero-slice arm narrowed the batch) reads NULL.
+            let b = pull(input, store, track)?;
+            let col = b
+                .slots
+                .get(*slot)
+                .cloned()
+                .unwrap_or_else(|| Col::Gen(vec![Value::Null; b.rows()]));
+            let mut out = Batch::of(vec![col]);
+            out.lineage = b.lineage;
+            out
         }
         Plan::Project { input, items } => {
             // Fused numeric-filtered projection streams the surviving frontier instead of
@@ -14806,6 +14822,20 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             order_page(&b, store, keys, *skip, *limit)?
         }
         Plan::Distinct { input } => distinct_batch(pull_body(input, store, seed)?),
+        Plan::Reconverge { input, slot } => {
+            // Collapse a branch arm to its element/value column at `slot` (cloned so a
+            // Nodes/Edges frontier keeps its type), preserving the lineage sidecar so
+            // path()-through-branch still works. `slot` past the width reads NULL.
+            let b = pull_body(input, store, seed)?;
+            let col = b
+                .slots
+                .get(*slot)
+                .cloned()
+                .unwrap_or_else(|| Col::Gen(vec![Value::Null; b.rows()]));
+            let mut out = Batch::of(vec![col]);
+            out.lineage = b.lineage;
+            out
+        }
         Plan::Tail { input, n } => {
             let b = pull_body(input, store, seed)?;
             let rows = b.rows();

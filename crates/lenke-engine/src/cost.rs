@@ -250,6 +250,8 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
         Plan::Branch { input, bodies } => {
             estimate(input, store).scale(bodies.len().max(1) as f64, false)
         }
+        // Collapses columns, not rows — same cardinality as its input.
+        Plan::Reconverge { input, .. } => estimate(input, store),
         Plan::Join { left, right, .. } => {
             // A hash join on shared node identity: rows ≈ left × right / max(dim), a
             // crude but adequate cap for routing.

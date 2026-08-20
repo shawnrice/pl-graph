@@ -240,6 +240,7 @@ fn bind_plan(plan: &mut Plan, params: &HashMap<&str, &Value>) -> Result<(), Stri
                 bind_plan(b, params)?;
             }
         }
+        Plan::Reconverge { input, .. } => bind_plan(input, params)?,
     }
     Ok(())
 }
