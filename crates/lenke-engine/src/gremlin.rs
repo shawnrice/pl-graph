@@ -46,6 +46,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         subgraph_caps: std::collections::HashMap::new(),
         pending_write: None,
         current_is_map: false,
+        current_is_element: false,
     };
     p.traversal()
 }
@@ -672,6 +673,14 @@ struct Parser {
     /// traverser drops. Frontier-preserving steps (`filter`/`order`/`dedup`/…) leave it
     /// unchanged; every other step resets it, and the Map producers set it true.
     current_is_map: bool,
+    /// True when the current frontier holds graph ELEMENTS (vertices or edges) rather
+    /// than scalars/collections — known statically from the step chain. Set true by the
+    /// frontier-move steps (V/E/out/in/both/*V/*E/addV/addE), false by every scalar/
+    /// collection/map producer (values/id/label/count/aggregates/valueMap/…), and left
+    /// unchanged by frontier-preserving filters/barriers. Read by `sum`/`min`/`max`/
+    /// `mean` and bare `order()` to reject a bare-element aggregate/sort (TinkerPop:
+    /// you cannot sum or order graph elements — `g.V().sum()` / `g.V().order()` throw).
+    current_is_element: bool,
 }
 
 impl Parser {
@@ -1154,6 +1163,9 @@ impl Parser {
             self.slots += 1;
             self.sack_slot = Some(slot);
         }
+        // The traversal SOURCE sets the initial frontier kind: `V`/`E`/`addV` land on
+        // graph ELEMENTS, `inject` (and anything else) on scalars. Each step updates it.
+        self.current_is_element = matches!(head.to_ascii_lowercase().as_str(), "v" | "e" | "addv");
         while self.peek() == Some(&Tok::Dot) {
             self.pos += 1;
             plan = self.step(plan)?;
@@ -2903,6 +2915,15 @@ impl Parser {
                     self.slots = 1;
                     p
                 } else {
+                    // TinkerPop: min/max/sum/mean over raw graph ELEMENTS throws — a
+                    // Vertex/Edge is neither numeric (sum/mean) nor comparable (min/max).
+                    // Project first with `values('<key>')`. Known statically from the chain.
+                    if self.current_is_element {
+                        return Err(format!(
+                            "{lname}() over graph elements is not supported — a vertex/edge \
+                             is not a number; project with values('<key>') first"
+                        ));
+                    }
                     let func = match lname.as_str() {
                         "min" => AggFn::Min,
                         "max" => AggFn::Max,
@@ -3202,6 +3223,21 @@ impl Parser {
                             descending: false,
                             nulls_first: true,
                         });
+                    }
+                    // TinkerPop: order() over raw graph ELEMENTS throws — a vertex/edge has
+                    // no natural order. A `by('<key>')`/`by(<traversal>)` projection makes a
+                    // comparable key (fine); a bare `order()` or a direction-only `by(desc)`
+                    // sorts the element itself, which faults. Known statically from the chain.
+                    if self.current_is_element
+                        && keys
+                            .iter()
+                            .any(|k| matches!(k.expr, Expr::Slot(s) if s == self.current))
+                    {
+                        return Err(
+                            "order() over graph elements is not supported — elements have no \
+                             natural order; use order().by('<key>')"
+                                .into(),
+                        );
                     }
                     plan.order_page(keys, None, None)
                 }
@@ -4406,6 +4442,25 @@ impl Parser {
                 | "as"
         ) {
             self.edge_hop = prev_edge_hop;
+        }
+        // Track whether the frontier now holds graph ELEMENTS (vertices/edges), known
+        // statically from the step's output kind. Frontier-MOVE steps land on an element;
+        // scalar/collection/map producers do not; frontier-PRESERVING filters/barriers
+        // (has/where/dedup/limit/range/order/as/simplePath/…) leave it unchanged (the
+        // catch-all). Ambiguous producers (union/coalesce/select/map/flatMap/unfold/cap/
+        // inject/OLAP) reset to false — a MISSED element-fault is safe; a false one breaks
+        // a valid query. (`sum`/`order` read this BEFORE it is updated for the step.)
+        match lname.as_str() {
+            "v" | "e" | "out" | "in" | "both" | "inv" | "outv" | "otherv" | "bothv" | "oute"
+            | "ine" | "bothe" | "addv" | "adde" => self.current_is_element = true,
+            "values" | "value" | "id" | "label" | "key" | "count" | "sum" | "min" | "max"
+            | "mean" | "math" | "constant" | "signum" | "mult" | "pow" | "pi" | "propertyname"
+            | "valuemap" | "elementmap" | "propertymap" | "properties" | "property" | "project"
+            | "group" | "groupcount" | "fold" | "unfold" | "tree" | "path" | "cap" | "inject"
+            | "union" | "coalesce" | "choose" | "optional" | "branch" | "flatmap" | "map"
+            | "select" | "sack" | "index" | "pagerank" | "peerpressure" | "connectedcomponent"
+            | "shortestpath" | "subgraph" => self.current_is_element = false,
+            _ => {} // filters / barriers / side-effects / modulators preserve the frontier
         }
         Ok(plan)
     }
@@ -8274,5 +8329,40 @@ mod tests {
         );
         assert_eq!(value_bag(&bare), value_bag(&with_p));
         assert_eq!(value_bag(&bare), vec!["Str(\"alice\");", "Str(\"carol\");"]);
+    }
+
+    /// A bare graph-ELEMENT frontier cannot be summed/averaged/min/max'd or sorted —
+    /// TinkerPop faults (a Vertex/Edge is not a number and has no natural order). The
+    /// frontier kind is known statically from the step chain, so this is a PARSE error.
+    /// A `values('<key>')` projection (or `order().by('<key>')`) makes it comparable/numeric.
+    #[test]
+    fn element_frontier_agg_and_order_fault() {
+        // sum/mean/min/max over raw vertices/edges → parse error.
+        for q in [
+            "g.V().sum()",
+            "g.V().mean()",
+            "g.V().max()",
+            "g.V().min()",
+            "g.V().has('age', gt(1)).sum()", // has() preserves the element frontier
+            "g.E().sum()",
+            "g.V().out().max()",
+        ] {
+            assert!(super::parse(q).is_err(), "expected fault: {q}");
+        }
+        // Bare order() (or a direction-only by) over elements → parse error.
+        for q in ["g.V().order()", "g.V().order().by(desc)", "g.E().order()"] {
+            assert!(super::parse(q).is_err(), "expected fault: {q}");
+        }
+        // A scalar/projected frontier is fine — no false positives.
+        for q in [
+            "g.V().values('age').sum()",
+            "g.V().values('age').max()",
+            "g.V().values('age').order()",
+            "g.V().count()",
+            "g.V().order().by('name')",
+            "g.V().out().count()",
+        ] {
+            assert!(super::parse(q).is_ok(), "expected ok: {q}");
+        }
     }
 }
