@@ -1228,6 +1228,46 @@ impl Parser {
         // An edge hop's landed endpoint is only reachable by the vertex move that
         // IMMEDIATELY follows it; consume the record here so any other step clears it.
         let prev_edge_hop = self.edge_hop.take();
+        // TinkerPop: an ELEMENT step applied straight to a PATH throws (an ImmutablePath
+        // is not an Element/Vertex/Edge). `unfold()` turns the path into its elements and
+        // `count`/`fold`/… consume it; `range`/`order`/… preserve it (the current_is_path
+        // classifier tracks that), so the element step is only rejected while the frontier
+        // is still a path.
+        if self.current_is_path
+            && matches!(
+                lname.as_str(),
+                "out"
+                    | "in"
+                    | "both"
+                    | "oute"
+                    | "ine"
+                    | "bothe"
+                    | "inv"
+                    | "outv"
+                    | "bothv"
+                    | "otherv"
+                    | "values"
+                    | "value"
+                    | "valuemap"
+                    | "propertymap"
+                    | "properties"
+                    | "property"
+                    | "key"
+                    | "id"
+                    | "label"
+                    | "has"
+                    | "hasnot"
+                    | "haslabel"
+                    | "hasid"
+                    | "haskey"
+                    | "hasvalue"
+            )
+        {
+            return Err(format!(
+                "{lname}() is not defined on a path — a path is not an element; \
+                 unfold() it into its elements first"
+            ));
+        }
         // A pending `repeat` stays open across its modulators (times/emit/until); any
         // other step flushes it into a VarLength walk first.
         let plan = if self.pending_repeat.is_some()
@@ -8577,6 +8617,34 @@ mod tests {
             "optional fallback: {:?}",
             opt.rows[0][0]
         );
+    }
+
+    /// An ELEMENT step applied straight to a PATH faults — a path is not a vertex/edge,
+    /// so `path().values(...)`/`.hasLabel(...)`/`.inV()`/`.out(...)` throw (TinkerPop
+    /// raises ClassCastException). `unfold()` turns the path into its elements (element
+    /// steps then fine); `count`/`fold`/`range`/`order` are path-safe.
+    #[test]
+    fn element_step_on_a_path_faults() {
+        let st = social();
+        for q in [
+            "g.V().out('KNOWS').path().values('name')",
+            "g.V().out('KNOWS').path().hasLabel('Person').count()",
+            "g.V().outE('KNOWS').path().inV()",
+            "g.V().out('KNOWS').path().out('KNOWS').count()",
+            "g.V().out('KNOWS').path().order().values('name')", // order preserves the path
+            "g.V().out('KNOWS').path().id()",
+        ] {
+            assert!(super::parse(q).is_err(), "expected fault: {q}");
+        }
+        // Path-safe: the path is counted / consumed, not treated as an element.
+        for q in [
+            "g.V().out('KNOWS').path().count()",
+            "g.V().out('KNOWS').path().fold()",
+            "g.V().out('KNOWS').path().range(0, 1).count()",
+            "g.V().out('KNOWS').path().unfold().values('name')", // unfold consumes the path
+        ] {
+            let _ = gremlin_rows(q, &st);
+        }
     }
 
     /// `otherV()` inside a branch arm resolves against the edge's ORIGIN when the edge

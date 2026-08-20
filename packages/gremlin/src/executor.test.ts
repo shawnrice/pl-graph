@@ -23,6 +23,8 @@ import {
   out,
   outE,
   inV,
+  path,
+  unfold,
   repeat,
   simplePath,
   store,
@@ -190,6 +192,22 @@ describe('static frontier-type faults (parity with the native engine)', () => {
     throws(traversal(V(), otherV())).toThrow(/requires an edge/);
     throws(traversal(V(), inV())).toThrow(/requires an edge/);
     throws(traversal(V(), out('NOPE'), otherV())).toThrow(/requires an edge/);
+  });
+
+  test('an element step applied to a PATH faults (as in TinkerPop)', () => {
+    // A path is not an element — TinkerPop throws ClassCastException.
+    throws(traversal(V(), out('knows'), path(), values('name'))).toThrow(/not defined on a path/);
+    throws(traversal(V(), out('knows'), path(), hasLabel('user'), count())).toThrow(
+      /not defined on a path/,
+    );
+    throws(traversal(V(), outE('knows'), path(), inV())).toThrow(/not defined on a path/);
+    // order() preserves the path, so the element step after it still faults.
+    throws(traversal(V(), out('knows'), path(), order(), values('name'))).toThrow(
+      /not defined on a path/,
+    );
+    // Path-safe: count()/fold() consume it; unfold() turns it into its elements.
+    ok(traversal(V(), out('knows'), path(), count())).not.toThrow();
+    ok(traversal(V(), out('knows'), path(), unfold(), values('name'))).not.toThrow();
   });
 
   test('otherV() off a BARE edge frontier faults — no reference vertex (as in TinkerPop)', () => {

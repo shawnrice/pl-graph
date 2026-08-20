@@ -244,35 +244,72 @@ const checkSteps = (steps: readonly Step[], start: Frontier, startEdgeHasOrigin:
 
 const assertFrontierTypes = (plan: Plan): void => checkSteps(plan.steps, 'unknown', false);
 
-const assertPlanIsSatisfiable = (plan: Plan): void => {
-  // The step KINDS, which are not always the step names — `limit()` builds a
-  // `take` and `dedup()` builds a `dedupe`.
-  const passesValueThrough = new Set([
-    'take',
-    'skip',
-    'range',
-    'tail',
-    'sample',
-    'dedupe',
-    'order',
-    'barrier',
-    'as',
-    'identity',
-  ]);
+// Steps that PASS A PATH THROUGH unchanged — the scan keeps looking past them for an
+// element step. (KINDS, not names — `limit()` builds a `take`, `dedup()` a `dedupe`.)
+const PATH_PASSTHROUGH = new Set([
+  'take',
+  'skip',
+  'range',
+  'tail',
+  'sample',
+  'dedupe',
+  'order',
+  'barrier',
+  'as',
+  'identity',
+  'simplePath',
+  'cyclicPath',
+]);
 
+// Steps that require an ELEMENT (a vertex/edge). Applied straight to a PATH they throw in
+// TinkerPop (`ImmutablePath cannot be cast to Element/Edge/Vertex`) — a path is not an
+// element. Verified on gremlin-console: `path().values(...)`, `.hasLabel(...)`, `.inV()`,
+// `.out(...)`, `.id()`/`.label()` all ClassCastException. `unfold()` (turns a path into
+// its elements), `count`/`fold`/etc CONSUME the path and end the scan.
+const ELEMENT_STEP_ON_PATH = new Set([
+  'out',
+  'in',
+  'both',
+  'outE',
+  'inE',
+  'bothE',
+  'inV',
+  'outV',
+  'bothV',
+  'otherV',
+  'values',
+  'value',
+  'valueMap',
+  'propertyMap',
+  'properties',
+  'property',
+  'key',
+  'id',
+  'label',
+  'has',
+  'hasNot',
+  'hasLabel',
+  'hasId',
+  'hasKey',
+  'hasValue',
+]);
+
+const assertPlanIsSatisfiable = (plan: Plan): void => {
   for (let i = 0; i < plan.steps.length; i++) {
     if (plan.steps[i].kind !== 'path') {
       continue;
     }
 
     for (const later of plan.steps.slice(i + 1)) {
-      if (later.kind === 'id' || later.kind === 'label') {
-        throw new LenkeError(`${later.kind}() is not defined on a path: a path is not an element`, {
-          code: ErrorCode.DataException,
-        });
+      if (ELEMENT_STEP_ON_PATH.has(later.kind)) {
+        throw new LenkeError(
+          `${later.kind}() is not defined on a path: a path is not an element ` +
+            `(unfold() it into its elements first)`,
+          { code: ErrorCode.DataException },
+        );
       }
 
-      if (!passesValueThrough.has(later.kind)) {
+      if (!PATH_PASSTHROUGH.has(later.kind)) {
         break;
       }
     }
