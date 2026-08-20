@@ -5228,9 +5228,11 @@ fn fold_grouped(
                             }
                         }
                     }
-                    // GQL faults on a non-numeric sum/avg; Gremlin (`null_on_empty`
-                    // marker) SKIPS it, like a null (so sum of {"text", 4} is 4).
-                    _ if agg.null_on_empty => {}
+                    // A non-numeric SCALAR (a vertex/edge/string) is a data exception in
+                    // BOTH engines — sum()/avg() never coerce. TinkerPop's `sum()` over
+                    // vertices throws (you can't add a Vertex), so `g.V().sum()` faults
+                    // rather than silently skipping. (Gremlin still differs only in that an
+                    // EMPTY/all-null sum() is NULL — handled below — not GQL/SQL's 0.)
                     _ => return Err("sum()/avg() require numeric values".into()),
                 }
             }
