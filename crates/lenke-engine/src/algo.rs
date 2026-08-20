@@ -1246,7 +1246,11 @@ fn neighbor_aggregate(
         }
     };
     let include_self = cfg_bool("includeSelf").unwrap_or(false);
-    let want = want_etype(store, cfg_str("edgeType"));
+    // The edge-type filter arrives as `edgeLabel` (core's key, sent by the shared Backend)
+    // OR `edgeType` (the engine's own CALL spelling) — accept both, like the dispatch's
+    // `edge_filter`. Reading only `edgeType` silently no-op'd the filter for every direct
+    // Backend call (e.g. `neighborAggregate({ edgeLabel: 'KNOWS' })`).
+    let want = want_etype(store, cfg_str("edgeLabel").or_else(|| cfg_str("edgeType")));
     let gcn = match cfg_str("norm").unwrap_or("none") {
         "none" => false,
         "gcn" => true,

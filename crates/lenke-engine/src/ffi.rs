@@ -169,6 +169,27 @@ fn run_algo_command(
         None => Vec::new(),
     };
     crate::algo::validate_config(&config)?;
+    // Dijkstra / A* (`shortest_path`) require NON-NEGATIVE weights — a negative edge
+    // never settles (the relaxation can loop forever) and a NaN strands the search.
+    // Reject any negative/NaN weight UP FRONT, whether or not it lies on a reachable
+    // path, matching lenke-core and the TS engine (whose infallible `shortest_path`
+    // otherwise just returns []). Plain `Err` → `E_INVALID_VALUE` at the FFI boundary.
+    if name == "shortest_path" {
+        if let Some((_, crate::value::Value::Str(wk))) =
+            config.iter().find(|(k, _)| k == "weightProperty")
+        {
+            for eid in store.all_edges() {
+                if let crate::value::Value::Num(w) = store.edge_prop(eid, wk) {
+                    if w < 0.0 || w.is_nan() {
+                        return Err(format!(
+                            "shortestPath `weightProperty` ({wk}) must hold non-negative \
+                             numbers — Dijkstra does not admit negative weights"
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let column = crate::algo::procedure_result_col(&name)
         .ok_or_else(|| format!("unknown algorithm `{raw_name}`"))?;
     let results = crate::algo::run_procedure(store, &name, &config)
