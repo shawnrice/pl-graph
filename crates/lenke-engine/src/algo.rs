@@ -494,10 +494,26 @@ pub fn label_propagation(
     store: &Store,
     edge_label: Option<&str>,
     iterations: u32,
+    seed_property: Option<&str>,
 ) -> Vec<(u32, u32)> {
     let n = store.node_count();
     let live = store.all_nodes();
     let mut labels: Vec<u32> = (0..n as u32).collect();
+    // Seed/anchor mask: a vertex carrying a NON-NULL `seedProperty` value is PINNED to
+    // its own label — it never adopts a neighbour's label (so communities nucleate around
+    // the seeds), though its label still propagates OUT to its neighbours. `!= null`
+    // catches both absent and a stored null, matching the TS engine's `getProperty(...)
+    // != null`. No seedProperty → no anchors (ordinary unsupervised LP).
+    let is_seed: Vec<bool> = seed_property.map_or_else(
+        || vec![false; n],
+        |key| {
+            live.iter().fold(vec![false; n], |mut m, &v| {
+                m[v as usize] =
+                    store.has_prop(v, key) && !matches!(store.prop(v, key), Value::Null);
+                m
+            })
+        },
+    );
     if let Some(want) = want_etype(store, edge_label) {
         // Reused scratch: a dense per-label tally indexed by label id (labels are
         // always in `0..n`), reset via a touched-list so each node costs O(degree),
@@ -512,6 +528,11 @@ pub fn label_propagation(
         for _ in 0..iterations {
             let mut next = labels.clone();
             for &v in &live {
+                // A seed anchor keeps its label — never tallies, never changes. (Its
+                // label is still counted by its neighbours via the CSR sweep below.)
+                if is_seed[v as usize] {
+                    continue;
+                }
                 touched.clear();
                 for &u in csr.nbrs(v) {
                     let lbl = labels[u as usize];
@@ -1549,7 +1570,7 @@ pub fn run_procedure(
             .collect(),
         "label_propagation" => {
             let iters = num_of("iterations").map_or(DEFAULT_LABEL_ITERATIONS, |n| n as u32);
-            label_propagation(store, edge_filter(), iters)
+            label_propagation(store, edge_filter(), iters, str_of("seedProperty"))
                 .into_iter()
                 .map(|(v, l)| (v, f64::from(l)))
                 .collect()
@@ -2216,12 +2237,12 @@ mod tests {
         // The undirected triangle collapses to one label (its smallest member id,
         // 0); the isolated node keeps its own label (3).
         assert_eq!(
-            label_propagation(&st, None, DEFAULT_LABEL_ITERATIONS),
+            label_propagation(&st, None, DEFAULT_LABEL_ITERATIONS, None),
             vec![(0, 0), (1, 0), (2, 0), (3, 3)]
         );
         // No edges (unknown type) → every node keeps its own label.
         assert_eq!(
-            label_propagation(&st, Some("NOPE"), DEFAULT_LABEL_ITERATIONS),
+            label_propagation(&st, Some("NOPE"), DEFAULT_LABEL_ITERATIONS, None),
             vec![(0, 0), (1, 1), (2, 2), (3, 3)]
         );
     }
