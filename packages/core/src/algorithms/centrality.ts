@@ -1,3 +1,5 @@
+import { ErrorCode, LenkeError } from '@lenke/errors';
+
 import type { Edge } from '../core/Edge.js';
 import type { Graph } from '../core/Graph.js';
 import { type AlgorithmGen, defineAlgorithm, materializeVertices, YIELD_EVERY } from './async.js';
@@ -34,6 +36,24 @@ const buildCsr = function* (
 
     return typeof x === 'number' ? x : 0;
   };
+
+  // Weighted closeness/betweenness run Dijkstra, which requires NON-NEGATIVE weights —
+  // a negative edge never settles and a NaN strands the search, leaving the distances
+  // undefined. Reject any negative/NaN weight up front (matching shortestPath + the
+  // native engine), whether or not it lies on a matched-label reachable path.
+  if (weighted) {
+    for (const edge of graph.edges) {
+      const x = edge.getProperty(weightProperty);
+
+      if (typeof x === 'number' && (Number.isNaN(x) || x < 0)) {
+        throw new LenkeError(
+          `\`weightProperty\` (${weightProperty}) must hold non-negative numbers — ` +
+            `Dijkstra does not admit negative weights`,
+          { code: ErrorCode.InvalidValue },
+        );
+      }
+    }
+  }
 
   let sinceYield = 0;
   const off = new Int32Array(n + 1);

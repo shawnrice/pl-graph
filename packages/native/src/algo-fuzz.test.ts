@@ -36,8 +36,10 @@ import { deserialize as tsDeserialize } from '@lenke/serialization';
 import { createFfiEngineBackend } from './backend-ffi-engine.js';
 import { graphFromNdjson } from './graph.js';
 
-const LIB = new URL('../../../crates/lenke-engine/target/release/liblenke_engine.so', import.meta.url)
-  .pathname;
+const LIB = new URL(
+  '../../../crates/lenke-engine/target/release/liblenke_engine.so',
+  import.meta.url,
+).pathname;
 const hasLib = existsSync(LIB);
 const suite = hasLib ? describe : describe.skip;
 const ffi = hasLib ? createFfiEngineBackend(LIB) : null;

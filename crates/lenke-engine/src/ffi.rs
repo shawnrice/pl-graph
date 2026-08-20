@@ -169,12 +169,13 @@ fn run_algo_command(
         None => Vec::new(),
     };
     crate::algo::validate_config(&config)?;
-    // Dijkstra / A* (`shortest_path`) require NON-NEGATIVE weights — a negative edge
-    // never settles (the relaxation can loop forever) and a NaN strands the search.
-    // Reject any negative/NaN weight UP FRONT, whether or not it lies on a reachable
-    // path, matching lenke-core and the TS engine (whose infallible `shortest_path`
-    // otherwise just returns []). Plain `Err` → `E_INVALID_VALUE` at the FFI boundary.
-    if name == "shortest_path" {
+    // Every DIJKSTRA-based procedure (`shortest_path`/A*, weighted `closeness`, weighted
+    // `betweenness`) requires NON-NEGATIVE weights — a negative edge never settles (the
+    // relaxation can loop forever) and a NaN strands the search, so the distances are
+    // undefined and the two engines diverge. Reject any negative/NaN weight UP FRONT,
+    // matching lenke-core + the TS engine. Plain `Err` → `E_INVALID_VALUE` at the FFI
+    // boundary.
+    if matches!(name.as_str(), "shortest_path" | "closeness" | "betweenness") {
         if let Some((_, crate::value::Value::Str(wk))) =
             config.iter().find(|(k, _)| k == "weightProperty")
         {
@@ -182,8 +183,8 @@ fn run_algo_command(
                 if let crate::value::Value::Num(w) = store.edge_prop(eid, wk) {
                     if w < 0.0 || w.is_nan() {
                         return Err(format!(
-                            "shortestPath `weightProperty` ({wk}) must hold non-negative \
-                             numbers — Dijkstra does not admit negative weights"
+                            "`weightProperty` ({wk}) must hold non-negative numbers — \
+                             Dijkstra does not admit negative weights"
                         ));
                     }
                 }

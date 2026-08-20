@@ -861,14 +861,23 @@ pub fn betweenness(
     store: &Store,
     edge_label: Option<&str>,
     weight_property: Option<&str>,
+    pivots: Option<usize>,
 ) -> Vec<(u32, f64)> {
     let n = store.node_count();
     let live = store.all_nodes();
+    // Source set: exact = every vertex; approximate (`pivots`) = an evenly-spaced sample
+    // of `pivots` sources (indices `i*live/k`), scaled below by `live/k` (the Brandes–Pich
+    // estimator) — identical to the TS engine.
+    let nlive = live.len();
+    let sources: Vec<u32> = match pivots {
+        Some(k) if k > 0 && k < nlive => (0..k).map(|i| live[i * nlive / k]).collect(),
+        _ => live.clone(),
+    };
     let want = want_etype(store, edge_label);
     let type_ok = |et: u32| want.is_some_and(|inner| inner.is_none_or(|t| t == et));
     let mut cb = vec![0f64; n];
 
-    for &s in &live {
+    for &s in &sources {
         // --- single-source shortest-path DAG (sigma / pred / stack) ---
         let mut sigma = vec![0f64; n];
         let mut pred: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -941,6 +950,14 @@ pub fn betweenness(
             if w != s {
                 cb[w as usize] += delta[w as usize];
             }
+        }
+    }
+
+    // Scale a sampled run up to a full-graph estimate (an exact run used every source).
+    if sources.len() < nlive {
+        let scale = nlive as f64 / sources.len() as f64;
+        for c in &mut cb {
+            *c *= scale;
         }
     }
 
@@ -1586,7 +1603,12 @@ pub fn run_procedure(
             .map(|(v, c)| (v, f64::from(c)))
             .collect(),
         "on_cycle" => on_cycle(store, edge_filter()),
-        "betweenness" => betweenness(store, edge_filter(), str_of("weightProperty")),
+        "betweenness" => betweenness(
+            store,
+            edge_filter(),
+            str_of("weightProperty"),
+            num_of("pivots").map(|n| n as usize),
+        ),
         "shortest_path" => {
             if str_of("algorithm") == Some("astar") {
                 // Goal-directed A*: source→target only, guided by heuristicProperty.
@@ -1790,7 +1812,7 @@ mod tests {
         // one 2-hop shortest path, so every betweenness is 1.0; the isolated node 0.
         let st = triangle_plus_isolated();
         assert_eq!(
-            betweenness(&st, None, None),
+            betweenness(&st, None, None, None),
             vec![(0, 1.0), (1, 1.0), (2, 1.0), (3, 0.0)]
         );
         // Diamond 0→1, 0→2, 1→3, 2→3: from 0 there are TWO shortest paths to 3, so
@@ -1806,12 +1828,12 @@ mod tests {
         b.edge(r, d, "R");
         let diamond = b.build();
         assert_eq!(
-            betweenness(&diamond, None, None),
+            betweenness(&diamond, None, None, None),
             vec![(0, 0.0), (1, 0.5), (2, 0.5), (3, 0.0)]
         );
         // A named-but-unknown edge type → no paths → every vertex 0.0.
         assert_eq!(
-            betweenness(&st, Some("NOPE"), None),
+            betweenness(&st, Some("NOPE"), None, None),
             vec![(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
         );
     }
@@ -2077,11 +2099,11 @@ mod tests {
         st.set_edge_prop(e3, "w", Value::Num(5.0));
 
         assert_eq!(
-            betweenness(&st, None, Some("w")),
+            betweenness(&st, None, Some("w"), None),
             vec![(0, 0.0), (1, 1.0), (2, 0.0), (3, 0.0)]
         );
         assert_eq!(
-            betweenness(&st, None, None),
+            betweenness(&st, None, None, None),
             vec![(0, 0.0), (1, 0.5), (2, 0.5), (3, 0.0)]
         );
     }

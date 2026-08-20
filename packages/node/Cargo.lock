@@ -158,9 +158,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lenke-codec"
+version = "0.0.0"
+
+[[package]]
 name = "lenke-core"
 version = "0.1.0"
 dependencies = [
+ "lenke-codec",
  "rayon",
  "regex",
 ]
