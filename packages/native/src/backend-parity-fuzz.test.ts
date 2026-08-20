@@ -17,22 +17,24 @@
 import { describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
-import { createFfiBackend } from './backend-ffi.js';
-import { createWasmBackend } from './backend-wasm.js';
+import { createFfiEngineBackend } from './backend-ffi-engine.js';
+import { createWasmEngineBackend } from './backend-wasm-engine.js';
 import type { Backend } from './backend.js';
 import { graphFromNdjson } from './graph.js';
 
-const LIB = new URL('../../../crates/lenke-core/target/release/liblenke_core.so', import.meta.url)
-  .pathname;
+const LIB = new URL(
+  '../../../crates/lenke-engine/target/release/liblenke_engine.so',
+  import.meta.url,
+).pathname;
 const WASM = new URL(
-  '../../../crates/lenke-core/target/wasm32-unknown-unknown/release/lenke_core.wasm',
+  '../../../crates/lenke-engine/target/wasm32-unknown-unknown/release/lenke_engine.wasm',
   import.meta.url,
 ).pathname;
 
 const hasBoth = existsSync(LIB) && existsSync(WASM);
 const suite = hasBoth ? describe : describe.skip;
-const ffi = hasBoth ? createFfiBackend(LIB) : null;
-const wasm = hasBoth ? await createWasmBackend(await Bun.file(WASM).arrayBuffer()) : null;
+const ffi = hasBoth ? createFfiEngineBackend(LIB) : null;
+const wasm = hasBoth ? await createWasmEngineBackend(await Bun.file(WASM).arrayBuffer()) : null;
 
 const SEED = [
   '{"type":"node","id":"1","labels":["P"],"properties":{"n":3,"s":"a","x":-1,"m":{"k":1}}}',
