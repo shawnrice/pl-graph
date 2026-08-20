@@ -1504,17 +1504,36 @@ export const parse = (
       // left to right (`a[0].amount`, `head(rels).x`). A leading `[` is still a
       // list literal, and a bare `variable.key` is `prop` (parsePrimary); this
       // loop extends a primary with further `[…]`/`.key` steps.
+      //
+      // GQL list element access `list[i]` (ISO — Fabric documents `list_var[0]`) attaches
+      // a subscript to a list-typed / container PRIMARY: a variable, a list literal, a
+      // property ref, a parenthesized expression, a function result. A BARE scalar literal
+      // is NOT one, so `5[0]` / `'abc'[0]` / `true[0]` / `null[0]` are parse errors — the
+      // same way `5.foo` is, and the same way Cypher rejects `5[0]`. A non-list VALUE still
+      // subscripts to null when it is genuinely type-unknown: `(5)[0]` and `p.age[0]` are
+      // null. The token BEFORE parsePrimary distinguishes a bare literal (`5`) from a
+      // parenthesized expression that happens to be one (`(5)`) — they share the same `lit`
+      // AST node.
+      const primaryStart = peek();
       let e = parsePrimary();
+      const bareLiteral =
+        e.kind === 'lit' &&
+        (primaryStart.type === 'number' ||
+          primaryStart.type === 'string' ||
+          (primaryStart.type === 'keyword' &&
+            (primaryStart.value === 'true' ||
+              primaryStart.value === 'false' ||
+              primaryStart.value === 'null')));
 
       for (;;) {
-        if (check('lbracket')) {
+        if (!bareLiteral && check('lbracket')) {
           advance();
 
           const idx = parseExpr();
 
           expect('rbracket', "']' to close a list subscript");
           e = { kind: 'index', base: e, index: idx };
-        } else if (check('dot')) {
+        } else if (!bareLiteral && check('dot')) {
           advance();
           e = { kind: 'field', base: e, key: bindName('a property name') };
         } else {

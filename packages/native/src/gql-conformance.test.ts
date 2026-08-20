@@ -485,8 +485,6 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       // Index is any expression; chained subscripts nest left to right.
       [`RETURN [10, 20, 30][1 + 1] AS a`, `[{"a":30}]`],
       [`RETURN [[1, 2], [3, 4]][1][0] AS a`, `[{"a":3}]`],
-      // Non-list base → null (not an error).
-      [`RETURN 5[0] AS a`, `[{"a":null}]`],
     ];
 
     for (const [q, want] of cases) {
@@ -500,6 +498,30 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       `MATCH (n:Person) WITH collect_list(n.name) AS names RETURN names[0] AS first`,
     );
     expect(tsC).toBe(natC);
+
+    // `list[i]` is ISO GQL (Fabric documents `list_var[0]`); a subscript attaches to a
+    // list-typed / container PRIMARY (variable, list literal, property, paren-expr, fn
+    // result), NOT a bare scalar literal — so `5[0]` / `'x'[0]` / `true[0]` / `null[0]`
+    // are PARSE ERRORS, the same way `5.foo` and Cypher's `5[0]` are. A non-list VALUE
+    // reached through a paren/property stays null-safe. Asserted against the ENGINE — the
+    // retiring core still returns null for the bare-literal form (model-aligned, like D1).
+    const eng = graphFromNdjson(createFfiEngineBackend(ENGINE_LIB), MODERN_NDJSON);
+    for (const bad of [
+      `RETURN 5[0] AS a`,
+      `RETURN 'x'[0] AS a`,
+      `RETURN true[0] AS a`,
+      `RETURN null[0] AS a`,
+    ]) {
+      expect(() => tsQuery(tsGraph, bad), bad).toThrow();
+      expect(() => eng.query(bad), bad).toThrow();
+    }
+    // …but a non-list VALUE (via a paren or a property) is null-safe, not an error —
+    // byte-identical between TS and the engine.
+    for (const ok of [`RETURN (5)[0] AS a`, `MATCH (n:Person) RETURN n.age[0] AS a`]) {
+      const t = JSON.stringify(tsQuery(tsGraph, ok));
+      expect(t, ok).toBe(JSON.stringify(eng.query(ok)));
+      expect(t, ok).toContain('null');
+    }
   });
 
   test('cardinality(list) — ISO GQL name for collection size, == size', () => {
