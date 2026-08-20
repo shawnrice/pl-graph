@@ -3348,7 +3348,11 @@ impl Parser {
                         keys.push(SortKey {
                             expr,
                             descending,
-                            nulls_first: true, // Gremlin: NULLs first
+                            // TinkerPop treats null as part of the total order that DESC
+                            // reverses — nulls FIRST in asc, LAST in desc (unlike GQL's
+                            // direction-INDEPENDENT `NULLS FIRST`). `row_cmp` places nulls
+                            // by this flag alone, so encode the direction here.
+                            nulls_first: !descending,
                         });
                     }
                     if keys.is_empty() {
