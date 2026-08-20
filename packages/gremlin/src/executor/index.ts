@@ -139,7 +139,9 @@ const nextFrontier = (kind: Step['kind'], prev: Frontier): Frontier => {
 
 const isElement = (f: Frontier): boolean => f === 'vertex' || f === 'edge';
 
-const checkStep = (step: Step, f: Frontier): void => {
+const EDGE_HOPS = new Set(['outE', 'inE', 'bothE']);
+
+const checkStep = (step: Step, f: Frontier, edgeHasOrigin: boolean): void => {
   const k = step.kind;
 
   if (
@@ -183,41 +185,64 @@ const checkStep = (step: Step, f: Frontier): void => {
       { code: ErrorCode.Syntax },
     );
   }
+
+  // `otherV()` is "the endpoint I did NOT arrive from" — it reads the path's reference
+  // vertex. Off a BARE edge frontier (`g.E().otherV()`) there is no prior vertex, so it
+  // is undefined; TinkerPop throws and the native engine rejects it. `inV`/`outV`/`bothV`
+  // name a specific endpoint and stay valid off a bare edge.
+  if (k === 'otherV' && f === 'edge' && !edgeHasOrigin) {
+    throw new LenkeError(
+      `otherV() has no reference vertex off a bare edge frontier — it returns the endpoint ` +
+        `not arrived from, but E() provides no origin; reach the edge via a vertex ` +
+        `(outE()/inE()/bothE()) first`,
+      { code: ErrorCode.Syntax },
+    );
+  }
 };
 
 // Recurse into a step list, tracking the frontier kind. A branch step's sub-traversals
 // (union/coalesce arms, an optional/choose body, a choose condition) each START from the
 // frontier at the branch — so `V().union(inV(), …)` faults on the vertex-move exactly as
 // the native engine's parser does, not just at the top level.
-const checkSteps = (steps: readonly Step[], start: Frontier): void => {
+const checkSteps = (steps: readonly Step[], start: Frontier, startEdgeHasOrigin: boolean): void => {
   let f = start;
+  // Whether the current edge frontier was reached THROUGH a vertex (so the path holds a
+  // reference vertex for `otherV()`). An edge hop (`outE`/…) sets it; a bare `E()` source
+  // clears it. A branch arm inherits it from the frontier at the branch.
+  let edgeHasOrigin = startEdgeHasOrigin;
 
   for (const step of steps) {
-    checkStep(step, f);
+    checkStep(step, f, edgeHasOrigin);
 
     const k = step.kind;
 
     if (k === 'union' || k === 'coalesce') {
       for (const p of (step as { plans: readonly Plan[] }).plans) {
-        checkSteps(p.steps, f);
+        checkSteps(p.steps, f, edgeHasOrigin);
       }
     } else if (k === 'optional') {
-      checkSteps((step as { plan: Plan }).plan.steps, f);
+      checkSteps((step as { plan: Plan }).plan.steps, f, edgeHasOrigin);
     } else if (k === 'choose') {
       const c = step as { test: Plan; thenPlan: Plan; elsePlan?: Plan };
-      checkSteps(c.test.steps, f);
-      checkSteps(c.thenPlan.steps, f);
+      checkSteps(c.test.steps, f, edgeHasOrigin);
+      checkSteps(c.thenPlan.steps, f, edgeHasOrigin);
 
       if (c.elsePlan) {
-        checkSteps(c.elsePlan.steps, f);
+        checkSteps(c.elsePlan.steps, f, edgeHasOrigin);
       }
+    }
+
+    if (EDGE_HOPS.has(k)) {
+      edgeHasOrigin = true;
+    } else if (k === 'E') {
+      edgeHasOrigin = false;
     }
 
     f = nextFrontier(k, f);
   }
 };
 
-const assertFrontierTypes = (plan: Plan): void => checkSteps(plan.steps, 'unknown');
+const assertFrontierTypes = (plan: Plan): void => checkSteps(plan.steps, 'unknown', false);
 
 const assertPlanIsSatisfiable = (plan: Plan): void => {
   // The step KINDS, which are not always the step names — `limit()` builds a

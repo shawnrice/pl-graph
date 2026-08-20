@@ -192,6 +192,16 @@ describe('static frontier-type faults (parity with the native engine)', () => {
     throws(traversal(V(), out('NOPE'), otherV())).toThrow(/requires an edge/);
   });
 
+  test('otherV() off a BARE edge frontier faults — no reference vertex (as in TinkerPop)', () => {
+    // `E().otherV()` has no prior vertex to take the "other" of.
+    throws(traversal(E(), otherV())).toThrow(/reference vertex/);
+    throws(traversal(E(), optional(traversal(otherV())), count())).toThrow(/reference vertex/);
+    // Reaching the edge THROUGH a vertex gives otherV its origin — fine.
+    ok(traversal(V(), outE('knows'), otherV(), count())).not.toThrow();
+    // inV/outV name a specific endpoint and stay valid off a bare edge.
+    ok(traversal(E(), inV(), count())).not.toThrow();
+  });
+
   test('projected / scalar frontiers are fine — no false positives', () => {
     ok(traversal(V(), values('age'), sum())).not.toThrow();
     ok(traversal(V(), values('age'), order())).not.toThrow();
