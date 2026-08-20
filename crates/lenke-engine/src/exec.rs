@@ -1551,14 +1551,13 @@ fn edge_result_value(store: &Store, eid: u32) -> Value {
             .node_ext_id(n)
             .unwrap_or_else(|| Arc::from(n.to_string()))
     };
-    // Single edge type here → a one-element (trivially sorted) labels list.
-    let labels = Value::List(
-        store
-            .edge_type_name(eid)
-            .into_iter()
-            .map(|t| Value::Str(t.into()))
-            .collect(),
-    );
+    // ALL of the edge's labels, sorted — mirroring `node_result_value`. A
+    // multi-label edge (`[KNOWS, CREATED]`) must render its whole label set
+    // regardless of which type it was reached through; `edge_type_name` returns
+    // only the primary type, which silently dropped the rest.
+    let mut labels = store.edge_labels_of(eid);
+    labels.sort_unstable();
+    let labels = Value::List(labels.into_iter().map(|t| Value::Str(t.into())).collect());
     let mut props: Vec<(String, Value)> = store
         .edge_prop_keys()
         .into_iter()
@@ -2699,8 +2698,15 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             let bl = pull(left, store, track)?;
             let br = pull(right, store, track)?;
             let ncols = bl.slots.len();
-            // Fast path: UNION ALL of same-width arms concatenates COLUMN-wise.
-            if matches!(op, CombineOp::Union) && *all && br.slots.len() == ncols {
+            // Fast path: UNION ALL of same-width arms concatenates COLUMN-wise — but ONLY
+            // when each column's arm variants agree. A mixed column (e.g. `V().inject(0)`:
+            // a Nodes column unioned with a Num) would otherwise fall into `concat_cols`'
+            // Gen fallback, which reads a node through `value_at` as its DENSE ID — losing
+            // node identity, so a downstream `values('name')` sees a number and yields
+            // nothing. The general path below renders such a node as its element map
+            // (`render_cell`), matching the TS engine's heterogeneous stream.
+            let variants_agree = (0..ncols).all(|j| same_col_variant(bl.slot(j), br.slot(j)));
+            if matches!(op, CombineOp::Union) && *all && br.slots.len() == ncols && variants_agree {
                 return Ok(concat_batches(&[bl, br]));
             }
             let row_of = |b: &Batch, i: usize| -> Vec<Value> {
@@ -3938,8 +3944,13 @@ fn write_edge_nested_map(
     out.push_str(",\"to\":");
     write_node_ext_or_dense(out, store, dst);
     out.push_str(",\"labels\":[");
-    if let Some(t) = store.edge_type_name(eid) {
-        crate::json::write_string(out, &t);
+    let mut labels = store.edge_labels_of(eid);
+    labels.sort_unstable();
+    for (i, t) in labels.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        crate::json::write_string(out, t);
     }
     out.push_str("],\"properties\":{");
     let mut first = true;
@@ -13946,14 +13957,20 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                         )
                     }
                 }
-                Col::Edges(eids) => Col::Bool(
-                    eids.iter()
-                        .map(|&e| {
-                            e != u32::MAX
-                                && store.edge_type_name(e).is_some_and(|t| labels.contains(&t))
-                        })
-                        .collect(),
-                ),
+                Col::Edges(eids) => {
+                    // Match ANY of the wanted labels against the edge's WHOLE label set
+                    // (primary OR secondary) — a multi-label edge `[KNOWS, CREATED]` is
+                    // `hasLabel('CREATED')` too. `edge_type_name` alone saw only the
+                    // primary type and missed the rest. Resolve the wanted type ids once.
+                    let want: Vec<u32> = labels.iter().filter_map(|l| store.etype_id(l)).collect();
+                    Col::Bool(
+                        eids.iter()
+                            .map(|&e| {
+                                e != u32::MAX && want.iter().any(|&t| store.edge_carries_type(e, t))
+                            })
+                            .collect(),
+                    )
+                }
                 other => Col::Bool(vec![false; other.len()]),
             }
         }
@@ -13992,7 +14009,24 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                         })
                         .collect(),
                 ),
-                other => Col::Gen(vec![Value::Null; other.len()]),
+                // A heterogeneous column (e.g. post-union `Gen` of boxed element maps):
+                // presence reads through a boxed vertex/edge's `properties`; a genuine
+                // non-element value has no property and stays NULL (core's `_ => Null`).
+                other => {
+                    Col::Gen(
+                        (0..other.len())
+                            .map(|i| match other.value_at(i) {
+                                Value::Map(pairs) => match boxed_element_props(&pairs) {
+                                    Some(props) => Value::Bool(props.iter().any(
+                                        |(k, _)| matches!(k, Value::Str(s) if s.as_ref() == key),
+                                    )),
+                                    None => Value::Null,
+                                },
+                                _ => Value::Null,
+                            })
+                            .collect(),
+                    )
+                }
             }
         }
         Expr::Exists { body, .. } => {
@@ -14353,6 +14387,14 @@ fn concat_batches(subs: &[Batch]) -> Batch {
         out.lineage = Some(crate::batch::Lineage::concat(&lins));
     }
     out
+}
+
+/// Whether two columns hold the same `Col` variant — the guard for the Union
+/// concat fast path. A `Nodes`/`Num` mismatch must NOT concat (see `Plan::Union`),
+/// because the Gen fallback would surface a node as its dense id.
+fn same_col_variant(a: &Col, b: &Col) -> bool {
+    use std::mem::discriminant;
+    discriminant(a) == discriminant(b)
 }
 
 /// Concatenate columns of (ideally) the same variant. Same variant → keep it and
@@ -17325,6 +17367,58 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
 /// Read `key` off an element frontier as a column, bulk-gathering the typed
 /// storage column and staying unboxed when it and every read entry are
 /// present-and-typed; fall to `Gen` (with nulls) otherwise.
+/// If `pairs` is a BOXED element map — a vertex `{id, labels, properties}` or an
+/// edge `{id, from, to, labels, properties}`, the shape `render_cell` produces when
+/// a heterogeneous union collapses a Nodes/Edges column into `Gen` — return its
+/// nested `properties` map. A property read/existence check on such a value must
+/// look INSIDE `properties` (`values('name')` on a boxed vertex is `props.name`,
+/// not the top-level `name`, which does not exist). `None` for a plain map, whose
+/// caller keeps the top-level-key behavior.
+fn boxed_element_props(pairs: &[(Value, Value)]) -> Option<&std::sync::Arc<Vec<(Value, Value)>>> {
+    let (mut has_id, mut has_labels) = (false, false);
+    let mut props = None;
+    for (k, v) in pairs {
+        let Value::Str(ks) = k else {
+            return None;
+        };
+        match ks.as_ref() {
+            "id" => has_id = true,
+            "labels" => has_labels = true,
+            "from" | "to" => {}
+            "properties" => match v {
+                Value::Map(p) => props = Some(p),
+                _ => return None,
+            },
+            _ => return None, // an unexpected key → a plain map, not an element
+        }
+    }
+    // Exactly a vertex (3 keys) or an edge (5 keys) map.
+    if has_id && has_labels && props.is_some() && (pairs.len() == 3 || pairs.len() == 5) {
+        props
+    } else {
+        None
+    }
+}
+
+/// The value of property `key` off a boxed `Value` — reading through a boxed element
+/// map's `properties`, a record's field, or a plain map's top-level key.
+fn boxed_value_prop(v: &Value, key: &str) -> Value {
+    let lookup = |pairs: &[(Value, Value)]| {
+        pairs
+            .iter()
+            .find(|(k, _)| matches!(k, Value::Str(s) if s.as_ref() == key))
+            .map_or(Value::Null, |(_, v)| v.clone())
+    };
+    match v {
+        Value::Record(fields) => value::record_field(fields, key),
+        Value::Map(pairs) => match boxed_element_props(pairs) {
+            Some(props) => lookup(props),
+            None => lookup(pairs),
+        },
+        _ => Value::Null,
+    }
+}
+
 fn read_property(store: &Store, col: &Col, key: &str) -> Col {
     // An edge slot reads an EDGE property (boxed map, keyed by eid). A `u32::MAX`
     // eid is the OPTIONAL null sentinel → NULL.
@@ -17395,15 +17489,7 @@ fn read_property(store: &Store, col: &Col, key: &str) -> Col {
         // field; anything else has no property and reads NULL.
         return Col::Gen(
             (0..col.len())
-                .map(|i| match col.value_at(i) {
-                    Value::Record(fields) => value::record_field(&fields, key),
-                    // A Map `.key` reads the entry under the string key `key`.
-                    Value::Map(pairs) => pairs
-                        .iter()
-                        .find(|(k, _)| matches!(k, Value::Str(s) if s.as_ref() == key))
-                        .map_or(Value::Null, |(_, v)| v.clone()),
-                    _ => Value::Null,
-                })
+                .map(|i| boxed_value_prop(&col.value_at(i), key))
                 .collect(),
         );
     };

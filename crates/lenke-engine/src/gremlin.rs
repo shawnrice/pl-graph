@@ -47,6 +47,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         pending_write: None,
         current_is_map: false,
         current_is_element: false,
+        current_is_path: false,
     };
     p.traversal()
 }
@@ -681,6 +682,12 @@ struct Parser {
     /// `mean` and bare `order()` to reject a bare-element aggregate/sort (TinkerPop:
     /// you cannot sum or order graph elements — `g.V().sum()` / `g.V().order()` throw).
     current_is_element: bool,
+    /// True when the current frontier holds PATHS (`path()`) — a non-numeric,
+    /// non-comparable sequence. Tracked like `current_is_element` and read by the
+    /// same `sum`/`min`/`max`/`mean` guard: TinkerPop's `path().sum()` throws (a
+    /// path is not a number). Preserving filters keep it; any producer that turns
+    /// paths into scalars/elements (`unfold`/`values`/`count`/…) clears it.
+    current_is_path: bool,
 }
 
 impl Parser {
@@ -2472,6 +2479,10 @@ impl Parser {
                     )]);
                     self.current = 0;
                     self.slots = 1;
+                    // This branch returns before the trailing step classifier, so mark the
+                    // path frontier here (a later sum/min/max/mean must still fault).
+                    self.current_is_element = false;
+                    self.current_is_path = true;
                     return Ok(p);
                 }
                 if !self.path_ok {
@@ -2922,6 +2933,12 @@ impl Parser {
                         return Err(format!(
                             "{lname}() over graph elements is not supported — a vertex/edge \
                              is not a number; project with values('<key>') first"
+                        ));
+                    }
+                    if self.current_is_path {
+                        return Err(format!(
+                            "{lname}() over paths is not supported — a path is not a number; \
+                             project its elements first (e.g. unfold().values('<key>'))"
                         ));
                     }
                     let func = match lname.as_str() {
@@ -4392,9 +4409,12 @@ impl Parser {
                     ordinal: None,
                 }
                 .project(vec![("inject".to_string(), Expr::Slot(1))]);
+                // TinkerPop's `inject` PREPENDS the injected values to the incoming
+                // stream (`g.V().inject(0)` → `[0, v1, …]`), so the literal rows are the
+                // LEFT arm. Column name/width still agree (both one "inject" column).
                 let p = Plan::Union {
-                    left: Box::new(cur),
-                    right: Box::new(lit_plan),
+                    left: Box::new(lit_plan),
+                    right: Box::new(cur),
                     all: true,
                     op: crate::ir::CombineOp::Union,
                 };
@@ -4452,14 +4472,25 @@ impl Parser {
         // a valid query. (`sum`/`order` read this BEFORE it is updated for the step.)
         match lname.as_str() {
             "v" | "e" | "out" | "in" | "both" | "inv" | "outv" | "otherv" | "bothv" | "oute"
-            | "ine" | "bothe" | "addv" | "adde" => self.current_is_element = true,
+            | "ine" | "bothe" | "addv" | "adde" => {
+                self.current_is_element = true;
+                self.current_is_path = false;
+            }
+            // A path frontier: not an element, IS a path — sum/min/max/mean throws over it.
+            "path" => {
+                self.current_is_element = false;
+                self.current_is_path = true;
+            }
             "values" | "value" | "id" | "label" | "key" | "count" | "sum" | "min" | "max"
             | "mean" | "math" | "constant" | "signum" | "mult" | "pow" | "pi" | "propertyname"
             | "valuemap" | "elementmap" | "propertymap" | "properties" | "property" | "project"
-            | "group" | "groupcount" | "fold" | "unfold" | "tree" | "path" | "cap" | "inject"
-            | "union" | "coalesce" | "choose" | "optional" | "branch" | "flatmap" | "map"
-            | "select" | "sack" | "index" | "pagerank" | "peerpressure" | "connectedcomponent"
-            | "shortestpath" | "subgraph" => self.current_is_element = false,
+            | "group" | "groupcount" | "fold" | "unfold" | "tree" | "cap" | "inject" | "union"
+            | "coalesce" | "choose" | "optional" | "branch" | "flatmap" | "map" | "select"
+            | "sack" | "index" | "pagerank" | "peerpressure" | "connectedcomponent"
+            | "shortestpath" | "subgraph" => {
+                self.current_is_element = false;
+                self.current_is_path = false;
+            }
             _ => {} // filters / barriers / side-effects / modulators preserve the frontier
         }
         Ok(plan)
@@ -8364,5 +8395,109 @@ mod tests {
         ] {
             assert!(super::parse(q).is_ok(), "expected ok: {q}");
         }
+    }
+
+    /// A tiny graph with ONE multi-label edge (`[KNOWS, CREATED]`).
+    fn multi_label_edge_store() -> Store {
+        let nd = concat!(
+            r#"{"id":"1","labels":["PERSON"],"props":{"name":"marko"}}"#,
+            "\n",
+            r#"{"id":"2","labels":["PERSON"],"props":{"name":"vadas"}}"#,
+            "\n",
+            r#"{"id":"e1","from":"1","to":"2","labels":["KNOWS","CREATED"],"props":{"w":0.5}}"#,
+            "\n",
+        );
+        crate::ndjson::from_ndjson(nd).expect("fixture decodes")
+    }
+
+    /// The `labels` list of the single rendered edge in `rows`.
+    fn edge_labels(rows: &Rows) -> Vec<String> {
+        let Value::Map(pairs) = &rows.rows[0][0] else {
+            panic!("expected an edge map, got {:?}", rows.rows[0][0]);
+        };
+        let labels = pairs
+            .iter()
+            .find(|(k, _)| matches!(k, Value::Str(s) if &**s == "labels"))
+            .map(|(_, v)| v)
+            .expect("edge map has a labels entry");
+        let Value::List(items) = labels else {
+            panic!("labels is a list");
+        };
+        items
+            .iter()
+            .map(|v| match v {
+                Value::Str(s) => s.to_string(),
+                o => panic!("label is a string, got {o:?}"),
+            })
+            .collect()
+    }
+
+    /// A multi-label edge renders its WHOLE label set (sorted), no matter which
+    /// type it was reached through — `edge_type_name` used to drop all but the
+    /// primary type, so `outE('KNOWS')` on a `[KNOWS, CREATED]` edge showed only
+    /// `[KNOWS]`. Both the nested map render and its streaming twin are checked.
+    #[test]
+    fn multi_label_edge_renders_all_labels_sorted() {
+        let st = multi_label_edge_store();
+        for q in [
+            "g.E().hasLabel('KNOWS')",
+            "g.E().hasLabel('CREATED')",
+            "g.V().outE('KNOWS')",
+            "g.E()",
+        ] {
+            let rows = gremlin_rows(q, &st);
+            assert_eq!(
+                edge_labels(&rows),
+                vec!["CREATED".to_string(), "KNOWS".to_string()],
+                "edge labels for `{q}`",
+            );
+        }
+    }
+
+    /// `path().sum()` (and min/max/mean) faults: a path is not a number. Known
+    /// statically from the chain, like the bare-element aggregate fault. `count()`
+    /// over a path is fine (it counts, not reduces numerically).
+    #[test]
+    fn path_aggregate_faults() {
+        let st = multi_label_edge_store();
+        for reduce in ["sum", "mean", "min", "max"] {
+            let q = format!("g.V().out('KNOWS').path().{reduce}()");
+            assert!(super::parse(&q).is_err(), "expected fault: {q}");
+        }
+        // count/fold over a path are fine.
+        for q in [
+            "g.V().out('KNOWS').path().count()",
+            "g.V().out('KNOWS').path().fold()",
+        ] {
+            let _ = gremlin_rows(q, &st); // parses AND runs without faulting
+        }
+    }
+
+    /// `inject` PREPENDS its literals, and a downstream element step reads THROUGH
+    /// the boxed element maps the heterogeneous union produces — `V().inject(0)`
+    /// used to surface each vertex as its dense id (a bare number), so
+    /// `.values('name')` saw numbers and returned nothing.
+    #[test]
+    fn inject_prepends_and_values_reads_boxed_elements() {
+        let st = multi_label_edge_store();
+
+        // values('name') after inject recovers every vertex name (the injected 0 has
+        // no name and drops); order-independent.
+        let names = value_bag(&gremlin_rows("g.V().inject(0).values('name')", &st));
+        assert_eq!(names, vec!["Str(\"marko\");", "Str(\"vadas\");"]);
+
+        // inject(0) alone: the literal comes FIRST (TinkerPop prepends), then the
+        // vertices render as element maps (not dense ids).
+        let alone = gremlin_rows("g.V().inject(0)", &st);
+        assert!(
+            matches!(alone.rows[0][0], Value::Num(n) if n == 0.0),
+            "inject prepends the literal, got {:?}",
+            alone.rows[0][0],
+        );
+        assert!(
+            matches!(&alone.rows[1][0], Value::Map(_)),
+            "a vertex renders as an element map, got {:?}",
+            alone.rows[1][0],
+        );
     }
 }
