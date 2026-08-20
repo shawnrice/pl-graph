@@ -19,6 +19,24 @@ fn etypes_of(label: Option<&str>) -> Vec<String> {
     label.into_iter().map(str::to_string).collect()
 }
 
+/// Whether `plan` can be used as a correlated-EXISTS body — i.e. it PRESERVES the
+/// provenance column the EXISTS eval appends (only column-appending / row-filtering
+/// ops). A `Project`/`Aggregate`/`Distinct` etc. would drop or reshape that column, so
+/// EXISTS over such a body cannot back-map its survivors (it would panic). Used to
+/// decide whether a coalesce arm gets an EXACT full-body existence guard or the
+/// leading-hop approximation.
+fn body_is_exists_safe(plan: &Plan) -> bool {
+    match plan {
+        Plan::Row => true,
+        Plan::Expand { input, .. }
+        | Plan::EdgeVertex { input, .. }
+        | Plan::Filter { input, .. }
+        | Plan::VarLength { input, .. }
+        | Plan::OptionalExpand { input, .. } => body_is_exists_safe(input),
+        _ => false,
+    }
+}
+
 pub fn parse(query: &str) -> Result<Plan, String> {
     let toks = lex(query)?;
     let mut p = Parser {
@@ -1597,10 +1615,32 @@ impl Parser {
                         any_edge = true;
                     }
                     let this = match self.peek_leading_hop() {
-                        Some((dir, labels)) => Expr::Exists {
-                            body: Box::new(Plan::Row.expand(from, dir, &labels)),
-                            outer_width: slots,
-                        },
+                        Some((dir, labels)) => {
+                            // A navigating body contributes where the FULL body produces
+                            // output — an EXACT correlated EXISTS when the body is
+                            // prov-safe (pure navigation/filter, no projection to drop the
+                            // provenance column); otherwise the leading-hop existence
+                            // approximation. Peek-parse the body (prov slot reserved,
+                            // width `slots + 1`), then restore the cursor for the real
+                            // parse below. `out('a').out('b')` where the 2nd hop is empty
+                            // would otherwise fire this arm's guard yet produce nothing,
+                            // wrongly excluding the element from a later arm.
+                            let save = self.pos;
+                            let gbody = self
+                                .parse_sub_body_seeded(Plan::Row, from, slots + 1)
+                                .map(|(b, _, _)| b);
+                            self.pos = save;
+                            match gbody {
+                                Ok(b) if body_is_exists_safe(&b) => Expr::Exists {
+                                    body: Box::new(b),
+                                    outer_width: slots,
+                                },
+                                _ => Expr::Exists {
+                                    body: Box::new(Plan::Row.expand(from, dir, &labels)),
+                                    outer_width: slots,
+                                },
+                            }
+                        }
                         // A body led by a FILTER (`hasLabel('PERSON').values('name')`)
                         // produces output only where the filter holds; that predicate is
                         // the guard. Peek it via child_filter_expr, then restore the
@@ -8516,6 +8556,23 @@ mod tests {
             "optional fallback: {:?}",
             opt.rows[0][0]
         );
+    }
+
+    /// coalesce falls through EXACTLY: an arm whose leading hop exists but whose FULL
+    /// (multi-hop) body produces nothing must NOT consume the element — a later arm
+    /// still gets it. The prov-safe body gets a full-body EXISTS guard rather than the
+    /// leading-hop approximation, so no element is wrongly dropped.
+    #[test]
+    fn coalesce_falls_through_on_a_dead_multi_hop_arm() {
+        let st = social();
+        // Every node yields exactly once: its 2-hop KNOWS target if any, else its name.
+        // The leading-hop approximation dropped nodes with a KNOWS out but no 2-hop.
+        let c = gremlin_rows(
+            "g.V().coalesce(out('KNOWS').out('KNOWS'), values('name')).count()",
+            &st,
+        );
+        let n = gremlin_rows("g.V().count()", &st);
+        assert_eq!(format!("{:?}", c.rows[0][0]), format!("{:?}", n.rows[0][0]));
     }
 
     /// A heterogeneous branch (an element arm beside a scalar arm) renders its

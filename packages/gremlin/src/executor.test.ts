@@ -8,6 +8,7 @@ import {
   V,
   aggregate,
   cap,
+  coalesce,
   count,
   dedupe,
   eq,
@@ -28,6 +29,8 @@ import {
   sum,
   take,
   toList,
+  union,
+  optional,
   traversal,
   values,
 } from './index.js';
@@ -194,6 +197,23 @@ describe('static frontier-type faults (parity with the native engine)', () => {
     ok(traversal(V(), values('age'), order())).not.toThrow();
     ok(traversal(V(), count())).not.toThrow();
     ok(traversal(V(), outE('knows'), otherV(), count())).not.toThrow();
+  });
+
+  test('the fault reaches INSIDE a branch arm (parity with the engine parser)', () => {
+    // A union/optional/choose arm starts from the frontier AT the branch, so a
+    // vertex-move on a vertex frontier inside the arm faults exactly as at the top
+    // level — the native engine rejects these at parse time.
+    throws(traversal(V(), union(traversal(inV()), traversal(outE('knows'))), count())).toThrow(
+      /requires an edge/,
+    );
+    throws(traversal(V(), optional(traversal(otherV())), count())).toThrow(/requires an edge/);
+    throws(traversal(V(), coalesce(traversal(inV()), traversal(values('name'))))).toThrow(
+      /requires an edge/,
+    );
+    // But an arm that FIRST takes an edge step is fine — the frontier is an edge there.
+    ok(
+      traversal(V(), union(traversal(outE('knows'), inV()), traversal(out('knows'))), count()),
+    ).not.toThrow();
   });
 });
 

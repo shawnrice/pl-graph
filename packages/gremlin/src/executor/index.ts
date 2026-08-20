@@ -139,57 +139,85 @@ const nextFrontier = (kind: Step['kind'], prev: Frontier): Frontier => {
 
 const isElement = (f: Frontier): boolean => f === 'vertex' || f === 'edge';
 
-const assertFrontierTypes = (plan: Plan): void => {
-  let f: Frontier = 'unknown';
+const checkStep = (step: Step, f: Frontier): void => {
+  const k = step.kind;
 
-  for (const step of plan.steps) {
+  if (
+    (k === 'sum' || k === 'min' || k === 'max' || k === 'mean') &&
+    (step as { scope?: string }).scope !== 'local' &&
+    isElement(f)
+  ) {
+    throw new LenkeError(
+      `${k}() over graph elements is not supported — a vertex/edge is not a number; ` +
+        `project with values('<key>') first`,
+      { code: ErrorCode.Syntax },
+    );
+  }
+
+  if (k === 'order' && isElement(f)) {
+    const o = step as { key?: string; bys?: readonly { kind: string }[]; scope?: string };
+    // Sorts the RAW element when there is no key projection and either no `by` or a
+    // direction-only `by(desc)` (an `identity` By). A `by('<key>')`/`by(<traversal>)`/
+    // `by(T.id)` projects a comparable value, so it is fine.
+    const sortsRawElement =
+      o.scope !== 'local' &&
+      !o.key &&
+      (!o.bys || o.bys.length === 0 || o.bys.some((b) => b.kind === 'identity'));
+
+    if (sortsRawElement) {
+      throw new LenkeError(
+        `order() over graph elements is not supported — elements have no natural order; ` +
+          `use order().by('<key>')`,
+        { code: ErrorCode.Syntax },
+      );
+    }
+  }
+
+  // Only a VERTEX frontier is a definite fault — the engine rejects `g.V().otherV()`
+  // but is LENIENT on a scalar frontier (`E().label().inV()` is fine — it just matches
+  // nothing). An 'edge' frontier is the valid case; 'unknown' never faults.
+  if ((k === 'inV' || k === 'outV' || k === 'bothV' || k === 'otherV') && f === 'vertex') {
+    throw new LenkeError(
+      `${k}() requires an edge — a vertex has no incident edge to move across; ` +
+        `use an edge step (outE()/inE()/bothE()) before ${k}()`,
+      { code: ErrorCode.Syntax },
+    );
+  }
+};
+
+// Recurse into a step list, tracking the frontier kind. A branch step's sub-traversals
+// (union/coalesce arms, an optional/choose body, a choose condition) each START from the
+// frontier at the branch — so `V().union(inV(), …)` faults on the vertex-move exactly as
+// the native engine's parser does, not just at the top level.
+const checkSteps = (steps: readonly Step[], start: Frontier): void => {
+  let f = start;
+
+  for (const step of steps) {
+    checkStep(step, f);
+
     const k = step.kind;
 
-    if (
-      (k === 'sum' || k === 'min' || k === 'max' || k === 'mean') &&
-      (step as { scope?: string }).scope !== 'local' &&
-      isElement(f)
-    ) {
-      throw new LenkeError(
-        `${k}() over graph elements is not supported — a vertex/edge is not a number; ` +
-          `project with values('<key>') first`,
-        { code: ErrorCode.Syntax },
-      );
-    }
-
-    if (k === 'order' && isElement(f)) {
-      const o = step as { key?: string; bys?: readonly { kind: string }[]; scope?: string };
-      // Sorts the RAW element when there is no key projection and either no `by` or a
-      // direction-only `by(desc)` (an `identity` By). A `by('<key>')`/`by(<traversal>)`/
-      // `by(T.id)` projects a comparable value, so it is fine.
-      const sortsRawElement =
-        o.scope !== 'local' &&
-        !o.key &&
-        (!o.bys || o.bys.length === 0 || o.bys.some((b) => b.kind === 'identity'));
-
-      if (sortsRawElement) {
-        throw new LenkeError(
-          `order() over graph elements is not supported — elements have no natural order; ` +
-            `use order().by('<key>')`,
-          { code: ErrorCode.Syntax },
-        );
+    if (k === 'union' || k === 'coalesce') {
+      for (const p of (step as { plans: readonly Plan[] }).plans) {
+        checkSteps(p.steps, f);
       }
-    }
+    } else if (k === 'optional') {
+      checkSteps((step as { plan: Plan }).plan.steps, f);
+    } else if (k === 'choose') {
+      const c = step as { test: Plan; thenPlan: Plan; elsePlan?: Plan };
+      checkSteps(c.test.steps, f);
+      checkSteps(c.thenPlan.steps, f);
 
-    // Only a VERTEX frontier is a definite fault — the engine rejects `g.V().otherV()`
-    // but is LENIENT on a scalar frontier (`E().label().inV()` is fine — it just matches
-    // nothing). An 'edge' frontier is the valid case; 'unknown' never faults.
-    if ((k === 'inV' || k === 'outV' || k === 'bothV' || k === 'otherV') && f === 'vertex') {
-      throw new LenkeError(
-        `${k}() requires an edge — a vertex has no incident edge to move across; ` +
-          `use an edge step (outE()/inE()/bothE()) before ${k}()`,
-        { code: ErrorCode.Syntax },
-      );
+      if (c.elsePlan) {
+        checkSteps(c.elsePlan.steps, f);
+      }
     }
 
     f = nextFrontier(k, f);
   }
 };
+
+const assertFrontierTypes = (plan: Plan): void => checkSteps(plan.steps, 'unknown');
 
 const assertPlanIsSatisfiable = (plan: Plan): void => {
   // The step KINDS, which are not always the step names — `limit()` builds a
