@@ -2631,7 +2631,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .iter()
                 .map(|b| pull_body(b, store, &inb))
                 .collect::<Result<_, _>>()?;
-            concat_batches(&subs)
+            concat_batches(&subs, store)
         }
         Plan::Reconverge { input, slot } => {
             // Collapse to the single element/value column at `slot` (cloned, so a
@@ -2723,7 +2723,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // (`render_cell`), matching the TS engine's heterogeneous stream.
             let variants_agree = (0..ncols).all(|j| same_col_variant(bl.slot(j), br.slot(j)));
             if matches!(op, CombineOp::Union) && *all && br.slots.len() == ncols && variants_agree {
-                return Ok(concat_batches(&[bl, br]));
+                return Ok(concat_batches(&[bl, br], store));
             }
             let row_of = |b: &Batch, i: usize| -> Vec<Value> {
                 let mut row: Vec<Value> =
@@ -3015,7 +3015,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                     // The null-fill rows carry no path; drop lineage rather than
                     // desync it (OPTIONAL CALL over a path binding is niche).
                     matched.lineage = None;
-                    matched = concat_batches(&[matched, fill]);
+                    matched = concat_batches(&[matched, fill], store);
                 }
             }
             matched
@@ -3296,7 +3296,7 @@ fn pull_capped_stream(plan: &Plan, store: &Store, cap: usize) -> Result<Option<B
         start = end;
         block = block.saturating_mul(2).min(8192);
     }
-    Ok(Some(concat_batches(&acc)))
+    Ok(Some(concat_batches(&acc, store)))
 }
 
 /// Streaming `DISTINCT … LIMIT k` over a streamable chain: dedup incrementally
@@ -3351,7 +3351,7 @@ fn pull_distinct_capped_stream(
         start = end;
         block = block.saturating_mul(2).min(8192);
     }
-    Ok(Some(concat_batches(&acc)))
+    Ok(Some(concat_batches(&acc, store)))
 }
 
 /// The TOP-LEVEL output over a VERY large streamable chain (`<hops>.values(k)` /
@@ -3402,7 +3402,7 @@ fn pull_top_output_streamed(
         )?);
         start = end;
     }
-    Ok(Some(concat_batches(&acc)))
+    Ok(Some(concat_batches(&acc, store)))
 }
 
 /// PROTOTYPE streaming result sink (Gremlin single-column array): serialize the result
@@ -4261,7 +4261,7 @@ fn try_distinct_by_streamed(
         acc.push(b.gather(&keep));
         start = end;
     }
-    Ok(Some(concat_batches(&acc)))
+    Ok(Some(concat_batches(&acc, store)))
 }
 
 /// Compare two rows by the sort keys only (`Equal` on a full tie). NULL placement
@@ -14392,7 +14392,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
 /// batches — so a column that is `Col::Nodes` in every branch stays a node frontier
 /// (continuable), falling back to `Col::Gen` only when the branch column types
 /// differ. Empty input → an empty batch.
-fn concat_batches(subs: &[Batch]) -> Batch {
+fn concat_batches(subs: &[Batch], store: &Store) -> Batch {
     if subs.is_empty() {
         return Batch::of(Vec::new());
     }
@@ -14427,7 +14427,7 @@ fn concat_batches(subs: &[Batch]) -> Batch {
                     }
                 })
                 .collect();
-            concat_cols(&refs)
+            concat_cols(&refs, store)
         })
         .collect();
     let mut out = Batch::of(cols);
@@ -14451,8 +14451,18 @@ fn same_col_variant(a: &Col, b: &Col) -> bool {
 }
 
 /// Concatenate columns of (ideally) the same variant. Same variant → keep it and
-/// extend the inner vector; mixed variants → materialize every value into `Gen`.
-fn concat_cols(cols: &[&Col]) -> Col {
+/// extend the inner vector; MIXED variants → materialize every value into `Gen`,
+/// rendering a node/edge as its ELEMENT MAP (`render_cell`) rather than its dense id
+/// (`value_at`) — a heterogeneous union/branch arm (a Nodes column beside a Str one)
+/// must still surface real vertices/edges downstream, not bare numbers.
+fn concat_cols(cols: &[&Col], store: &Store) -> Col {
+    let gen = || {
+        Col::Gen(
+            cols.iter()
+                .flat_map(|c| (0..c.len()).map(|i| render_cell(c, i, store)))
+                .collect(),
+        )
+    };
     macro_rules! same {
         ($variant:ident) => {{
             let mut v = Vec::new();
@@ -14460,11 +14470,7 @@ fn concat_cols(cols: &[&Col]) -> Col {
                 if let Col::$variant(xs) = c {
                     v.extend(xs.iter().cloned());
                 } else {
-                    return Col::Gen(
-                        cols.iter()
-                            .flat_map(|c| (0..c.len()).map(|i| c.value_at(i)))
-                            .collect(),
-                    );
+                    return gen();
                 }
             }
             Col::$variant(v)
@@ -14477,11 +14483,7 @@ fn concat_cols(cols: &[&Col]) -> Col {
         Some(Col::Num(_)) => same!(Num),
         Some(Col::Bool(_)) => same!(Bool),
         Some(Col::Str(_)) => same!(Str),
-        Some(Col::Gen(_)) => Col::Gen(
-            cols.iter()
-                .flat_map(|c| (0..c.len()).map(|i| c.value_at(i)))
-                .collect(),
-        ),
+        Some(Col::Gen(_)) => gen(),
     }
 }
 

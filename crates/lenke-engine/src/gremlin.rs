@@ -8518,6 +8518,26 @@ mod tests {
         );
     }
 
+    /// A heterogeneous branch (an element arm beside a scalar arm) renders its
+    /// vertices/edges as ELEMENT MAPS, not dense ids. The mixed column falls into
+    /// `concat_cols`' Gen path, which used `value_at` (a node → its dense id) — now
+    /// `render_cell` (a node → `{id, labels, properties}`).
+    #[test]
+    fn mixed_type_branch_renders_elements_not_dense_ids() {
+        let st = social();
+        let rows = gremlin_rows("g.V().union(out('KNOWS'), values('name'))", &st);
+        let mut saw_map = false;
+        for r in &rows.rows {
+            match &r[0] {
+                // A vertex from the element arm: a map, NEVER a bare Num (a dense id).
+                Value::Map(_) => saw_map = true,
+                Value::Str(_) => {} // a name from the value arm
+                other => panic!("branch element rendered as {other:?}, expected a map or a name"),
+            }
+        }
+        assert!(saw_map, "the element arm must contribute vertex maps");
+    }
+
     /// A coalesce/union whose arms reconverge at DIFFERENT widths (an `out()` expand
     /// beside a `limit(3).label()` scalar projection) used to index a column a narrow
     /// arm lacks and PANIC (`batch.slot` out of bounds). The concat now pads short arms
