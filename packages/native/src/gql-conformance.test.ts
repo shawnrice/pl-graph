@@ -148,11 +148,18 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     }
   });
 
-  test('scalar numeric fns coerce like Rust num_of (not JS Number), byte-identical', () => {
-    // JS Number('0x10') is 16 and Number([5]) is 5; Rust num_of gives NaN → null.
-    const [ts, native] = both(`RETURN abs('0x10') AS a, abs([5]) AS b, abs('12') AS c`);
-    expect(ts).toBe(native);
-    expect(ts).toBe(`[{"a":null,"b":null,"c":12}]`);
+  test('a numeric function does NOT coerce a string/list — it throws (byte-identical)', () => {
+    // A numeric function requires a number. A string — even a numeric-looking `'12'`, or a
+    // hex `'0x10'` — or a list is NOT coerced: it is a data exception in BOTH engines
+    // (strict typing, like SQL and the arithmetic operators). JS `Number('0x10')` is 16 and
+    // `Number([5])` is 5 would silently succeed; lenke rejects. Asserted against the ENGINE
+    // (the retiring core still coerced these to null).
+    const eng = graphFromNdjson(createFfiEngineBackend(ENGINE_LIB), MODERN_NDJSON);
+
+    for (const q of [`RETURN abs('0x10') AS a`, `RETURN abs([5]) AS a`, `RETURN abs('12') AS a`]) {
+      expect(() => tsQuery(tsGraph, q), q).toThrow();
+      expect(() => eng.query(q), q).toThrow();
+    }
   });
 
   test('-0 and +0 are ONE GROUP BY/DISTINCT key, byte-identical', () => {
@@ -190,20 +197,28 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts).toBe(`[{"a":20,"b":null,"c":null,"d":null}]`);
   });
 
-  test('numeric-string coercion is strict + byte-identical (inf/nan/hex)', () => {
-    // One strict grammar across both engines: non-finite spellings and hex/octal
-    // coerce to NaN (scalar fns / aggregates) or NULL (to_integer/to_float). Rust
-    // once accepted 'inf' (str::parse) and TS aggregates once accepted hex (Number()).
-    const [ts, native] = both(
-      `RETURN sign('inf') AS a, abs('inf') AS b, (to_integer('nan') IS NULL) AS c, (to_float('inf') IS NULL) AS d`,
-    );
-    expect(ts).toBe(native);
-    expect(ts).toBe(`[{"a":null,"b":null,"c":true,"d":true}]`);
+  test('string→number is strict: functions/aggregates throw; conversions null (byte-identical)', () => {
+    // A numeric function or aggregate on a non-finite / hex STRING is a data exception —
+    // never coerced (JS `Number('0x10')`=16 / `Number('inf')`=±Inf are rejected). You can't
+    // `sum` a string. Both engines throw. Asserted against the ENGINE (retiring core coerced).
+    const eng = graphFromNdjson(createFfiEngineBackend(ENGINE_LIB), MODERN_NDJSON);
 
-    // Aggregates coerce a hex / inf string to NaN → null in both, not JS Number()'s 16.
-    const [ts2, nat2] = both(`MATCH (n:Person) RETURN sum('0x10') AS s, sum('inf') AS t`);
-    expect(ts2).toBe(nat2);
-    expect(ts2).toBe(`[{"s":null,"t":null}]`);
+    for (const q of [
+      `RETURN sign('inf') AS a`,
+      `RETURN abs('inf') AS a`,
+      `MATCH (n:Person) RETURN sum('0x10') AS s`,
+      `MATCH (n:Person) RETURN sum('inf') AS s`,
+    ]) {
+      expect(() => tsQuery(tsGraph, q), q).toThrow();
+      expect(() => eng.query(q), q).toThrow();
+    }
+
+    // The explicit CONVERSIONS `to_integer`/`to_float` are lenient — a non-numeric string is
+    // NULL (not a throw), and a valid numeric string converts. Byte-identical.
+    const conv = `RETURN (to_integer('nan') IS NULL) AS a, (to_float('inf') IS NULL) AS b, to_integer('12') AS c`;
+    const t = JSON.stringify(tsQuery(tsGraph, conv));
+    expect(t).toBe(JSON.stringify(eng.query(conv)));
+    expect(t).toBe(`[{"a":true,"b":true,"c":12}]`);
   });
 
   test('RETURN n — rich node object, byte-identical, keys sorted', () => {
@@ -506,6 +521,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     // reached through a paren/property stays null-safe. Asserted against the ENGINE — the
     // retiring core still returns null for the bare-literal form (model-aligned, like D1).
     const eng = graphFromNdjson(createFfiEngineBackend(ENGINE_LIB), MODERN_NDJSON);
+
     for (const bad of [
       `RETURN 5[0] AS a`,
       `RETURN 'x'[0] AS a`,
@@ -515,6 +531,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       expect(() => tsQuery(tsGraph, bad), bad).toThrow();
       expect(() => eng.query(bad), bad).toThrow();
     }
+
     // …but a non-list VALUE (via a paren or a property) is null-safe, not an error —
     // byte-identical between TS and the engine.
     for (const ok of [`RETURN (5)[0] AS a`, `MATCH (n:Person) RETURN n.age[0] AS a`]) {

@@ -6222,12 +6222,13 @@ fn current_temporal_kind(name: &str) -> Option<&'static str> {
 }
 
 /// Map a path-accessor function name to its `PathPart`, or `None` if it is not one.
-/// `edges` is core's spelling for the relationships accessor — accepted for parity
-/// alongside the engine's `relationships` (a superset alias).
+/// The ISO GQL name for the edge list is `edges`; the Cypher-ism `relationships` is NOT
+/// accepted (it is a non-ISO alias — use `edges`), so it falls through to an unknown
+/// function, matching pure-TS.
 fn path_part(name: &str) -> Option<PathPart> {
     Some(match name {
         "nodes" => PathPart::Nodes,
-        "relationships" | "edges" => PathPart::Relationships,
+        "edges" => PathPart::Relationships,
         "path_length" => PathPart::Length,
         "elements" => PathPart::Elements,
         _ => return None,
@@ -7246,7 +7247,7 @@ mod tests {
         assert_eq!(num(&col(&out, 0, "indeg")), 0.0); // alice
         assert_eq!(num(&col(&out, 1, "indeg")), 1.0); // bob
         assert_eq!(num(&col(&out, 2, "indeg")), 2.0); // carol
-        // A bare `()` start (no label) reverse-anchors the same way.
+                                                      // A bare `()` start (no label) reverse-anchors the same way.
         let out = run(
             &super::parse(
                 "MATCH (p:Person) RETURN p.name AS name, \
@@ -7256,7 +7257,7 @@ mod tests {
             &store,
         );
         assert_eq!(num(&col(&out, 2, "indeg")), 2.0); // carol
-        // EXISTS endpoint-anchor: who is known by at least one Person? (not alice)
+                                                      // EXISTS endpoint-anchor: who is known by at least one Person? (not alice)
         let q = "MATCH (p:Person) WHERE EXISTS { (:Person)-[:KNOWS]->(p) } RETURN p.name AS name";
         assert_eq!(names(&store, q), vec!["bob", "carol"]);
     }
@@ -7513,16 +7514,25 @@ mod tests {
     }
 
     #[test]
-    fn any_shortest_relationships_are_the_traversed_edges() {
+    fn any_shortest_edges_are_the_traversed_edges() {
         let store = chain();
         // Edges are created a→b, b→c, c→d (ids 0,1,2). The shortest path a→d
-        // traverses all three, in order — relationships(p) recovers them.
+        // traverses all three, in order — edges(p) recovers them. (`edges` is the ISO
+        // name; the Cypher-ism `relationships` is not accepted.)
         let q = "MATCH p = ANY SHORTEST (x)-[:LINK]->*(y) \
-                 WHERE x.name = 'a' AND y.name = 'd' RETURN relationships(p) AS es";
+                 WHERE x.name = 'a' AND y.name = 'd' RETURN edges(p) AS es";
         let out = run(&super::parse(q).unwrap(), &store);
         assert_eq!(out.rows.len(), 1);
-        // relationships(p) materializes the three traversed edges, in order.
+        // edges(p) materializes the three traversed edges, in order.
         assert_eq!(elem_ids(&out.rows[0][0]), vec!["e0", "e1", "e2"]);
+    }
+
+    #[test]
+    fn relationships_is_not_an_iso_function() {
+        // The Cypher spelling `relationships` is NOT a GQL function — ISO uses `edges`.
+        let err =
+            super::parse("MATCH p = (a)-[:LINK]->(b) RETURN relationships(p) AS x").unwrap_err();
+        assert!(err.contains("E_UNKNOWN_FUNCTION"), "got: {err}");
     }
 
     #[test]
@@ -7545,7 +7555,7 @@ mod tests {
     #[test]
     fn path_accessor_requires_a_path_variable() {
         // A path accessor on a non-path expression is a clear parse error.
-        let err = super::parse("MATCH (a:Person) RETURN relationships(a.name) AS x").unwrap_err();
+        let err = super::parse("MATCH (a:Person) RETURN edges(a.name) AS x").unwrap_err();
         assert!(err.contains("path variable"), "got: {err}");
     }
 
