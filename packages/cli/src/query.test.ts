@@ -49,8 +49,11 @@ describe('runQuery (wasm engine)', () => {
   test('a forced language overrides the auto-detect', () => {
     const g = withPeople();
 
-    // Text that would classify as GQL, run as Gremlin explicitly.
-    expect(runQuery(g, 'V().count()', 'gremlin', false).output).toContain('2');
+    // `g.V().count()` auto-classifies as Gremlin (leading `g.`); forcing GQL routes
+    // it to the GQL engine instead, which rejects the Gremlin syntax — proving the
+    // explicit `lang` argument wins over `classify`.
+    expect(classify('g.V().count()')).toBe('gremlin');
+    expect(() => runQuery(g, 'g.V().count()', 'gql', false)).toThrow();
     g.free();
   });
 });

@@ -20,7 +20,7 @@ Options:
   -f, --format <fmt>        input codec: ndjson | csv | graphson | pg-json | pg-text
   -o, --out <file>          serialize the graph to a file, then exit (a codec converter)
       --out-format <fmt>    output codec (default: from the --out extension)
-      --wasm <path>         path to lenke_core.wasm ($LENKE_WASM, else the build output)
+      --wasm <path>         path to lenke_engine.wasm ($LENKE_WASM, else the build output)
       --no-color            disable colored output
   -h, --help                show this
 
