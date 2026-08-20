@@ -124,7 +124,47 @@ export const compareTotal = (a: unknown, b: unknown): number => {
     }
   }
 
-  return compareValues(a, b);
+  // A TOTAL order across types — order()/min()/max() never throw on a mixed stream
+  // (TinkerPop's Orderability, and the engine's deliberate total order for sort/min/max
+  // so both stay deterministic + byte-identical). Different types sort by a fixed rank
+  // (number < string < boolean < temporal < list < …, matching the Rust `type_rank`);
+  // same-type pairs compare normally. Only `sum()`/`mean()` (numeric) and the ordering
+  // PREDICATES fault/filter — never the sort.
+  const ra = typeRank(a);
+  const rb = typeRank(b);
+
+  if (ra !== rb) {
+    return ra - rb;
+  }
+
+  // Same rank but still incomparable (cross-kind temporals) → treat as equal for a
+  // stable total order rather than throwing.
+  return cmpSameType(a, b) ?? 0;
+};
+
+/**
+ * The cross-type SORT rank, matching the Rust engine's `type_rank` (Num < Str < Bool <
+ * Temporal < List < compound) so `order()`/min()/max() over a mixed column agree
+ * byte-for-byte. NULL is handled separately (sorts first).
+ */
+const typeRank = (v: unknown): number => {
+  if (typeof v === 'number') {
+    return 0;
+  }
+
+  if (typeof v === 'string') {
+    return 1;
+  }
+
+  if (typeof v === 'boolean') {
+    return 2;
+  }
+
+  if (isTemporal(v)) {
+    return 3;
+  }
+
+  return Array.isArray(v) ? 4 : 5;
 };
 
 /**

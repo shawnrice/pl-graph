@@ -132,14 +132,16 @@ describe('hardening G7-G9: comparison/order/aggregation reject incomparable type
     expect(arr(run(traversal(inject(5), is(gt('x' as never))), new Graph()))).toEqual([]);
   });
 
-  test('order() over mixed types throws', () => {
-    const e = thrown(() => arr(run(traversal(inject(3, 'a', 1), order()), new Graph())));
-    expect(hasErrorCode(e, ErrorCode.InvalidValue)).toBe(true);
+  // order()/min()/max() use a TOTAL order over mixed types — numbers before strings —
+  // rather than throwing, matching the engine (deterministic + byte-identical) and
+  // TinkerPop's Orderability. Only sum()/mean() (numeric) and the ordering PREDICATES
+  // fault/filter on a cross-type value.
+  test('order() over mixed types TOTAL-orders (numbers before strings), no throw', () => {
+    expect(arr(run(traversal(inject(3, 'a', 1), order()), new Graph()))).toEqual([1, 3, 'a']);
   });
 
-  test('min() over mixed types throws', () => {
-    const e = thrown(() => arr(run(traversal(inject(3, 'a'), min()), new Graph())));
-    expect(hasErrorCode(e, ErrorCode.InvalidValue)).toBe(true);
+  test('min() over mixed types is the total-order minimum (a number), no throw', () => {
+    expect(arr(run(traversal(inject(3, 'a'), min()), new Graph()))).toEqual([3]);
   });
 
   test('sum() of a non-numeric value throws', () => {
