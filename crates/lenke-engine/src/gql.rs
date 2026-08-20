@@ -5718,18 +5718,22 @@ impl Parser {
         self.eat_kw("MATCH");
         let outer_width = self.slots;
         let (var, label, props, start_where, le) = self.node_plain()?;
-        let Some(v) = var else {
-            return Err(format!("{kw} pattern must start from a bound variable"));
-        };
         if start_where.is_some() {
             return Err(format!(
-                "inline WHERE on a {kw} start variable is not supported; use a trailing WHERE"
+                "inline WHERE on a {kw} start node is not supported; use a trailing WHERE"
             ));
         }
+        // FORWARD only when the start node NAMES a bound variable; an anonymous start
+        // (`(:Person)-[:R]->(s)`) or a local-named one falls to the REVERSE branch, where
+        // the correlated (bound) variable is the landing endpoint.
+        let forward_from = var
+            .as_ref()
+            .and_then(|v| self.scope.get(v).copied())
+            .map(|from| (var.clone().unwrap(), from));
 
         let mut sub_scope = self.scope.clone();
         let mut sub_slots = outer_width + 1;
-        let body = if let Some(&from) = self.scope.get(&v) {
+        let body = if let Some((v, from)) = forward_from {
             // FORWARD: the first node is the bound correlated variable; it may not be
             // re-labeled or re-constrained. Extend the chain from it.
             if label.is_some() || le.is_some() {
@@ -5745,9 +5749,10 @@ impl Parser {
             }
             self.extend_chain(Plan::Row, &mut sub_scope, &mut sub_slots, from)?
         } else {
-            // REVERSE (single hop): the first node is a LOCAL variable; the correlated
-            // (bound) variable is the LANDING — `EXISTS { (m)-[:R]->(n) }` with `n`
-            // outer. Traverse from the bound endpoint backward to the local node.
+            // REVERSE (single hop): the start node is a LOCAL node — named (`(m)-[:R]->(n)`)
+            // or ANONYMOUS (`(:Person)-[:CREATED]->(s)`) — and the correlated (bound)
+            // variable is the LANDING. Traverse from the bound endpoint backward to the
+            // local node; the local node's label/props become a landing filter.
             let rel = self.rel(false)?;
             if self.opt_quantifier()?.is_some() {
                 return Err(format!(
@@ -5766,7 +5771,7 @@ impl Parser {
             let Some(&from) = self.scope.get(&vb) else {
                 return Err(format!(
                     "{kw} must start from or land on a bound (correlated) variable; neither \
-                     `{v}` nor `{vb}` is in scope"
+                     the start node nor `{vb}` is in scope"
                 ));
             };
             if vb_label.is_some() || vb_le.is_some() || !vb_props.is_empty() || vb_where.is_some() {
@@ -5782,16 +5787,14 @@ impl Parser {
                 Dir::Both => Dir::Both,
             };
             let local_slot = outer_width + 1;
-            sub_scope.insert(v.clone(), local_slot);
+            if let Some(v) = &var {
+                sub_scope.insert(v.clone(), local_slot);
+            }
             let mut body = Plan::Row.expand(from, rev_dir, &rel.etypes);
             if let Some(pred) = landing_label_filter(label, le, local_slot) {
                 body = body.filter(pred);
             }
             body = node_prop_filters(body, local_slot, props);
-            if let Some(r) = start_where {
-                self.scope = sub_scope.clone();
-                body = body.filter(self.parse_captured_where(r)?);
-            }
             body
         };
         let body = if self.eat_kw("WHERE") {
@@ -7223,6 +7226,39 @@ mod tests {
             "MATCH (p:Person) WHERE EXISTS { (z)-[:KNOWS]->(x) } RETURN p.name AS name",
         )
         .is_ok());
+    }
+
+    /// COUNT / EXISTS correlated on the pattern's ENDPOINT with an ANONYMOUS start node
+    /// (`(:Person)-[:KNOWS]->(p)`) — a reverse expansion from the bound landing. KNOWS:
+    /// alice→bob, alice→carol, bob→carol, so in-degree is alice 0, bob 1, carol 2.
+    /// (Previously rejected with "must start from a bound variable".)
+    #[test]
+    fn count_exists_endpoint_anchor_anonymous_start() {
+        let store = social();
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) RETURN p.name AS name, \
+                 COUNT { (:Person)-[:KNOWS]->(p) } AS indeg ORDER BY name",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(num(&col(&out, 0, "indeg")), 0.0); // alice
+        assert_eq!(num(&col(&out, 1, "indeg")), 1.0); // bob
+        assert_eq!(num(&col(&out, 2, "indeg")), 2.0); // carol
+        // A bare `()` start (no label) reverse-anchors the same way.
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) RETURN p.name AS name, \
+                 COUNT { ()-[:KNOWS]->(p) } AS indeg ORDER BY name",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(num(&col(&out, 2, "indeg")), 2.0); // carol
+        // EXISTS endpoint-anchor: who is known by at least one Person? (not alice)
+        let q = "MATCH (p:Person) WHERE EXISTS { (:Person)-[:KNOWS]->(p) } RETURN p.name AS name";
+        assert_eq!(names(&store, q), vec!["bob", "carol"]);
     }
 
     #[test]
