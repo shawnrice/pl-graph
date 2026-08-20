@@ -2822,6 +2822,13 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 return Ok(b);
             }
             let batch = pull(input, store, track)?;
+            // Nothing to dedup on an empty batch — and reading `key_slots` would panic
+            // when a preceding empty/zero-slice hop narrowed the batch below the tagged
+            // slot (`inE('UNKNOWN').otherV().range(0,0).dedup()` keeps the endpoint slot
+            // in the plan's slot map but not in the 0-row batch's width).
+            if batch.rows() == 0 {
+                return Ok(batch);
+            }
             let typed = distinct_by_typed(&batch, key_slots);
             let mut seen_ids: FnvSet<u32> = FnvSet::default();
             let mut seen_bytes: FnvSet<Vec<u8>> = FnvSet::default();
@@ -14370,12 +14377,42 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
 /// (continuable), falling back to `Col::Gen` only when the branch column types
 /// differ. Empty input → an empty batch.
 fn concat_batches(subs: &[Batch]) -> Batch {
-    let Some(first) = subs.first() else {
+    if subs.is_empty() {
         return Batch::of(Vec::new());
-    };
-    let ncols = first.slots.len();
+    }
+    // A branch/coalesce reconverges bodies that need not share a width — `out('X')`
+    // (an expand, wider) beside `limit(3).label()` (a scalar projection, narrow). The
+    // output is as WIDE as the widest arm; a narrower arm contributes NULL for the
+    // columns it lacks, so a downstream slot read never indexes past a short arm (a
+    // slot-out-of-bounds panic before this padding).
+    let ncols = subs.iter().map(|b| b.slots.len()).max().unwrap_or(0);
     let cols: Vec<Col> = (0..ncols)
-        .map(|j| concat_cols(&subs.iter().map(|b| b.slot(j)).collect::<Vec<_>>()))
+        .map(|j| {
+            // NULL placeholders for the arms that have no column `j` — kept alive for
+            // the borrow below; unused (empty) when every arm has the column.
+            let fills: Vec<Col> = subs
+                .iter()
+                .map(|b| {
+                    if j < b.slots.len() {
+                        Col::Gen(Vec::new())
+                    } else {
+                        Col::Gen(vec![Value::Null; b.rows()])
+                    }
+                })
+                .collect();
+            let refs: Vec<&Col> = subs
+                .iter()
+                .enumerate()
+                .map(|(k, b)| {
+                    if j < b.slots.len() {
+                        b.slot(j)
+                    } else {
+                        &fills[k]
+                    }
+                })
+                .collect();
+            concat_cols(&refs)
+        })
         .collect();
     let mut out = Batch::of(cols);
     // Preserve lineage: when every sub carries a sidecar, concatenate them row-wise so

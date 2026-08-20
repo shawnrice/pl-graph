@@ -8473,6 +8473,57 @@ mod tests {
         }
     }
 
+    /// A coalesce/union whose arms reconverge at DIFFERENT widths (an `out()` expand
+    /// beside a `limit(3).label()` scalar projection) used to index a column a narrow
+    /// arm lacks and PANIC (`batch.slot` out of bounds). The concat now pads short arms
+    /// with NULLs, so these run and terminate cleanly. (The reconverged VALUES over a
+    /// mismatched-shape branch are a separate, fuzz-tracked divergence — this only
+    /// asserts no crash and a well-formed terminal.)
+    #[test]
+    fn mismatched_width_branch_does_not_panic() {
+        let st = multi_label_edge_store();
+        for q in [
+            "g.V().coalesce(out('CREATED'), limit(3).label()).count()",
+            "g.E().coalesce(hasLabel('NOPE'), range(0, 1)).count()",
+            "g.V().coalesce(id().has('name', gte(-1)), out('NOPE')).values('lang')",
+            "g.V().coalesce(out('CREATED'), limit(3).label())",
+            "g.V().hasLabel('NOPE').union(limit(0).both('NOPE'), id()).dedup().count()",
+        ] {
+            // Parses AND runs without a slot-out-of-bounds panic.
+            let _ = gremlin_rows(q, &st);
+        }
+        // A count terminal over a mismatched-width coalesce is a single well-formed row.
+        let c = gremlin_rows(
+            "g.V().coalesce(out('CREATED'), limit(3).label()).count()",
+            &st,
+        );
+        assert_eq!(c.rows.len(), 1);
+        assert!(matches!(c.rows[0][0], Value::Num(_)));
+    }
+
+    /// `dedup()` after an empty/zero-slice hop does not panic. An empty `inE('X')`
+    /// over an UNKNOWN edge type narrows the batch below the endpoint slot that
+    /// `otherV()` tagged, so `DistinctBy` read a slot past the 0-row batch's width.
+    /// A zero-row dedup is trivially the empty input.
+    #[test]
+    fn dedup_after_empty_slice_does_not_panic() {
+        let st = multi_label_edge_store();
+        for q in [
+            "g.V().inE('NOPE').otherV().range(0, 0).dedup().count()",
+            "g.V().inE('NOPE').otherV().range(0, 0).dedup()",
+            "g.V().inE('KNOWS').otherV().range(0, 0).dedup().count()",
+            "g.V().outE('NOPE').inV().dedup().count()",
+        ] {
+            let _ = gremlin_rows(q, &st);
+        }
+        // The count is 0 (nothing survives the zero slice).
+        let c = gremlin_rows(
+            "g.V().inE('NOPE').otherV().range(0, 0).dedup().count()",
+            &st,
+        );
+        assert!(matches!(c.rows[0][0], Value::Num(n) if n == 0.0));
+    }
+
     /// `inject` PREPENDS its literals, and a downstream element step reads THROUGH
     /// the boxed element maps the heterogeneous union produces — `V().inject(0)`
     /// used to surface each vertex as its dense id (a bare number), so
