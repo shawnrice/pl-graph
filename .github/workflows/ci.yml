@@ -26,7 +26,6 @@ jobs:
 
       # Rust toolchain (cargo/clippy/rustfmt) + the wasm32 target, so the wasm
       # backend can be built and its tests actually run (not silently skip).
-      # Keep this ref in sync with crates/lenke-core/rust-toolchain.toml.
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@1.96.0
         with:
@@ -36,7 +35,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/lenke-core
+          workspaces: crates/lenke-engine
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -44,9 +43,9 @@ jobs:
       # Build first: each package exports its types from dist/, and the root
       # typecheck has no source-path mapping, so `check`'s tsc only resolves
       # @lenke/* once dist/ exists. nx caches any unchanged build work.
-      # `bun run build` builds the ffi cdylib (lenke-core:build, uncached) and
+      # `bun run build` builds the ffi cdylib (lenke-engine:build, uncached) and
       # the napi addon (@lenke/node:build, cache-keyed on the crate src so a
-      # Rust-only change rebuilds it — see the `rustCore` named input).
+      # Rust-only change rebuilds it — see the `rustEngine` named input).
       - name: Build
         run: bun run build
 
@@ -66,7 +65,7 @@ jobs:
 
       # FFI canary: prove the cdylib built above loads and round-trips over bun:ffi.
       - name: FFI smoke test
-        run: bun test crates/lenke-core/ffi-smoke.test.ts
+        run: bun test packages/native/src/backend-engine.test.ts
 
   # ===========================================================================
   # Native Node addon (@lenke/node) — build + test on Linux and macOS (arm64).

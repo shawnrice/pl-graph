@@ -39,6 +39,9 @@ pub mod bind;
 #[cfg(feature = "codecs")]
 pub mod codec;
 pub mod cost;
+/// Canonical error codes shared with the TypeScript `@lenke/errors` package —
+/// `@generated` by `packages/errors/gen-rust.ts`, kept in sync by its drift test.
+pub mod error_codes;
 pub mod exec;
 // The C ABI (`lnk_*` exports). Gated behind `capi` so the engine's `#[no_mangle]`
 // symbols never collide with core's when core links this crate for engine-compare.
