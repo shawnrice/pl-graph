@@ -5308,23 +5308,33 @@ fn fold_grouped(
             lists.into_iter().map(Value::List).collect()
         }
         AggFn::Min | AggFn::Max => {
-            // min()/max() are NUMERIC reductions (like sum()/mean()): NULLs are skipped,
-            // a non-null NON-numeric value is a data exception. TinkerPop technically
-            // orders any Comparable (so `max('a','b')` is 'b'), but a mixed max is decided
-            // only by an arbitrary type rank — a meaningless result — so we fault instead,
-            // keeping min/max to numbers. NaN stays a number (cmp_total: NaN greatest, so
-            // max keeps it and min never picks it).
+            // min()/max() order WITHIN one type — TinkerPop compares pure numbers or pure
+            // strings fine (`max('a','b')` is 'b', verified against gremlin-console) — but
+            // a CROSS-TYPE comparison (a number and a string in the SAME group) is a
+            // ClassCastException there. Gremlin (`numeric_only`) faults on such a mixed
+            // group; GQL (`numeric_only` false) keeps the total order. NULLs are skipped;
+            // NaN stays a number (cmp_total: NaN greatest).
             let want_min = agg.func == AggFn::Min;
             let mut best: Vec<Option<Value>> = vec![None; n_groups];
+            // Each group's established "is this a numeric group?" from its first non-null
+            // value; a later value of the other kind is the cross-type fault.
+            let mut is_num_group: Vec<Option<bool>> = vec![None; n_groups];
             for (i, &g) in group_of.iter().enumerate() {
                 let v = col.value_at(i);
-                match v {
-                    Value::Null => continue,
-                    // Gremlin's min()/max() are numeric-only; GQL keeps the total order.
-                    _ if agg.numeric_only && !matches!(v, Value::Num(_)) => {
-                        return Err("min()/max() require numeric values".into());
+                if v.is_null() {
+                    continue;
+                }
+                if agg.numeric_only {
+                    let is_num = matches!(v, Value::Num(_));
+                    match is_num_group[g as usize] {
+                        None => is_num_group[g as usize] = Some(is_num),
+                        Some(prev) if prev != is_num => {
+                            return Err("min()/max() cannot compare across types \
+                                        (a number and a non-number in the same group)"
+                                .into());
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
                 match &best[g as usize] {
                     None => best[g as usize] = Some(v),
@@ -10660,7 +10670,9 @@ fn try_frontier_aggregate(
             name: a.name.clone(),
             frac: a.frac,
             null_on_empty: a.null_on_empty,
-            numeric_only: false,
+            // Preserve min()/max()'s cross-type-fault contract: dropping it let a grouped
+            // `by(__.values(v).max())` return a value where the streamed spelling faulted.
+            numeric_only: a.numeric_only,
         })
         .collect();
     Ok(Some(aggregate(&batch, store, &keys, &aggs)?))
