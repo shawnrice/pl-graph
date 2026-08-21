@@ -1897,11 +1897,12 @@ impl Parser {
                     return Ok(p);
                 }
                 // A body that ALWAYS produces exactly one output per element — a single
-                // `id()`/`label()` projection (no hop or filter to drop a row) — makes the
-                // identity fallback dead: `optional(id()) ≡ id()`. Lower to just the body,
-                // else the Exists guard over a projecting body wrongly reports "empty" and
-                // the fallback double-emits (`limit(3).optional(id())` returned the ids AND
-                // the source vertices).
+                // `id()`/`label()`/`path()` projection (no hop or filter to drop a row) —
+                // makes the identity fallback dead: `optional(id()) ≡ id()`, `optional(path())
+                // ≡ path()`. Lower to just the body, else the Exists guard over a projecting
+                // body wrongly reports "empty" and the fallback double-emits (`limit(3).
+                // optional(id())` returned the ids AND the vertices; `optional(path()).count()`
+                // was 14, not 7).
                 {
                     let mut p = self.pos;
                     if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
@@ -1912,7 +1913,7 @@ impl Parser {
                     }
                     let is_always_scalar = matches!(self.toks.get(p), Some(Tok::Ident(s)) if {
                         let l = s.to_ascii_lowercase();
-                        l == "id" || l == "label"
+                        l == "id" || l == "label" || l == "path"
                     }) && self.toks.get(p + 1) == Some(&Tok::LParen)
                         && self.toks.get(p + 2) == Some(&Tok::RParen)
                         && self.toks.get(p + 3) == Some(&Tok::RParen); // arm-terminal `)`

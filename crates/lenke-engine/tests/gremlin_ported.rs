@@ -10177,3 +10177,15 @@ fn coalesce_arm_with_a_limit_zero_never_fires() {
         2
     );
 }
+
+#[test]
+fn optional_over_path_does_not_double_emit() {
+    let mut g = modern();
+    // optional(path()) always produces one path per element, so the fallback is dead:
+    // optional(path()) ≡ path(). The Exists guard over the path body reported "empty" and
+    // re-emitted the source, doubling the count (was 12 on the 6-vertex modern graph).
+    assert_eq!(
+        run_query("g.V().optional(path()).count()", &mut g),
+        vec![GVal::Num(6.0)]
+    );
+}
