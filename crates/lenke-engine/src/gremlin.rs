@@ -1254,13 +1254,49 @@ impl Parser {
         // source). Project the current element into slot 0 so the output is the
         // traverser's element — `g.V('3').in('CREATED')` yields the neighbours, not
         // three copies of the source.
-        if self.current != 0 {
+        // The element slot BEFORE the render projection below resets it — the element a
+        // terminal `property()` must emit lives here in the write frontier.
+        let elem_slot = self.current;
+        // A TERMINAL write EMITS its created/mutated element (TinkerPop). Convert it to
+        // the *Return variant with an element-projecting tail BEFORE the render
+        // projection — otherwise that projection wraps the write in a Project and shallow
+        // `is_write` runs the whole thing as a READ (see the drop() finalization). `drop`
+        // (a Delete Update) stays terminal and emits nothing.
+        plan = match plan {
+            // Only when the frontier is an ELEMENT — `property()` on a non-element
+            // (`inject(5).property(...)`) drops it (emits nothing), so leave the bare
+            // Update, which no-ops and returns empty.
+            Plan::Update { input, ops }
+                if self.current_is_element
+                    && !ops.iter().any(|o| matches!(o, crate::ir::SetOp::Delete { .. })) =>
+            {
+                Plan::UpdateReturn {
+                    input,
+                    ops,
+                    tail: Box::new(
+                        Plan::Row.project(vec![("_".to_string(), Expr::Slot(elem_slot))]),
+                    ),
+                }
+            }
+            // addV (props folded in) — the InsertReturn seed binds the created node at
+            // slot 0, so the tail projects it.
+            Plan::Insert { nodes, edges } => Plan::InsertReturn {
+                nodes,
+                edges,
+                tail: Box::new(Plan::Row.project(vec![("_".to_string(), Expr::Slot(0))])),
+            },
+            other => other,
+        };
+        if self.current != 0
+            && !matches!(plan, Plan::UpdateReturn { .. } | Plan::InsertReturn { .. })
+        {
             plan = plan.project(vec![("_".to_string(), Expr::Slot(self.current))]);
             self.current = 0;
             self.slots = 1;
         }
-        // A folded `property()`-Update read tail: wrap it back into an UpdateReturn so
-        // the writes run, then `plan` reads them over the frontier (read-after-write).
+        // A folded `property()`-Update read tail (`property(k,v).values(k)`): wrap it
+        // back into an UpdateReturn so the writes run, then `plan` reads them over the
+        // frontier (read-after-write).
         if let Some((input, ops)) = self.pending_write.take() {
             plan = Plan::UpdateReturn {
                 input,
@@ -8234,12 +8270,16 @@ mod tests {
     fn property_value_accepts_constant_and_degree_traversal() {
         use crate::ir::{Expr, Plan, SetOp};
         let set_value = |q: &str| -> (String, Expr) {
+            // A terminal property() is an UpdateReturn now (it EMITS the mutated
+            // element); the write ops are the same.
             match super::parse(q).unwrap() {
-                Plan::Update { ops, .. } => match ops.into_iter().next().unwrap() {
-                    SetOp::Set { key, value, .. } => (key, value),
-                    other => panic!("expected SetOp::Set, got {other:?}"),
-                },
-                other => panic!("expected Plan::Update, got {other:?}"),
+                Plan::Update { ops, .. } | Plan::UpdateReturn { ops, .. } => {
+                    match ops.into_iter().next().unwrap() {
+                        SetOp::Set { key, value, .. } => (key, value),
+                        other => panic!("expected SetOp::Set, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Plan::Update(Return), got {other:?}"),
             }
         };
         let (k, v) = set_value("g.V().hasLabel('Person').property('flag', constant(1.0))");
