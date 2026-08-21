@@ -26,6 +26,7 @@ export const unionStep = function* (
   // vertex then the total count, matching TinkerPop and the native branch. (coalesce/choose/
   // optional below stay PER-ELEMENT — they route each traverser individually.)
   const all = [...stream];
+
   for (const plan of plans) {
     yield* applyPlanToStream(plan, all, graph, ctx);
   }

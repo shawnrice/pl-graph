@@ -110,6 +110,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         current_is_map: false,
         current_is_element: false,
         current_is_path: false,
+        current_is_scalar: false,
     };
     p.traversal()
 }
@@ -782,6 +783,14 @@ struct Parser {
     /// path is not a number). Preserving filters keep it; any producer that turns
     /// paths into scalars/elements (`unfold`/`values`/`count`/…) clears it.
     current_is_path: bool,
+    /// True when the current frontier holds a DEFINITE scalar (a number/string/id) — set by
+    /// the scalar producers `values`/`value`/`id`/`label`/`count`/`sum`/`min`/`max`/`mean`/
+    /// `math`/`loops`/`inject`, cleared by every element / map / path / ambiguous producer.
+    /// Distinct from `!current_is_element`, which also covers UNKNOWN frontiers (a
+    /// `union`/`unfold`/`select` output that MIGHT be an element) where nothing must fault.
+    /// Read by the element-type-algebra guard in [`step`] (adjacency/edge-hop/endpoint/
+    /// projection on a scalar faults), mirroring the pure-TS engine's `Frontier` classifier.
+    current_is_scalar: bool,
     /// True when the traversal reads a full `path()`/`tree()` — the lowering then emits a
     /// `Plan::PathRecord` after each value-producing step (see [`parse`]).
     building_full_path: bool,
@@ -1449,6 +1458,56 @@ impl Parser {
                 "{lname}() is not defined on a path — a path is not an element; \
                  unfold() it into its elements first"
             ));
+        }
+        // Element-type algebra — the SAME static rejection the pure-TS engine applies (and
+        // TinkerPop's runtime ClassCastException, verified against gremlin-console): the
+        // INCOMING frontier (before this step) must match what the step consumes. A scalar
+        // frontier is `current_is_scalar`; an UNKNOWN frontier (a union/unfold/select output,
+        // `!element && !scalar && !map && !path`) never faults — a missed fault is safe, a
+        // false one breaks a valid query.
+        {
+            let on_edge_frontier = self.current_is_element && self.on_edge;
+            let on_vertex_frontier = self.current_is_element && !self.on_edge;
+            let on_scalar_frontier = self.current_is_scalar;
+            match lname.as_str() {
+                // Adjacency + edge hops navigate FROM a vertex.
+                "out" | "in" | "both" | "oute" | "ine" | "bothe"
+                    if on_edge_frontier || on_scalar_frontier =>
+                {
+                    return Err(format!(
+                        "{lname}() moves from a vertex, but the frontier is {} — {} before {lname}()",
+                        if on_edge_frontier { "an edge" } else { "a scalar" },
+                        if on_edge_frontier {
+                            "use an endpoint step (inV()/outV()/otherV())"
+                        } else {
+                            "project to a vertex"
+                        },
+                    ));
+                }
+                // Endpoints move to an edge's endpoint, so they need an edge.
+                "inv" | "outv" | "bothv" | "otherv" if on_vertex_frontier || on_scalar_frontier => {
+                    return Err(format!(
+                        "{lname}() moves to an edge endpoint, but the frontier is {} — reach an \
+                         edge (outE()/inE()/bothE()) before {lname}()",
+                        if on_vertex_frontier {
+                            "a vertex"
+                        } else {
+                            "a scalar"
+                        },
+                    ));
+                }
+                // Projections read a property/id/label off an ELEMENT.
+                "values" | "value" | "id" | "label" | "properties" | "propertymap" | "valuemap"
+                | "elementmap" | "key"
+                    if on_scalar_frontier =>
+                {
+                    return Err(format!(
+                        "{lname}() reads from a graph element, but the frontier is a projected \
+                         scalar (values()/id()/label()/count()/inject()); it has no such value"
+                    ));
+                }
+                _ => {}
+            }
         }
         // A pending `repeat` stays open across its modulators (times/emit/until); any
         // other step flushes it into a VarLength walk first.
@@ -4816,21 +4875,36 @@ impl Parser {
             | "ine" | "bothe" | "addv" | "adde" => {
                 self.current_is_element = true;
                 self.current_is_path = false;
+                self.current_is_scalar = false;
             }
             // A path frontier: not an element, IS a path — sum/min/max/mean throws over it.
             "path" => {
                 self.current_is_element = false;
                 self.current_is_path = true;
+                self.current_is_scalar = false;
             }
-            "values" | "value" | "id" | "label" | "key" | "count" | "sum" | "min" | "max"
-            | "mean" | "math" | "constant" | "signum" | "mult" | "pow" | "pi" | "propertyname"
-            | "valuemap" | "elementmap" | "propertymap" | "properties" | "property" | "project"
-            | "group" | "groupcount" | "fold" | "unfold" | "tree" | "cap" | "inject" | "union"
-            | "coalesce" | "choose" | "optional" | "branch" | "flatmap" | "map" | "select"
-            | "sack" | "index" | "pagerank" | "peerpressure" | "connectedcomponent"
-            | "shortestpath" | "subgraph" => {
+            // DEFINITE scalar producers (a number/string/id) — mirrors the pure-TS engine's
+            // SCALAR_STEPS. These set `current_is_scalar` so the element-type-algebra guard in
+            // `step` faults a following navigation/projection (`id().out()`, `count().inV()`).
+            "values" | "value" | "id" | "label" | "count" | "sum" | "min" | "max" | "mean"
+            | "math" | "loops" | "inject" => {
                 self.current_is_element = false;
                 self.current_is_path = false;
+                self.current_is_scalar = true;
+            }
+            // Ambiguous / map / collection producers: NOT an element, but NOT a definite
+            // scalar either (a `union`/`unfold`/`select`/`valueMap` output might be an element
+            // or a map) — leave `current_is_scalar` false so nothing faults (a missed fault is
+            // safe; a false one breaks a valid query, exactly as the TS 'unknown' frontier).
+            "key" | "constant" | "signum" | "mult" | "pow" | "pi" | "propertyname" | "valuemap"
+            | "elementmap" | "propertymap" | "properties" | "property" | "project" | "group"
+            | "groupcount" | "fold" | "unfold" | "tree" | "cap" | "union" | "coalesce"
+            | "choose" | "optional" | "branch" | "flatmap" | "map" | "select" | "sack"
+            | "index" | "pagerank" | "peerpressure" | "connectedcomponent" | "shortestpath"
+            | "subgraph" => {
+                self.current_is_element = false;
+                self.current_is_path = false;
+                self.current_is_scalar = false;
             }
             _ => {} // filters / barriers / side-effects / modulators preserve the frontier
         }
@@ -5658,6 +5732,14 @@ impl Parser {
         let saved_repeat = self.pending_repeat.take();
         let saved_path_ok = self.path_ok;
         let saved_on_edge = self.on_edge;
+        // Each branch arm starts from the frontier AT the branch (the input), not from the
+        // previous arm's output — save/restore the frontier-kind flags so the element-type
+        // guard classifies every arm's first step against the branch input (mirrors the
+        // pure-TS checkSteps, which recurses per-arm from the branch frontier).
+        let saved_is_element = self.current_is_element;
+        let saved_is_scalar = self.current_is_scalar;
+        let saved_is_path = self.current_is_path;
+        let saved_is_map = self.current_is_map;
         self.current = from;
         self.slots = width;
         // Optional leading `__.` (an anonymous traversal). The body is then a `.`-
@@ -5683,6 +5765,10 @@ impl Parser {
         self.pending_repeat = saved_repeat;
         self.path_ok = saved_path_ok;
         self.on_edge = saved_on_edge;
+        self.current_is_element = saved_is_element;
+        self.current_is_scalar = saved_is_scalar;
+        self.current_is_path = saved_is_path;
+        self.current_is_map = saved_is_map;
         Ok((body, out_current, out_slots))
     }
 
@@ -9135,10 +9221,13 @@ mod tests {
     fn inject_prepends_and_values_reads_boxed_elements() {
         let st = multi_label_edge_store();
 
-        // values('name') after inject recovers every vertex name (the injected 0 has
-        // no name and drops); order-independent.
-        let names = value_bag(&gremlin_rows("g.V().inject(0).values('name')", &st));
-        assert_eq!(names, vec!["Str(\"marko\");", "Str(\"vadas\");"]);
+        // values('name') AFTER inject is a type error: inject prepends a literal (0), so the
+        // frontier is no longer purely vertices, and values() reads off an element — TinkerPop
+        // throws ClassCastException, and both engines reject it at parse (element-type algebra).
+        assert!(
+            super::parse("g.V().inject(0).values('name')").is_err(),
+            "values() on a post-inject scalar frontier must be rejected"
+        );
 
         // inject(0) alone: the literal comes FIRST (TinkerPop prepends), then the
         // vertices render as element maps (not dense ids).

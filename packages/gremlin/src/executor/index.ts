@@ -79,6 +79,29 @@ const SCALAR_STEPS = new Set([
   'mean',
   'math',
   'loops',
+  // inject() prepends literal values (strings/numbers) to the stream, so the frontier is
+  // no longer purely elements — a following navigation/projection faults, exactly as native
+  // rejects `inject('x').outV()` and TinkerPop throws (the literal is not an element).
+  'inject',
+]);
+
+// Element-type algebra (rejected statically, matching native's parse-time rejection and
+// TinkerPop's runtime ClassCastException — verified against gremlin-console):
+//  - out/in/both (adjacency) + outE/inE/bothE (edge hops) navigate FROM a vertex.
+//  - inV/outV/bothV/otherV (endpoints) move to an edge's endpoint, so need an edge.
+//  - values/value/id/label/properties/… read off an ELEMENT.
+// count/fold/sum/… are stream reducers, valid on ANY frontier (`V().count().count()` → [1]).
+const ADJ_OR_HOP = new Set(['out', 'in', 'both', 'outE', 'inE', 'bothE']);
+const PROJECTION = new Set([
+  'values',
+  'value',
+  'id',
+  'label',
+  'properties',
+  'propertyMap',
+  'valueMap',
+  'elementMap',
+  'key',
 ]);
 // Frontier-PRESERVING filters / barriers / side-effects / writes-that-pass-through.
 const PRESERVE_STEPS = new Set([
@@ -145,10 +168,9 @@ const EDGE_HOPS = new Set(['outE', 'inE', 'bothE']);
 // and so require one. `true` = an edge is reachable, `false` = definitely none, `undefined`
 // = unknown (a branch/collection producer — never fault). An edge step establishes it; a
 // vertex step or vertex-move (out/inV/…) clears it (the edge, if any, was consumed reaching
-// the vertex); a scalar projection (values/label/count) PRESERVES it — `E().count().inV()`
-// is valid (edge still in scope) while `V().values('x').inV()` faults (no edge ever). This
-// mirrors the native engine's plan, where an edge slot survives a projection but a
-// vertex-move consumes it.
+// the vertex); a scalar projection (values/label/count) also CLEARS it — a scalar is not an
+// edge, so `E().count().inV()` and `E().label().inV()` fault (TinkerPop throws), matching the
+// frontier-based checks below. Preserving filters/barriers keep it.
 type HasEdge = boolean | undefined;
 
 const EDGE_SOURCE = new Set(['E', 'outE', 'inE', 'bothE', 'addE']);
@@ -163,7 +185,12 @@ const nextHasEdge = (kind: Step['kind'], prev: HasEdge): HasEdge => {
     return false;
   }
 
-  return SCALAR_STEPS.has(kind) || PRESERVE_STEPS.has(kind) ? prev : undefined;
+  // A scalar producer clears the edge scope (a number/string/id is not an edge).
+  if (SCALAR_STEPS.has(kind)) {
+    return false;
+  }
+
+  return PRESERVE_STEPS.has(kind) ? prev : undefined;
 };
 
 // Combine the ending edge-scope of a branch's arms: any arm that DEFINITELY yields a
@@ -183,6 +210,28 @@ const combineHasEdge = (arms: readonly HasEdge[]): HasEdge => {
 
 const checkStep = (step: Step, f: Frontier, hasEdge: HasEdge, edgeHasOrigin: boolean): void => {
   const k = step.kind;
+
+  // Adjacency (out/in/both) and edge hops (outE/inE/bothE) navigate FROM a vertex. On a
+  // KNOWN edge or scalar frontier the value is not a vertex, so TinkerPop throws and native
+  // rejects — fault to match. `unknown` (a branch output that MIGHT be a vertex) never faults.
+  if (ADJ_OR_HOP.has(k) && (f === 'edge' || f === 'scalar')) {
+    throw new LenkeError(
+      `${k}() moves from a vertex, but the frontier is ${f === 'edge' ? 'an edge' : 'a scalar'} — ` +
+        `${f === 'edge' ? 'use an endpoint step (inV()/outV()/otherV())' : 'project to a vertex'} ` +
+        `before ${k}()`,
+      { code: ErrorCode.Syntax },
+    );
+  }
+
+  // Projections (values/id/label/properties/…) read off an ELEMENT. On a scalar frontier
+  // (`V().id().values('x')`, `E().count().label()`) there is no element — TinkerPop throws.
+  if (PROJECTION.has(k) && f === 'scalar') {
+    throw new LenkeError(
+      `${k}() reads from a graph element, but the frontier is a projected scalar ` +
+        `(values()/id()/label()/count()/inject()); it has no ${k === 'id' || k === 'label' ? k : 'properties'}`,
+      { code: ErrorCode.Syntax },
+    );
+  }
 
   if (
     (k === 'sum' || k === 'min' || k === 'max' || k === 'mean') &&
