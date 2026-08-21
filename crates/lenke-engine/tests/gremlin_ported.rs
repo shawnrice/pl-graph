@@ -10217,3 +10217,22 @@ fn coalesce_barrier_led_filter_arm_guards_the_fallback() {
         6
     );
 }
+
+#[test]
+fn coalesce_skip_before_a_hop_empties_the_arm() {
+    let mut g = modern();
+    let count = |q: &str, g: &mut EngineGraph| match run_query(q, g).as_slice() {
+        [GVal::Num(n)] => *n as i64,
+        other => panic!("expected one count, got {other:?}"),
+    };
+    // Per element skip(1) on the single traverser empties it BEFORE any hop, so the arm never
+    // fires and id() catches all six. AFTER a hop, skip(1) may keep rows, so the arm can fire.
+    assert_eq!(
+        count("g.V().coalesce(skip(1).out('KNOWS'), id()).count()", &mut g),
+        6
+    );
+    assert_eq!(
+        count("g.V().coalesce(out('KNOWS').skip(1), id()).count()", &mut g),
+        6
+    );
+}

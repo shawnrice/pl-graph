@@ -69,19 +69,35 @@ fn body_is_exists_safe(plan: &Plan) -> bool {
 /// the linear operator chain looking for such a barrier. (`limit(n>=1)`/`skip(n)` depend on
 /// the per-hop stream size and are handled per-arm by `strip_barrier_arm`, not here.)
 fn arm_always_empty(p: &Plan) -> bool {
-    match p {
-        Plan::OrderPage { limit: Some(0), .. } => true,
-        Plan::OrderPage { input, .. }
-        | Plan::Filter { input, .. }
-        | Plan::Distinct { input }
-        | Plan::DistinctBy { input, .. }
-        | Plan::Expand { input, .. }
-        | Plan::EdgeVertex { input, .. }
-        | Plan::VarLength { input, .. }
-        | Plan::Project { input, .. }
-        | Plan::OptionalExpand { input, .. } => arm_always_empty(input),
-        _ => false,
+    // Walk bottom-up (Row is the base) tracking whether a hop has grown the per-element stream
+    // beyond the single seed traverser. `limit(0)`/empty-range empties ANY stream; a `skip(n>0)`
+    // empties the SIZE-1 stream that exists before the first hop — `skip(1).inV()` yields nothing
+    // per element, `out().skip(1)` may not. Returns (empty, hopped).
+    fn walk(p: &Plan) -> (bool, bool) {
+        match p {
+            Plan::Row => (false, false),
+            Plan::OrderPage {
+                input, skip, limit, ..
+            } => {
+                let (below_empty, hopped) = walk(input);
+                if below_empty {
+                    return (true, hopped);
+                }
+                let empties = *limit == Some(0) || (!hopped && skip.unwrap_or(0) > 0);
+                (empties, hopped)
+            }
+            Plan::Expand { input, .. }
+            | Plan::EdgeVertex { input, .. }
+            | Plan::VarLength { input, .. }
+            | Plan::OptionalExpand { input, .. } => (walk(input).0, true),
+            Plan::Filter { input, .. }
+            | Plan::Distinct { input }
+            | Plan::DistinctBy { input, .. }
+            | Plan::Project { input, .. } => walk(input),
+            _ => (false, false),
+        }
     }
+    walk(p).0
 }
 
 fn strip_barrier_arm(body: Plan) -> Option<(Plan, bool, Vec<Expr>)> {
