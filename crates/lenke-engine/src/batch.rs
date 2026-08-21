@@ -98,10 +98,29 @@ pub struct Lineage {
     pub offsets: Vec<usize>,
     pub edges: Vec<Value>,
     pub edge_offsets: Vec<usize>,
+    /// The full per-step TRAVERSER HISTORY for Gremlin `path()`/`tree()` — the ordered
+    /// sequence of values the traverser has been, one entry per value-producing step, exactly
+    /// like the pure-TS engine's `Traverser.path`. Unlike `values`/`edges` (which are the
+    /// GQL node/edge path — a pattern's bound elements), this interleaves vertices, edges AND
+    /// projected scalars in the order the steps ran, so `V().values('name').path()` yields
+    /// `[v, 'name']` and `E().path()` yields `[e]`. Row `i`'s history is
+    /// `steps[step_off[i]..step_off[i+1]]`, each element tagged by `step_tag`
+    /// (0 = node id, 1 = edge id, 2 = scalar value). Present only when a Gremlin full-path is
+    /// read (see `needs_gremlin_path`); empty otherwise.
+    pub steps: Vec<Value>,
+    pub step_tag: Vec<u8>,
+    pub step_off: Vec<usize>,
 }
 
+/// Tag for a `Lineage::steps` history element.
+pub const STEP_NODE: u8 = 0;
+pub const STEP_EDGE: u8 = 1;
+pub const STEP_SCALAR: u8 = 2;
+
 impl Lineage {
-    /// Seed one single-node path per node — what a lineage-tracking Scan produces.
+    /// Seed one single-node path per node — what a lineage-tracking Scan produces. The
+    /// Gremlin step-history is seeded with the same node (the source vertex is the first
+    /// path element); `PathRecord` appends every subsequent value-producing step.
     #[must_use]
     pub fn seed(nodes: &[u32]) -> Self {
         Self {
@@ -109,6 +128,24 @@ impl Lineage {
             offsets: (0..=nodes.len()).collect(),
             edges: Vec::new(),
             edge_offsets: vec![0; nodes.len() + 1], // each seed path has 0 edges
+            steps: nodes.iter().map(|&n| Value::Num(f64::from(n))).collect(),
+            step_tag: vec![STEP_NODE; nodes.len()],
+            step_off: (0..=nodes.len()).collect(),
+        }
+    }
+
+    /// Seed one single-EDGE step-history per edge — the `E()` source (`E().path()` yields
+    /// `[e]`). The node/edge path stays empty (GQL does not read an edge-sourced lineage).
+    #[must_use]
+    pub fn seed_edges(edges: &[u32]) -> Self {
+        Self {
+            values: Vec::new(),
+            offsets: vec![0; edges.len() + 1],
+            edges: Vec::new(),
+            edge_offsets: vec![0; edges.len() + 1],
+            steps: edges.iter().map(|&e| Value::Num(f64::from(e))).collect(),
+            step_tag: vec![STEP_EDGE; edges.len()],
+            step_off: (0..=edges.len()).collect(),
         }
     }
 
@@ -121,6 +158,43 @@ impl Lineage {
             offsets: vec![0],
             edges: Vec::new(),
             edge_offsets: vec![0],
+            steps: Vec::new(),
+            step_tag: Vec::new(),
+            step_off: vec![0],
+        }
+    }
+
+    /// Row `i`'s Gremlin step-history slice, paired with the per-element tags.
+    #[must_use]
+    pub fn steps_at(&self, i: usize) -> (&[Value], &[u8]) {
+        let (a, b) = (self.step_off[i], self.step_off[i + 1]);
+        (&self.steps[a..b], &self.step_tag[a..b])
+    }
+
+    /// Append one value per row to the step-history (what `PathRecord` produces): row `i`'s
+    /// history grows by `(vals[i], tag)`. Preserves the node/edge path unchanged.
+    #[must_use]
+    pub fn push_step(&self, vals: &[Value], tag: u8) -> Self {
+        let rows = self.offsets.len().saturating_sub(1);
+        let mut steps = Vec::with_capacity(self.steps.len() + rows);
+        let mut step_tag = Vec::with_capacity(self.step_tag.len() + rows);
+        let mut step_off = vec![0usize];
+        for (i, v) in vals.iter().enumerate().take(rows) {
+            let (sv, st) = self.steps_at(i);
+            steps.extend_from_slice(sv);
+            step_tag.extend_from_slice(st);
+            steps.push(v.clone());
+            step_tag.push(tag);
+            step_off.push(steps.len());
+        }
+        Self {
+            values: self.values.clone(),
+            offsets: self.offsets.clone(),
+            edges: self.edges.clone(),
+            edge_offsets: self.edge_offsets.clone(),
+            steps,
+            step_tag,
+            step_off,
         }
     }
 
@@ -143,17 +217,30 @@ impl Lineage {
         let mut offsets = vec![0usize];
         let mut edges = Vec::new();
         let mut edge_offsets = vec![0usize];
+        let mut steps = Vec::new();
+        let mut step_tag = Vec::new();
+        let mut step_off = vec![0usize];
+        let has_steps = self.step_off.len() > 1;
         for &i in idx {
             values.extend_from_slice(self.path_at(i));
             offsets.push(values.len());
             edges.extend_from_slice(self.edges_at(i));
             edge_offsets.push(edges.len());
+            if has_steps {
+                let (sv, st) = self.steps_at(i);
+                steps.extend_from_slice(sv);
+                step_tag.extend_from_slice(st);
+            }
+            step_off.push(steps.len());
         }
         Self {
             values,
             offsets,
             edges,
             edge_offsets,
+            steps,
+            step_tag,
+            step_off,
         }
     }
 
@@ -166,6 +253,14 @@ impl Lineage {
         let mut offsets = vec![0usize];
         let mut edges = Vec::new();
         let mut edge_offsets = vec![0usize];
+        // The Gremlin step-history is carried through UNCHANGED (gathered by `keep`); the new
+        // node/edge is recorded into it by a following `PathRecord`, not here — an Expand
+        // serves both a GQL pattern (edge in the path) and a Gremlin `out()` (edge NOT in the
+        // path), so the step append is decided by the lowering, per step.
+        let mut steps = Vec::new();
+        let mut step_tag = Vec::new();
+        let mut step_off = vec![0usize];
+        let has_steps = self.step_off.len() > 1;
         for (i, &k) in keep.iter().enumerate() {
             values.extend_from_slice(self.path_at(k));
             values.push(Value::Num(f64::from(new_nodes[i])));
@@ -173,12 +268,21 @@ impl Lineage {
             edges.extend_from_slice(self.edges_at(k));
             edges.push(Value::Num(f64::from(new_edges[i])));
             edge_offsets.push(edges.len());
+            if has_steps {
+                let (sv, st) = self.steps_at(k);
+                steps.extend_from_slice(sv);
+                step_tag.extend_from_slice(st);
+            }
+            step_off.push(steps.len());
         }
         Self {
             values,
             offsets,
             edges,
             edge_offsets,
+            steps,
+            step_tag,
+            step_off,
         }
     }
 
@@ -191,13 +295,23 @@ impl Lineage {
         let mut offsets = vec![0usize];
         let mut edges = Vec::new();
         let mut edge_offsets = vec![0usize];
+        let mut steps = Vec::new();
+        let mut step_tag = Vec::new();
+        let mut step_off = vec![0usize];
         for lin in parts {
             let rows = lin.offsets.len().saturating_sub(1);
+            let has_steps = lin.step_off.len() > 1;
             for i in 0..rows {
                 values.extend_from_slice(lin.path_at(i));
                 offsets.push(values.len());
                 edges.extend_from_slice(lin.edges_at(i));
                 edge_offsets.push(edges.len());
+                if has_steps {
+                    let (sv, st) = lin.steps_at(i);
+                    steps.extend_from_slice(sv);
+                    step_tag.extend_from_slice(st);
+                }
+                step_off.push(steps.len());
             }
         }
         Self {
@@ -205,6 +319,9 @@ impl Lineage {
             offsets,
             edges,
             edge_offsets,
+            steps,
+            step_tag,
+            step_off,
         }
     }
 }

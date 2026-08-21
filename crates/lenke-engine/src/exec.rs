@@ -1586,6 +1586,14 @@ fn edge_result_value(store: &Store, eid: u32) -> Value {
 /// Render one element of an interleaved Gremlin `path()` per its (cycled) `by`
 /// modulator. A vertex or an edge (`is_edge`); `Element` → the element map,
 /// `Prop` → a property value, `Id`/`Label` → the ext-id / label string.
+// Extract a dense id (`Value::Num`) as `u32` for path element rendering.
+fn num_as_u32(v: &Value) -> u32 {
+    match v {
+        Value::Num(n) => *n as u32,
+        _ => 0,
+    }
+}
+
 fn render_gpath_elem(store: &Store, id: u32, is_edge: bool, by: &crate::ir::GPathBy) -> Value {
     use crate::ir::GPathBy;
     match by {
@@ -1820,7 +1828,10 @@ fn needs_lineage(plan: &Plan) -> bool {
     fn reads_path(e: &Expr) -> bool {
         match e {
             // Reading any part of the path needs the lineage, just like `Path`.
-            Expr::Path | Expr::PathAccess { .. } | Expr::GremlinPath { .. } => true,
+            Expr::Path
+            | Expr::PathAccess { .. }
+            | Expr::GremlinPath { .. }
+            | Expr::GremlinFullPath { .. } => true,
             Expr::Compare { left, right, .. }
             | Expr::In {
                 needle: left,
@@ -1914,6 +1925,9 @@ fn needs_lineage(plan: &Plan) -> bool {
             input, qlo, qhi, ..
         } => reads_path(qlo) || reads_path(qhi) || needs_lineage(input),
         Plan::Filter { input, pred } => reads_path(pred) || needs_lineage(input),
+        // A `PathRecord` writes the step-history, so the plan must track lineage; the `input`
+        // is walked for the same reason `Filter` walks its own (the decision is plan-global).
+        Plan::PathRecord { .. } => true,
         Plan::Project { input, items } => {
             items.iter().any(|(_, e)| reads_path(e)) || needs_lineage(input)
         }
@@ -1973,6 +1987,20 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         | Plan::MergeEdge { .. }
         | Plan::AddEdge { .. }
         | Plan::TxControl { .. } => Batch::of(Vec::new()),
+        Plan::PathRecord { input, value, tag } => {
+            let mut batch = pull(input, store, track)?;
+            // Append this step's frontier value to each row's Gremlin step-history. `value`
+            // is `Slot(frontier)` for a node/edge (its dense id) or the projected scalar; the
+            // `tag` records which, so `path()` renders a vertex, an edge, or the raw value.
+            if track {
+                if let Some(lin) = batch.lineage.take() {
+                    let col = eval(value, store, &batch)?;
+                    let vals: Vec<Value> = (0..batch.rows()).map(|i| col.value_at(i)).collect();
+                    batch.lineage = Some(lin.push_step(&vals, *tag));
+                }
+            }
+            batch
+        }
         // `Row` is the leaf of an EXISTS body and is only ever fed a batch by
         // `pull_body`; reaching it through the main pipeline is a bug.
         Plan::Row => {
@@ -2007,10 +2035,15 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             batch
         }
         Plan::EdgeScan => {
-            // The frontier is EDGES, not nodes. `track` is never set for a bare
-            // g.E() read (no path()/lineage step targets an edge frontier yet), so
-            // no lineage is seeded here — a path over g.E() is a later item.
-            Batch::single(Col::Edges(store.all_edges()))
+            // The frontier is EDGES, not nodes. When a full `path()`/`tree()` is read
+            // (`track`), seed the step-history with the source edge — `E().path()` yields
+            // `[e]` per edge — so `PathRecord` can extend it with later steps.
+            let ids = store.all_edges();
+            let mut batch = Batch::single(Col::Edges(ids.clone()));
+            if track {
+                batch.lineage = Some(Lineage::seed_edges(&ids));
+            }
+            batch
         }
         Plan::EdgeSeed { ext_ids } => {
             // Resolve each external id to a LIVE edge, preserving request order; an
@@ -2660,7 +2693,12 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // values, not the pre-projection bindings.
             let batch = pull(input, store, track)?;
             let cols = eval_all(items.iter().map(|(_, e)| e), store, &batch)?;
-            Batch::of(cols)
+            // A Project is row-preserving, so the path lineage stays aligned and flows
+            // through — a following `PathRecord` (Gremlin value-step) needs it, and it does
+            // not disturb the GQL node/edge path either (same rows).
+            let mut out = Batch::of(cols);
+            out.lineage = batch.lineage;
+            out
         }
         Plan::Unwind {
             input,
@@ -10365,7 +10403,10 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         Expr::Lit(_) | Expr::Param(_) => true,
         Expr::Slot(n) => *n == s,
         Expr::Prop { slot, .. } => *slot == s,
-        Expr::Path | Expr::PathAccess { .. } | Expr::GremlinPath { .. } => false,
+        Expr::Path
+        | Expr::PathAccess { .. }
+        | Expr::GremlinPath { .. }
+        | Expr::GremlinFullPath { .. } => false,
         Expr::Not(x) => refs_only_slot(x, s),
         Expr::And(a, b)
         | Expr::Or(a, b)
@@ -10427,7 +10468,8 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         | Expr::Lit(_)
         | Expr::Path
         | Expr::PathAccess { .. }
-        | Expr::GremlinPath { .. } => expr.clone(),
+        | Expr::GremlinPath { .. }
+        | Expr::GremlinFullPath { .. } => expr.clone(),
         Expr::Not(x) => Expr::Not(go(x)),
         Expr::And(a, b) => Expr::And(go(a), go(b)),
         Expr::Or(a, b) => Expr::Or(go(a), go(b)),
@@ -10799,11 +10841,15 @@ fn var_length(
     }
     let mut out = Batch::of(slots);
     if track {
+        let rows_plus1 = bufs.offsets.len();
         out.lineage = Some(Lineage {
             values: bufs.values,
             offsets: bufs.offsets,
             edges: bufs.edges,
             edge_offsets: bufs.edge_offsets,
+            steps: Vec::new(),
+            step_tag: Vec::new(),
+            step_off: vec![0; rows_plus1],
         });
     }
     Ok(out)
@@ -12404,11 +12450,15 @@ fn shortest_path(
     slots.push(Col::Nodes(ends));
     let mut out = Batch::of(slots);
     if track {
+        let rows_plus1 = path_offsets.len();
         out.lineage = Some(Lineage {
             values: path_values,
             offsets: path_offsets,
             edges: path_edges,
             edge_offsets: path_edge_offsets,
+            steps: Vec::new(),
+            step_tag: Vec::new(),
+            step_off: vec![0; rows_plus1],
         });
     }
     out
@@ -12538,11 +12588,15 @@ fn shortest_k_path(
     slots.push(Col::Nodes(ends));
     let mut out = Batch::of(slots);
     if track {
+        let rows_plus1 = bufs.offsets.len();
         out.lineage = Some(Lineage {
             values: bufs.values,
             offsets: bufs.offsets,
             edges: bufs.edges,
             edge_offsets: bufs.edge_offsets,
+            steps: Vec::new(),
+            step_tag: Vec::new(),
+            step_off: vec![0; rows_plus1],
         });
     }
     out
@@ -13015,6 +13069,39 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                                     &bys[p % bys.len()]
                                 };
                                 render_gpath_elem(store, id, is_edge, by)
+                            })
+                            .collect();
+                        Value::List(out)
+                    })
+                    .collect(),
+            ),
+            None => Col::Gen(vec![Value::Null; batch.rows()]),
+        },
+        Expr::GremlinFullPath { bys } => match &batch.lineage {
+            Some(lin) => Col::Gen(
+                (0..batch.rows())
+                    .map(|i| {
+                        let (svals, stags) = lin.steps_at(i);
+                        let out: Vec<Value> = svals
+                            .iter()
+                            .zip(stags)
+                            .enumerate()
+                            .map(|(p, (v, &tag))| {
+                                let by = if bys.is_empty() {
+                                    &crate::ir::GPathBy::Element
+                                } else {
+                                    &bys[p % bys.len()]
+                                };
+                                match tag {
+                                    crate::batch::STEP_NODE => {
+                                        render_gpath_elem(store, num_as_u32(v), false, by)
+                                    }
+                                    crate::batch::STEP_EDGE => {
+                                        render_gpath_elem(store, num_as_u32(v), true, by)
+                                    }
+                                    // A projected scalar is its own path element (no `by`).
+                                    _ => v.clone(),
+                                }
                             })
                             .collect();
                         Value::List(out)

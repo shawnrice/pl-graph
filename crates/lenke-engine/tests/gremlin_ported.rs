@@ -7134,12 +7134,21 @@ fn p6_path_by_name() {
 
 #[test]
 fn p6_path_includes_values() {
-    // Deferred Gremlin form (path() over value projections / with by() modulators / a
-    // simplePath() repeat body — the engine rejects it). Re-asserted as a rejection so it
-    // stays green AND flips the day the feature lands.
+    // path() over a VALUE PROJECTION now records the projected scalar into the step-history
+    // (the feature landed). marko(1) KNOWS vadas(2) and josh(4); each path is
+    // [marko-vertex, neighbour-vertex, neighbour-name], so both a vertex map and the name
+    // string appear, and there are two paths (both starting at marko).
+    let mut g = modern();
+    let json = run_json("g.V('1').out('KNOWS').values('name').path()", &mut g);
     assert!(
-        rejects("g.V('1').out('KNOWS').values('name').path()"),
-        "expected the engine to reject p6_path_includes_values"
+        json.contains("\"vadas\""),
+        "path ends in the neighbour name: {json}"
+    );
+    assert!(json.contains("\"josh\""), "{json}");
+    assert_eq!(
+        json.matches("\"marko\"").count(),
+        2,
+        "two paths, both from marko: {json}"
     );
 }
 

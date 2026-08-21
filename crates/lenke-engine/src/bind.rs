@@ -112,6 +112,10 @@ fn bind_plan(plan: &mut Plan, params: &HashMap<&str, &Value>) -> Result<(), Stri
             bind_plan(input, params)?;
             bind_expr(pred, params)?;
         }
+        Plan::PathRecord { input, value, .. } => {
+            bind_plan(input, params)?;
+            bind_expr(value, params)?;
+        }
         Plan::Aggregate { input, keys, aggs } => {
             bind_plan(input, params)?;
             for (_, e) in keys {
@@ -262,7 +266,8 @@ fn bind_expr(e: &mut Expr, params: &HashMap<&str, &Value>) -> Result<(), String>
         | Expr::Path
         | Expr::PropertyExists { .. }
         | Expr::PathAccess { .. }
-        | Expr::GremlinPath { .. } => {}
+        | Expr::GremlinPath { .. }
+        | Expr::GremlinFullPath { .. } => {}
 
         Expr::Not(a) => bind_expr(a, params)?,
         Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {

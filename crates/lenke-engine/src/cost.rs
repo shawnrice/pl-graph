@@ -98,6 +98,7 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
             let (sel, sel_exact) = selectivity(pred, store);
             estimate(input, store).scale(sel, sel_exact)
         }
+        Plan::PathRecord { input, .. } => estimate(input, store),
         Plan::Expand {
             input, edge_label, ..
         }

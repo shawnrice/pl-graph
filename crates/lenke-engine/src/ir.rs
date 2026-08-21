@@ -267,6 +267,15 @@ pub enum Expr {
         ends_on_edge: bool,
         bys: Vec<GPathBy>,
     },
+    /// The FULL Gremlin `path()` — the per-step traverser history recorded in
+    /// `Lineage::steps` (vertices, edges AND projected scalars, in step order), rendered
+    /// per its (cycled) `by` modulators. Unlike [`GremlinPath`], which reconstructs an
+    /// interleaved node/edge chain from the GQL node/edge lineage, this reads the explicit
+    /// history that `Plan::PathRecord` builds — so it covers value projections, an `E()`
+    /// source, barriers and branches, matching TinkerPop.
+    GremlinFullPath {
+        bys: Vec<GPathBy>,
+    },
     /// `EXISTS { <pattern> [WHERE <pred>] }` — a correlated existence predicate. A
     /// definite Bool per outer row: TRUE iff the sub-pattern, extended from an
     /// outer-bound variable, matches at least once for that row. `body` is a
@@ -753,6 +762,17 @@ pub enum Plan {
     },
     /// Keep rows where `pred` is TRUE (three-valued: FALSE and NULL drop).
     Filter { input: Box<Plan>, pred: Expr },
+    /// Append the current frontier value to the Gremlin `path()`/`tree()` step-history
+    /// (`Lineage::steps`) — one entry per value-producing step, so `path()` can render the
+    /// full traverser history (vertices, edges AND projected scalars) the way TinkerPop does.
+    /// Inserted by the Gremlin lowering after each such step ONLY when the traversal reads a
+    /// full path; `tag` classifies the value (node id / edge id / scalar). Passes rows through
+    /// unchanged (it only grows the sidecar).
+    PathRecord {
+        input: Box<Plan>,
+        value: Expr,
+        tag: u8,
+    },
     /// Group rows by the `(name, expr)` keys and compute `aggs` per group. With
     /// no keys, the whole input is one group (a scalar aggregate). Output columns
     /// are the key names followed by the aggregate names. Group order is

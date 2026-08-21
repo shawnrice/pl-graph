@@ -308,6 +308,17 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             let (i, c) = rewrite(*input, idx);
             (Plan::GroupToMap { input: Box::new(i) }, c)
         }
+        Plan::PathRecord { input, value, tag } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::PathRecord {
+                    input: Box::new(i),
+                    value,
+                    tag,
+                },
+                c,
+            )
+        }
         Plan::InsertFrom {
             input,
             nodes,
@@ -1584,7 +1595,10 @@ fn max_slot(expr: &Expr) -> Option<usize> {
         // false. (Without this, filter-pushdown moved the simplePath filter below the
         // Expands that build the path, where it saw a one-node path and passed
         // everything — silently dropping the filter.)
-        Expr::Path | Expr::PathAccess { .. } | Expr::GremlinPath { .. } => Some(usize::MAX),
+        Expr::Path
+        | Expr::PathAccess { .. }
+        | Expr::GremlinPath { .. }
+        | Expr::GremlinFullPath { .. } => Some(usize::MAX),
         Expr::Not(x) => max_slot(x),
         Expr::And(a, b)
         | Expr::Or(a, b)
@@ -1691,7 +1705,8 @@ fn width(plan: &Plan) -> usize {
         Plan::NestedGroup {
             input, bind_slots, ..
         } => width(input) + 1 + bind_slots.len(),
-        Plan::Filter { input, .. }
+        Plan::PathRecord { input, .. }
+        | Plan::Filter { input, .. }
         | Plan::OrderPage { input, .. }
         | Plan::Distinct { input }
         | Plan::DistinctBy { input, .. }
@@ -2139,7 +2154,8 @@ mod tests {
     fn plan_contains_filter(p: &Plan) -> bool {
         match p {
             Plan::Filter { .. } => true,
-            Plan::Expand { input, .. }
+            Plan::PathRecord { input, .. }
+            | Plan::Expand { input, .. }
             | Plan::Unwind { input, .. }
             | Plan::OptionalExpand { input, .. }
             | Plan::IntervalExpand { input, .. }

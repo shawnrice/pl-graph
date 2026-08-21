@@ -55,8 +55,17 @@ fn body_is_exists_safe(plan: &Plan) -> bool {
 
 pub fn parse(query: &str) -> Result<Plan, String> {
     let toks = lex(query)?;
+    // A traversal that reads a full `path()`/`tree()` records each value-producing step's
+    // frontier into `Lineage::steps` (via `Plan::PathRecord`) so the path can carry projected
+    // scalars, an edge source, etc. Pre-scanned so the lowering knows to emit those records
+    // from the first step; harmless if a `path`/`tree` ident is actually a property name (the
+    // records are no-ops when no path is read).
+    let building_full_path = toks.iter().any(|t| {
+        matches!(t, Tok::Ident(s) if s.eq_ignore_ascii_case("path") || s.eq_ignore_ascii_case("tree"))
+    });
     let mut p = Parser {
         toks,
+        building_full_path,
         pos: 0,
         current: 0,
         slots: 1,
@@ -754,6 +763,9 @@ struct Parser {
     /// path is not a number). Preserving filters keep it; any producer that turns
     /// paths into scalars/elements (`unfold`/`values`/`count`/…) clears it.
     current_is_path: bool,
+    /// True when the traversal reads a full `path()`/`tree()` — the lowering then emits a
+    /// `Plan::PathRecord` after each value-producing step (see [`parse`]).
+    building_full_path: bool,
 }
 
 impl Parser {
@@ -1243,7 +1255,32 @@ impl Parser {
         self.current_is_element = matches!(head.to_ascii_lowercase().as_str(), "v" | "e" | "addv");
         while self.peek() == Some(&Tok::Dot) {
             self.pos += 1;
+            let step_name = match self.peek() {
+                Some(Tok::Ident(s)) => s.to_ascii_lowercase(),
+                _ => String::new(),
+            };
             plan = self.step(plan)?;
+            // Record this step's frontier into the Gremlin path history when it PRODUCES a
+            // new path element (a vertex/edge move or a value projection). Filters/barriers
+            // leave the value unchanged and add nothing to the path. The tag is decided by the
+            // step name — robust against the frontier-flag bookkeeping.
+            if self.building_full_path {
+                let tag = match step_name.as_str() {
+                    "oute" | "ine" | "bothe" => Some(crate::batch::STEP_EDGE),
+                    "out" | "in" | "both" | "inv" | "outv" | "otherv" | "bothv" => {
+                        Some(crate::batch::STEP_NODE)
+                    }
+                    "values" | "value" | "id" | "label" | "key" => Some(crate::batch::STEP_SCALAR),
+                    _ => None,
+                };
+                if let Some(tag) = tag {
+                    plan = Plan::PathRecord {
+                        input: Box::new(plan),
+                        value: Expr::Slot(self.current),
+                        tag,
+                    };
+                }
+            }
         }
         plan = self.flush_repeat(plan)?;
         if self.pos != self.toks.len() {
@@ -1307,6 +1344,44 @@ impl Parser {
             };
         }
         Ok(plan)
+    }
+
+    /// Parse a run of `.by(...)` modulators after `path()`/`tree()` into cycled path
+    /// projectors: `by('k')` → the element's property, `by(id)` / `by(label)` (bare, `T.`- or
+    /// `__.`-qualified) → its id / label. Empty when there is no `by`.
+    fn parse_path_bys(&mut self) -> Result<Vec<crate::ir::GPathBy>, String> {
+        let mut bys: Vec<crate::ir::GPathBy> = Vec::new();
+        while self.peek() == Some(&Tok::Dot)
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
+        {
+            self.expect(&Tok::Dot)?;
+            self.ident()?; // by
+            self.expect(&Tok::LParen)?;
+            if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                self.bump();
+                self.expect(&Tok::Dot)?;
+            }
+            if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("T")) {
+                self.bump();
+                self.expect(&Tok::Dot)?;
+            }
+            let by = match self.peek() {
+                Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("id") => {
+                    self.bump();
+                    self.eat_empty_parens();
+                    crate::ir::GPathBy::Id
+                }
+                Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("label") => {
+                    self.bump();
+                    self.eat_empty_parens();
+                    crate::ir::GPathBy::Label
+                }
+                _ => crate::ir::GPathBy::Prop(self.str_arg()?),
+            };
+            self.expect(&Tok::RParen)?;
+            bys.push(by);
+        }
+        Ok(bys)
     }
 
     fn step(&mut self, plan: Plan) -> Result<Plan, String> {
@@ -2647,110 +2722,80 @@ impl Parser {
             }
             "path" => {
                 self.expect(&Tok::RParen)?;
-                // An interleaved node/edge path (`outE().inV()…`) renders through
-                // GremlinPath (lineage `values` zipped with `edges`); a bare vertex-hop
-                // chain stays on the nodes-only path below.
+                // An interleaved node/edge path (`outE().inV()…`) renders through GremlinPath
+                // (lineage `values` zipped with `edges`); a pure vertex-hop chain (incl. a
+                // `repeat(<hop>)` walk) stays on the nodes-only `Expr::Path`. Both keep their
+                // established behavior. Everything else — a value projection, an `E()` source,
+                // a barrier, a branch — uses the full per-step history from `PathRecord`.
                 if self.path_has_edges && self.edge_path_ok {
                     let ends_on_edge = self.on_edge;
-                    let mut bys: Vec<crate::ir::GPathBy> = Vec::new();
-                    while self.peek() == Some(&Tok::Dot)
-                        && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
-                    {
-                        self.expect(&Tok::Dot)?;
-                        self.ident()?; // by
-                        self.expect(&Tok::LParen)?;
-                        // by('k') | by(id) | by(label) | by(T.id|T.label) | by(__.id()|__.label()).
-                        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
-                            self.bump();
-                            self.expect(&Tok::Dot)?;
-                        }
-                        if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("T"))
-                        {
-                            self.bump();
-                            self.expect(&Tok::Dot)?;
-                        }
-                        let by = match self.peek() {
-                            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("id") => {
-                                self.bump();
-                                self.eat_empty_parens();
-                                crate::ir::GPathBy::Id
-                            }
-                            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("label") => {
-                                self.bump();
-                                self.eat_empty_parens();
-                                crate::ir::GPathBy::Label
-                            }
-                            _ => crate::ir::GPathBy::Prop(self.str_arg()?),
-                        };
-                        self.expect(&Tok::RParen)?;
-                        bys.push(by);
-                    }
+                    let bys = self.parse_path_bys()?;
                     let p = plan.project(vec![(
                         "path".to_string(),
                         Expr::GremlinPath { ends_on_edge, bys },
                     )]);
                     self.current = 0;
                     self.slots = 1;
-                    // This branch returns before the trailing step classifier, so mark the
-                    // path frontier here (a later sum/min/max/mean must still fault).
                     self.current_is_element = false;
                     self.current_is_path = true;
                     return Ok(p);
                 }
-                if !self.path_ok {
-                    return Err("path() is only supported over a pure vertex-hop chain \
-                                (V-source + out/in/both); edge steps, var-length, value \
-                                projections and the E source are deferred"
-                        .into());
-                }
-                // Gremlin path() over a vertex-hop chain is the sequence of vertices
-                // visited. The engine's lineage records exactly that node sequence
-                // (`Expr::Path` → the ids); `path_nodes` renders each id as its
-                // element map so the path elements are vertices, matching core. The
-                // `Expr::Path` argument both feeds the ids and makes `needs_lineage`
-                // switch tracking on.
-                // An optional `.by('k')` projects each path ELEMENT to a property
-                // (Gremlin `path().by('name')` → a list of names, not vertex maps).
-                let call = if self.peek() == Some(&Tok::Dot)
-                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
-                {
-                    self.expect(&Tok::Dot)?;
-                    self.ident()?; // `by`
-                    self.expect(&Tok::LParen)?;
-                    // by('k') → each element's property; by(id|label|T.id|T.label) → the
-                    // element's ext-id / label (sentinel keys the path_values fn maps).
-                    if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("T")) {
-                        self.bump();
+                if self.path_ok {
+                    // Vertex-hop path — the node sequence; `.by('k')` projects each element.
+                    let call = if self.peek() == Some(&Tok::Dot)
+                        && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
+                    {
                         self.expect(&Tok::Dot)?;
-                    }
-                    let key = match self.peek() {
-                        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("id") => {
+                        self.ident()?; // `by`
+                        self.expect(&Tok::LParen)?;
+                        if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("T"))
+                        {
                             self.bump();
-                            self.eat_empty_parens();
-                            "\u{0}id".to_string()
+                            self.expect(&Tok::Dot)?;
                         }
-                        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("label") => {
-                            self.bump();
-                            self.eat_empty_parens();
-                            "\u{0}label".to_string()
+                        let key = match self.peek() {
+                            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("id") => {
+                                self.bump();
+                                self.eat_empty_parens();
+                                "\u{0}id".to_string()
+                            }
+                            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("label") => {
+                                self.bump();
+                                self.eat_empty_parens();
+                                "\u{0}label".to_string()
+                            }
+                            _ => self.str_arg()?,
+                        };
+                        self.expect(&Tok::RParen)?;
+                        Expr::Call {
+                            name: "path_values".to_string(),
+                            args: vec![Expr::Path, Expr::Lit(Value::Str(key.into()))],
                         }
-                        _ => self.str_arg()?,
+                    } else {
+                        Expr::Call {
+                            name: "path_nodes".to_string(),
+                            args: vec![Expr::Path],
+                        }
                     };
-                    self.expect(&Tok::RParen)?;
-                    Expr::Call {
-                        name: "path_values".to_string(),
-                        args: vec![Expr::Path, Expr::Lit(Value::Str(key.into()))],
-                    }
-                } else {
-                    Expr::Call {
-                        name: "path_nodes".to_string(),
-                        args: vec![Expr::Path],
-                    }
-                };
-                let p = plan.project(vec![("path".to_string(), call)]);
+                    let p = plan.project(vec![("path".to_string(), call)]);
+                    self.current = 0;
+                    self.slots = 1;
+                    // The frontier is now a PATH (a later element step must fault) — set here
+                    // because this early return skips the end-of-step frontier classifier.
+                    self.current_is_element = false;
+                    self.current_is_path = true;
+                    return Ok(p);
+                }
+                // Previously DEFERRED — the full per-step traverser history (vertices, edges
+                // AND projected scalars, in step order) that `PathRecord` recorded, matching
+                // TinkerPop. Optional `.by(...)` projects each element, cycled positionally.
+                let bys = self.parse_path_bys()?;
+                let p = plan.project(vec![("path".to_string(), Expr::GremlinFullPath { bys })]);
                 self.current = 0;
                 self.slots = 1;
-                p
+                self.current_is_element = false;
+                self.current_is_path = true;
+                return Ok(p);
             }
             "simplepath" | "cyclicpath" => {
                 self.expect(&Tok::RParen)?;
@@ -7715,11 +7760,12 @@ mod tests {
             id_seqs("g.V('0').out('KNOWS').out('KNOWS').path()", &store),
             vec![vec!["0".to_string(), "1".to_string(), "2".to_string()]],
         );
-        // An interleaved node/edge path (`outE().inV()`) renders through GremlinPath.
+        // An interleaved node/edge path (`outE().inV()`) works.
         assert!(super::parse("g.V().outE().inV().path()").is_ok());
-        // Still deferred: the bare `E` source, and a value projection before path().
-        assert!(super::parse("g.E().path()").is_err());
-        assert!(super::parse("g.V().values('name').path()").is_err());
+        // The full per-step history (PathRecord) now covers what was once deferred: an `E()`
+        // source (`[e]` per edge) and a value projection before `path()` (`[v, 'name']`).
+        assert!(super::parse("g.E().path()").is_ok());
+        assert!(super::parse("g.V().values('name').path()").is_ok());
         // A `repeat(<vertex-hop>)` walk records full path lineage, so path() over it
         // parses (the VarLength endpoints carry their node chains).
         assert!(super::parse("g.V().repeat(out('KNOWS')).times(2).path()").is_ok());
