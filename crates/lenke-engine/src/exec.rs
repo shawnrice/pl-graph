@@ -14118,6 +14118,11 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             // `u32::MAX`, or a computed value) the answer is NULL, matching core's
             // `prop_present` (`_ => Val::Null`). A column with no sentinel keeps the
             // unboxed `Col::Bool` fast path; a sentinel forces the null-carrying `Gen`.
+            // A slot past the runtime width (a branch/inject collapsed the layout) has no
+            // element to test — the presence is NULL, like a non-element frontier.
+            if *slot >= batch.slots.len() {
+                return Ok(Col::Gen(vec![Value::Null; batch.rows()]));
+            }
             match batch.slot(*slot) {
                 Col::Nodes(ids) if !ids.contains(&u32::MAX) => {
                     Col::Bool(ids.iter().map(|&id| store.has_prop(id, key)).collect())
@@ -14272,7 +14277,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             let seed = Batch::of(slots);
             let survivors = pull_body(body, store, &seed)?;
             let mut hit = vec![false; n];
-            if let Col::Num(ids) = survivors.slot(prov) {
+            if let Some(Col::Num(ids)) = survivors.slots.get(prov) {
                 for &id in ids {
                     let i = id as usize;
                     if i < n {
@@ -14292,7 +14297,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             let seed = Batch::of(slots);
             let survivors = pull_body(body, store, &seed)?;
             let mut counts = vec![0f64; n];
-            if let Col::Num(ids) = survivors.slot(prov) {
+            if let Some(Col::Num(ids)) = survivors.slots.get(prov) {
                 for &id in ids {
                     let i = id as usize;
                     if i < n {
@@ -14314,7 +14319,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             let survivors = pull_body(body, store, &seed)?;
             let vals = eval(scalar, store, &survivors)?;
             let mut out: Vec<Vec<Value>> = vec![Vec::new(); n];
-            if let Col::Num(ids) = survivors.slot(prov).clone() {
+            if let Some(Col::Num(ids)) = survivors.slots.get(prov).cloned() {
                 for (j, &id) in ids.iter().enumerate() {
                     let i = id as usize;
                     if i < n {
@@ -14340,7 +14345,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             let vals = eval(scalar, store, &survivors)?;
             // Per outer row: (running total, count of numeric values, best for min/max).
             let mut acc: Vec<(f64, u64, Option<f64>)> = vec![(0.0, 0, None); n];
-            if let Col::Num(ids) = survivors.slot(prov).clone() {
+            if let Some(Col::Num(ids)) = survivors.slots.get(prov).cloned() {
                 for (j, &id) in ids.iter().enumerate() {
                     let i = id as usize;
                     if i >= n {
@@ -14395,7 +14400,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             let vals = eval(scalar, store, &survivors)?;
             let mut out = vec![Value::Null; n];
             let mut seen = vec![false; n];
-            if let Col::Num(ids) = survivors.slot(prov).clone() {
+            if let Some(Col::Num(ids)) = survivors.slots.get(prov).cloned() {
                 for (j, &id) in ids.iter().enumerate() {
                     let i = id as usize;
                     if i < n {
@@ -17389,7 +17394,9 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
     // whose column `k` is present — a raw `present[]` pass, no boxing. An
     // absent-everywhere column keeps nothing.
     if let Expr::PropertyExists { slot, key } = pred {
-        let Col::Nodes(ids) = batch.slot(*slot) else {
+        // A slot past the runtime width (a branch/inject collapsed the layout) has no column
+        // to gate on — fall back to the general evaluator rather than indexing out of bounds.
+        let Some(Col::Nodes(ids)) = batch.slots.get(*slot) else {
             return None;
         };
         // Present = `present_at` (a typed value OR a stored present-null via the column's
