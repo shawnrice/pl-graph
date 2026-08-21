@@ -6151,6 +6151,14 @@ impl Parser {
             },
             _ => None,
         };
+        // A leading hop navigates FROM a vertex. If the incoming frontier is DEFINITELY not a
+        // vertex (an edge or scalar branch input, `inE(…).choose(outE(…).count(), …)`), bail so
+        // the general arm path faults via the adjacency/edge-hop guard rather than silently
+        // building a subquery. (An UNKNOWN frontier might be a vertex — keep building.)
+        if hop_dir.is_some() && (self.on_edge || self.current_is_scalar) {
+            self.pos = save;
+            return Ok(None);
+        }
         let (mut body, landed) = if let Some((dir, is_edge)) = hop_dir {
             self.bump();
             if self.expect(&Tok::LParen).is_err() {

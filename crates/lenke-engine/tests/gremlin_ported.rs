@@ -10269,3 +10269,19 @@ fn endpoint_after_a_branch_needs_an_edge_in_scope() {
         "count needs no edge"
     );
 }
+
+#[test]
+fn per_element_aggregate_arm_respects_the_frontier_type() {
+    // try_per_element_agg builds a correlated subquery directly, bypassing the per-step
+    // type-algebra guards — so a leading hop from a DEFINITELY-non-vertex frontier (an edge or
+    // scalar branch input) has to bail, else `outE('X').count()` on an edge frontier silently
+    // builds a subquery where TinkerPop + pure-TS fault (edge-hop on an edge).
+    assert!(
+        lenke_engine::gremlin::parse(
+            "g.V().inE('KNOWS').choose(outV().has('name', gte('a')), outE('NOPE').count(), hasLabel('NOPE'))"
+        ).is_err(),
+        "outE().count() on an edge frontier must fault"
+    );
+    // out().count() on a vertex frontier stays valid.
+    assert!(lenke_engine::gremlin::parse("g.V().coalesce(out('KNOWS').count(), id())").is_ok());
+}
