@@ -1689,9 +1689,12 @@ fn width(plan: &Plan) -> usize {
         | Plan::IntervalExpand {
             input, bind_edge, ..
         } => width(input) + if *bind_edge { 2 } else { 1 },
-        Plan::VarLength { input, .. }
-        | Plan::ShortestPath { input, .. }
-        | Plan::Branch { input, .. } => width(input) + 1,
+        Plan::VarLength { input, .. } | Plan::ShortestPath { input, .. } => width(input) + 1,
+        // A Branch (union/coalesce/optional/choose) concatenates its bodies, each RECONVERGED
+        // to a single frontier column — so its output is that body width (1), NOT
+        // `width(input) + 1`. Over-counting it let filter-pushdown move a predicate that reads
+        // the branch's frontier slot below an Expand that produces it (out-of-range at run).
+        Plan::Branch { bodies, .. } => bodies.first().map_or(1, width),
         Plan::Reconverge { .. } => 1,
         // A bound-edge OPTIONAL MATCH appends the edge column too.
         Plan::OptionalExpand {
