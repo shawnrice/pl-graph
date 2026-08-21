@@ -9991,3 +9991,32 @@ fn coalesce_edge_hop_arm_guards_the_fallback() {
         "the five vertices with no outgoing KNOWS each count themselves"
     );
 }
+
+#[test]
+fn sum_over_a_branch_of_elements_faults() {
+    let mut g = modern();
+    // A numeric aggregate over a branch that yields ELEMENTS (union/optional/coalesce of
+    // vertices) is a type error — a vertex is not a number. The static current_is_element
+    // guard misses it (a branch's frontier is 'unknown'), so the runtime reduce must fault,
+    // matching TinkerPop's ClassCastException and the pure-TS engine. Without it native
+    // silently summed the node dense-ids.
+    let mut rejects = |q: &str| exec_query(q, &mut g).is_err();
+    assert!(
+        rejects("g.V().union(out('CREATED'), has('age', gt(0))).sum()"),
+        "union sum"
+    );
+    assert!(
+        rejects("g.V().optional(has('age', gt(0))).sum()"),
+        "optional sum"
+    );
+    assert!(
+        rejects("g.V().coalesce(out('CREATED'), has('age', gt(0))).max()"),
+        "coalesce max"
+    );
+    // A fold() of elements is still valid (a list of element maps), NOT a numeric reduce.
+    assert!(!run_query(
+        "g.V().union(out('CREATED'), has('age', gt(0))).fold()",
+        &mut g
+    )
+    .is_empty());
+}

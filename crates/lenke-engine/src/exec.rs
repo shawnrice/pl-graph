@@ -4742,6 +4742,31 @@ fn aggregate(
             slots.push(Col::Gen(vec![Value::List(list)]));
             continue;
         }
+        // A NUMERIC aggregate over a raw ELEMENT column (a vertex/edge frontier — e.g. a
+        // union/coalesce/optional arm that yields elements, whose 'unknown' frontier slips
+        // past the Gremlin parser's static current_is_element guard) is a type error: a
+        // Vertex/Edge is not a number. `value_at` surfaces a node as its dense id, which
+        // would SILENTLY SUM THE IDS; TinkerPop throws ClassCastException and pure-TS faults,
+        // so fault here to match (`g.V().union(out(), …).sum()`). Collect/fold over elements
+        // is fine (it builds a list of element maps), so only the numeric reducers fault.
+        if matches!(
+            agg.func,
+            AggFn::Sum
+                | AggFn::Avg
+                | AggFn::Min
+                | AggFn::Max
+                | AggFn::StddevPop
+                | AggFn::StddevSamp
+                | AggFn::PercentileCont
+                | AggFn::PercentileDisc
+        ) && matches!(arg_col, Some(Col::Nodes(_) | Col::Edges(_)))
+        {
+            return Err(format!(
+                "{}() over graph elements is not supported — a vertex/edge is not a number; \
+                 project with values('<key>') first",
+                agg.name
+            ));
+        }
         slots.push(Col::Gen(fold_grouped(
             agg,
             arg_col.as_ref(),
