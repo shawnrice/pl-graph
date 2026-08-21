@@ -275,6 +275,35 @@ fn run_json(query: &str, store: &mut EngineGraph) -> String {
     lenke_engine::json::gremlin_results_json(&rows)
 }
 
+/// Render via the FUSED JSON serializers (`try_run_gremlin_json`) — the FFI's result path,
+/// distinct from `run_json`'s materialized `gremlin_results_json`. Some panics only surface
+/// here (an out-of-range slot read the fused fold/map serializers made).
+fn run_fused_json(query: &str, store: &EngineGraph) -> Result<String, String> {
+    let plan = lenke_engine::gremlin::parse(query)?;
+    lenke_engine::exec::try_run_gremlin_json(&plan, store)
+}
+
+#[test]
+fn limit_zero_over_an_edge_frontier_does_not_panic_the_fused_serializer() {
+    let g = modern();
+    // `outE('X').limit(0).fold()` leaves a zero-row batch that drops the edge column; the
+    // fused fold/map JSON serializers read the frontier slot and panic-indexed the FFI
+    // (surfacing as E_INVALID_VALUE) where TinkerPop and pure-TS give [[]] / [].
+    assert_eq!(
+        run_fused_json("g.V().outE('KNOWS').limit(0).fold()", &g).unwrap(),
+        "[[]]"
+    );
+    assert_eq!(
+        run_fused_json("g.V().outE('NOPE').limit(0).fold()", &g).unwrap(),
+        "[[]]"
+    );
+    assert_eq!(
+        run_fused_json("g.V().out('KNOWS').limit(1).limit(0)", &g).unwrap(),
+        "[]"
+    );
+    assert_eq!(run_fused_json("g.V().limit(0)", &g).unwrap(), "[]");
+}
+
 // ── error contract: engine fault string → a coded result ─────────────────────
 
 /// The error codes the ported bodies assert on. The engine reports a fault as a

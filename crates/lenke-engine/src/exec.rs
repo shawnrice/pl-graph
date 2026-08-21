@@ -3799,7 +3799,14 @@ fn try_fused_fold_json(plan: &Plan, store: &Store) -> Option<String> {
     let batch = pull(input, store, false).ok()?;
     let cols = resolve_node_cols(store, &[]);
     let mut out = String::from("[[");
-    match batch.slot(*s) {
+    // An empty frontier narrowed below this slot (`outE('X').limit(0).fold()` — limit(0)
+    // leaves a zero-row batch that may drop the edge column) folds to the empty list. Guard
+    // the slot read: `batch.slot()` would panic-index (crashing the FFI as E_INVALID_VALUE).
+    let Some(frontier) = batch.slots.get(*s) else {
+        out.push_str("]]");
+        return Some(out);
+    };
+    match frontier {
         Col::Nodes(ids) => {
             for (n, &id) in ids.iter().enumerate() {
                 if n > 0 {
@@ -3874,7 +3881,12 @@ fn try_fused_map_json(plan: &Plan, store: &Store) -> Option<String> {
     };
     let batch = pull(input, store, false).ok()?;
     let mut out = String::from("[");
-    match batch.slot(slot) {
+    // An empty frontier narrowed below this slot (a zero-row batch after `limit(0)`) renders
+    // as no rows. Guard the slot read — `batch.slot()` would panic-index the FFI.
+    let Some(frontier) = batch.slots.get(slot) else {
+        return Some(String::from("[]"));
+    };
+    match frontier {
         Col::Nodes(ids) => {
             let cols = resolve_node_cols(store, &filter);
             for (n, &id) in ids.iter().enumerate() {
