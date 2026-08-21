@@ -41,6 +41,8 @@ export const traverseToVertex = function* (
   step: { kind: 'out' | 'in' | 'both'; labels: readonly string[] },
 ): Iterable<Traverser<unknown>> {
   for (const t of stream) {
+    // A vertex step on a NON-VERTEX yields nothing — matching the native engine, which
+    // is lenient here (unlike the edge→vertex steps below, which fault on a non-edge).
     if (!isVertex(t.value)) {
       continue;
     }

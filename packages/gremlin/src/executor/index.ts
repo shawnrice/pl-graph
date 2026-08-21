@@ -141,7 +141,47 @@ const isElement = (f: Frontier): boolean => f === 'vertex' || f === 'edge';
 
 const EDGE_HOPS = new Set(['outE', 'inE', 'bothE']);
 
-const checkStep = (step: Step, f: Frontier, edgeHasOrigin: boolean): void => {
+// Whether an EDGE is in scope for `inV`/`outV`/`otherV`, which move to an edge's endpoint
+// and so require one. `true` = an edge is reachable, `false` = definitely none, `undefined`
+// = unknown (a branch/collection producer — never fault). An edge step establishes it; a
+// vertex step or vertex-move (out/inV/…) clears it (the edge, if any, was consumed reaching
+// the vertex); a scalar projection (values/label/count) PRESERVES it — `E().count().inV()`
+// is valid (edge still in scope) while `V().values('x').inV()` faults (no edge ever). This
+// mirrors the native engine's plan, where an edge slot survives a projection but a
+// vertex-move consumes it.
+type HasEdge = boolean | undefined;
+
+const EDGE_SOURCE = new Set(['E', 'outE', 'inE', 'bothE', 'addE']);
+const VERTEX_MOVE = new Set(['V', 'out', 'in', 'both', 'addV', 'inV', 'outV', 'bothV', 'otherV']);
+
+const nextHasEdge = (kind: Step['kind'], prev: HasEdge): HasEdge => {
+  if (EDGE_SOURCE.has(kind)) {
+    return true;
+  }
+
+  if (VERTEX_MOVE.has(kind)) {
+    return false;
+  }
+
+  return SCALAR_STEPS.has(kind) || PRESERVE_STEPS.has(kind) ? prev : undefined;
+};
+
+// Combine the ending edge-scope of a branch's arms: any arm that DEFINITELY yields a
+// non-edge (`false`) makes a following `inV`/`outV` faultable; all-edge arms keep it in
+// scope; anything unknown stays unknown (conservative — never fault).
+const combineHasEdge = (arms: readonly HasEdge[]): HasEdge => {
+  if (arms.some((a) => a === false)) {
+    return false;
+  }
+
+  if (arms.length > 0 && arms.every((a) => a === true)) {
+    return true;
+  }
+
+  return undefined;
+};
+
+const checkStep = (step: Step, f: Frontier, hasEdge: HasEdge, edgeHasOrigin: boolean): void => {
   const k = step.kind;
 
   if (
@@ -175,10 +215,12 @@ const checkStep = (step: Step, f: Frontier, edgeHasOrigin: boolean): void => {
     }
   }
 
-  // Only a VERTEX frontier is a definite fault — the engine rejects `g.V().otherV()`
-  // but is LENIENT on a scalar frontier (`E().label().inV()` is fine — it just matches
-  // nothing). An 'edge' frontier is the valid case; 'unknown' never faults.
-  if ((k === 'inV' || k === 'outV' || k === 'bothV' || k === 'otherV') && f === 'vertex') {
+  // `inV`/`outV`/`bothV`/`otherV` move to an edge's endpoint, so they require an edge in
+  // scope. Fault iff there is DEFINITELY none (`g.V().otherV()`, `g.V().values('x').inV()`);
+  // an edge frontier or an edge-derived scalar (`E().label().inV()`) is valid, and an
+  // unknown frontier (a branch that might yield edges) never faults. Matches the native
+  // engine's parse-time rejection.
+  if ((k === 'inV' || k === 'outV' || k === 'bothV' || k === 'otherV') && hasEdge === false) {
     throw new LenkeError(
       `${k}() requires an edge — a vertex has no incident edge to move across; ` +
         `use an edge step (outE()/inE()/bothE()) before ${k}()`,
@@ -204,32 +246,61 @@ const checkStep = (step: Step, f: Frontier, edgeHasOrigin: boolean): void => {
 // (union/coalesce arms, an optional/choose body, a choose condition) each START from the
 // frontier at the branch — so `V().union(inV(), …)` faults on the vertex-move exactly as
 // the native engine's parser does, not just at the top level.
-const checkSteps = (steps: readonly Step[], start: Frontier, startEdgeHasOrigin: boolean): void => {
+const checkSteps = (
+  steps: readonly Step[],
+  start: Frontier,
+  startHasEdge: HasEdge,
+  startEdgeHasOrigin: boolean,
+): { f: Frontier; hasEdge: HasEdge } => {
   let f = start;
+  let hasEdge = startHasEdge;
   // Whether the current edge frontier was reached THROUGH a vertex (so the path holds a
   // reference vertex for `otherV()`). An edge hop (`outE`/…) sets it; a bare `E()` source
   // clears it. A branch arm inherits it from the frontier at the branch.
   let edgeHasOrigin = startEdgeHasOrigin;
 
   for (const step of steps) {
-    checkStep(step, f, edgeHasOrigin);
+    checkStep(step, f, hasEdge, edgeHasOrigin);
 
     const k = step.kind;
 
+    // A branch's arms each START from the frontier at the branch; the branch's OUTPUT
+    // edge-scope is the combination of the arms' endings (so `V().union(outE(), out()).inV()`
+    // faults — one arm yields a non-edge — exactly as the native parser rejects it).
     if (k === 'union' || k === 'coalesce') {
-      for (const p of (step as { plans: readonly Plan[] }).plans) {
-        checkSteps(p.steps, f, edgeHasOrigin);
-      }
-    } else if (k === 'optional') {
-      checkSteps((step as { plan: Plan }).plan.steps, f, edgeHasOrigin);
-    } else if (k === 'choose') {
-      const c = step as { test: Plan; thenPlan: Plan; elsePlan?: Plan };
-      checkSteps(c.test.steps, f, edgeHasOrigin);
-      checkSteps(c.thenPlan.steps, f, edgeHasOrigin);
+      const ends = (step as { plans: readonly Plan[] }).plans.map((p) =>
+        checkSteps(p.steps, f, hasEdge, edgeHasOrigin),
+      );
 
-      if (c.elsePlan) {
-        checkSteps(c.elsePlan.steps, f, edgeHasOrigin);
-      }
+      f = 'unknown';
+      hasEdge = combineHasEdge(ends.map((e) => e.hasEdge));
+
+      continue;
+    }
+
+    if (k === 'optional') {
+      // The output is the matched (body) traversers AND the unmatched (pre-body) ones,
+      // so combine the body's ending edge-scope with the pre-body scope.
+      const body = checkSteps((step as { plan: Plan }).plan.steps, f, hasEdge, edgeHasOrigin);
+
+      f = 'unknown';
+      hasEdge = combineHasEdge([hasEdge, body.hasEdge]);
+
+      continue;
+    }
+
+    if (k === 'choose') {
+      const c = step as { test: Plan; thenPlan: Plan; elsePlan?: Plan };
+      checkSteps(c.test.steps, f, hasEdge, edgeHasOrigin);
+      const thenEnd = checkSteps(c.thenPlan.steps, f, hasEdge, edgeHasOrigin);
+      const elseEnd = c.elsePlan
+        ? checkSteps(c.elsePlan.steps, f, hasEdge, edgeHasOrigin)
+        : { f, hasEdge };
+
+      f = 'unknown';
+      hasEdge = combineHasEdge([thenEnd.hasEdge, elseEnd.hasEdge]);
+
+      continue;
     }
 
     if (EDGE_HOPS.has(k)) {
@@ -239,10 +310,15 @@ const checkSteps = (steps: readonly Step[], start: Frontier, startEdgeHasOrigin:
     }
 
     f = nextFrontier(k, f);
+    hasEdge = nextHasEdge(k, hasEdge);
   }
+
+  return { f, hasEdge };
 };
 
-const assertFrontierTypes = (plan: Plan): void => checkSteps(plan.steps, 'unknown', false);
+const assertFrontierTypes = (plan: Plan): void => {
+  checkSteps(plan.steps, 'unknown', false, false);
+};
 
 // Steps that PASS A PATH THROUGH unchanged — the scan keeps looking past them for an
 // element step. (KINDS, not names — `limit()` builds a `take`, `dedup()` a `dedupe`.)
