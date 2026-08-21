@@ -17697,7 +17697,7 @@ fn compare(op: CompareOp, l: &Col, r: &Col) -> Col {
 /// The message for a non-boolean used where a truth value is required (WHERE / FILTER /
 /// CASE WHEN / AND / OR / NOT / XOR). A number or string is NOT coerced to a truth value
 /// (SQL / ISO-GQL); the only path to a boolean is an explicit CAST AS BOOLEAN / to_boolean.
-const TRUTH_TYPE_ERR: &str =
+pub(crate) const TRUTH_TYPE_ERR: &str =
     "E_INVALID_VALUE: a boolean is required — a non-boolean value is not coerced to a truth \
      value (use CAST(x AS BOOLEAN) or to_boolean(x))";
 
@@ -21848,28 +21848,52 @@ mod tests {
         );
     }
 
-    /// A non-boolean WHERE/FILTER value is a TRUTHINESS test (matching core): a
-    /// non-zero number and a non-empty string keep the row; zero / "" / null drop it.
-    /// The engine used to treat every non-bool as no-match.
+    /// A non-boolean WHERE/FILTER value is a data exception — a number / string / map is
+    /// NOT coerced to a truth value (strict typing; `CAST AS BOOLEAN` / `to_boolean`
+    /// converts). Two paths, matching Postgres and the pure-TS engine:
+    ///   - STATIC: a value whose type is known at parse time (a literal, arithmetic, a
+    ///     map/list constructor) is rejected during PARSE, even on an empty match.
+    ///   - DYNAMIC: a property / function result — type unknown in a schemaless engine —
+    ///     parses, then throws per-row at evaluation via `as_truth`.
     #[test]
     fn where_rejects_a_non_boolean_condition() {
         let mut b = Builder::default();
         b.node(&["T"], &[("n", n(1.0)), ("s", s("x"))]);
         b.node(&["T"], &[("n", n(0.0)), ("s", s(""))]);
         let st = b.build();
-        // A non-boolean WHERE condition is a data exception — a number / string is NOT
-        // coerced to a truth value (strict typing; CAST AS BOOLEAN / to_boolean converts).
-        let errs = |q: &str| {
+        // STATIC: the parse itself fails (no row data needed).
+        let parse_errs = |q: &str| {
+            crate::gql::parse(q)
+                .unwrap_err()
+                .contains("E_INVALID_VALUE")
+        };
+        assert!(parse_errs("MATCH (n:T) WHERE 5 RETURN n.n AS x"));
+        assert!(parse_errs(
+            "MATCH (n:T) WHERE (n.n > 0 AND 100) RETURN n.n AS x"
+        ));
+        assert!(parse_errs("MATCH (n:T) WHERE (n.n + 1) RETURN n.n AS x"));
+        assert!(parse_errs("MATCH (n:T) WHERE {a: n.n} RETURN n.n AS x"));
+        // STATIC fires even when the pattern matches NOTHING (plan-time, like Postgres).
+        assert!(parse_errs("MATCH (n:NONE) WHERE 5 RETURN n.n AS x"));
+        // DYNAMIC: a bare property parses, then throws at runtime.
+        let run_errs = |q: &str| {
             try_run(&crate::gql::parse(q).unwrap(), &st)
                 .unwrap_err()
                 .contains("E_INVALID_VALUE")
         };
-        assert!(errs("MATCH (n:T) WHERE n.n RETURN n.n AS x"));
-        assert!(errs("MATCH (n:T) WHERE n.s RETURN n.s AS x"));
-        assert!(errs("MATCH (n:T) WHERE 5 RETURN n.n AS x"));
-        // A proper boolean condition still works.
+        assert!(run_errs("MATCH (n:T) WHERE n.n RETURN n.n AS x"));
+        assert!(run_errs("MATCH (n:T) WHERE n.s RETURN n.s AS x"));
+        // A string-returning function is a Call — dynamic (not statically classified),
+        // so `n.s || 'q'` (concat) is caught per-row at runtime, not at parse.
+        assert!(run_errs("MATCH (n:T) WHERE (n.s || 'q') RETURN n.n AS x"));
+        // A proper boolean condition still works; null is UNKNOWN (allowed), not an error.
         let count = |q: &str| run(&crate::gql::parse(q).unwrap(), &st).rows.len();
         assert_eq!(count("MATCH (n:T) WHERE n.n > 0 RETURN n.n AS x"), 1);
+        assert_eq!(count("MATCH (n:T) WHERE null RETURN n.n AS x"), 0);
+        assert_eq!(
+            count("MATCH (n:T) WHERE CAST(n.n AS BOOLEAN) RETURN n.n AS x"),
+            1
+        );
     }
 
     /// A temporal renders TAGGED in a query result (`{"@duration":"P1D"}`), matching

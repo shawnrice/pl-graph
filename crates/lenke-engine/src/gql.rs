@@ -17,6 +17,104 @@ use std::collections::{HashMap, HashSet};
 use crate::ir::{AggFn, CastTarget, CompareOp, Dir, Expr, PathMode, PathPart, Plan, TxKind};
 use crate::value::Value;
 
+/// Whether `e`'s type is STATICALLY known to be non-boolean — a value that can never be
+/// a truth value, decided from the expression shape alone (no row data). A non-bool /
+/// non-null literal, arithmetic, a list / record / map constructor, a non-boolean CAST,
+/// a path or path accessor, and the count/collect/scalar-aggregate subqueries are all
+/// definitely non-boolean. Everything dynamic — a property, parameter, function result,
+/// field/subscript, `CASE` result, or a comparison/connective (already boolean) — is NOT
+/// flagged here; a dynamic value is type-checked per row by `exec::as_truth` instead.
+fn definitely_non_bool(e: &Expr) -> bool {
+    match e {
+        Expr::Lit(v) => !matches!(v, Value::Bool(_) | Value::Null),
+        Expr::Arith { .. }
+        | Expr::List { .. }
+        | Expr::Record { .. }
+        | Expr::MapLit { .. }
+        | Expr::Path
+        | Expr::PathAccess { .. }
+        | Expr::GremlinPath { .. }
+        | Expr::CountSubquery { .. }
+        | Expr::CollectSubquery { .. }
+        | Expr::AggSubquery { .. } => true,
+        Expr::Cast { target, .. } => !matches!(target, CastTarget::Boolean),
+        _ => false,
+    }
+}
+
+/// Static (plan-time) boolean-context type check, matching Postgres and the pure-TS
+/// engine: a value whose type is statically known to be non-boolean is rejected wherever
+/// a truth value is required — a `WHERE` / `FILTER` / `HAVING` / per-repetition / edge
+/// predicate, an `AND` / `OR` / `XOR` / `NOT` operand, or a `CASE WHEN` condition —
+/// regardless of whether any row would reach it. This fires even on an empty match, and
+/// is what makes `WHERE 0` / `WHERE (x AND {a: 1})` a plan-time `E_INVALID_VALUE` in both
+/// engines. It closes the differential-fuzzer divergence where a selective seek narrowed
+/// the rows to zero before `as_truth` could reject a sibling non-boolean conjunct at
+/// runtime: the reject now happens before execution, independent of the seek. A
+/// dynamically-typed operand (a bare property, `NOT n.s`, a function result) is left to
+/// the per-row `as_truth` check — the engine is schemaless, so its type is unknowable
+/// here. `bool_ctx` marks whether `e` sits in a boolean position.
+fn check_bool_ctx(e: &Expr, bool_ctx: bool) -> Result<(), String> {
+    if bool_ctx && definitely_non_bool(e) {
+        return Err(crate::exec::TRUTH_TYPE_ERR.to_string());
+    }
+    match e {
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            check_bool_ctx(a, true)?;
+            check_bool_ctx(b, true)?;
+        }
+        Expr::Not(x) => check_bool_ctx(x, true)?,
+        Expr::Compare { left, right, .. } | Expr::Arith { left, right, .. } => {
+            check_bool_ctx(left, false)?;
+            check_bool_ctx(right, false)?;
+        }
+        Expr::In { needle, haystack } => {
+            check_bool_ctx(needle, false)?;
+            check_bool_ctx(haystack, false)?;
+        }
+        Expr::Call { args, .. } => {
+            for a in args {
+                check_bool_ctx(a, false)?;
+            }
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for (cond, val) in branches {
+                check_bool_ctx(cond, true)?;
+                check_bool_ctx(val, false)?;
+            }
+            if let Some(o) = otherwise {
+                check_bool_ctx(o, false)?;
+            }
+        }
+        Expr::List { items } => {
+            for it in items {
+                check_bool_ctx(it, false)?;
+            }
+        }
+        Expr::Record { fields } => {
+            for (_, v) in fields {
+                check_bool_ctx(v, false)?;
+            }
+        }
+        Expr::MapLit { entries } => {
+            for (_, v) in entries {
+                check_bool_ctx(v, false)?;
+            }
+        }
+        Expr::Field { base, .. } | Expr::Cast { expr: base, .. } => check_bool_ctx(base, false)?,
+        Expr::Index { base, index, .. } => {
+            check_bool_ctx(base, false)?;
+            check_bool_ctx(index, false)?;
+        }
+        Expr::IsNull { expr, .. } => check_bool_ctx(expr, false)?,
+        _ => {}
+    }
+    Ok(())
+}
+
 /// A parsed node pattern head: its optional variable, the SEED label (a single
 /// positive label used for `Scan`, or `None`), inline property map (empty when
 /// absent), the token span of an optional inline `WHERE` predicate, and a residual
@@ -893,7 +991,7 @@ impl Parser {
                 self.scope = scope;
                 self.slots = slots;
                 if self.eat_kw("WHERE") {
-                    plan = plan.filter(self.expr()?);
+                    plan = plan.filter(self.bool_pred()?);
                 }
                 return self.query_tail(plan);
             }
@@ -911,7 +1009,7 @@ impl Parser {
             self.scope = scope;
             self.slots = slots;
             if self.eat_kw("WHERE") {
-                plan = plan.filter(self.expr()?);
+                plan = plan.filter(self.bool_pred()?);
             }
             return self.query_tail(plan);
         }
@@ -1035,7 +1133,7 @@ impl Parser {
         self.scope = scope;
         self.slots = slots;
         if self.eat_kw("WHERE") {
-            let pred = self.expr()?;
+            let pred = self.bool_pred()?;
             plan = plan.filter(pred);
         }
         Ok(plan)
@@ -1088,7 +1186,7 @@ impl Parser {
                 // `FILTER [WHERE] <cond>` — the ISO standalone filtering statement: a
                 // predicate over the current bindings, no projection.
                 self.eat_kw("WHERE");
-                plan = plan.filter(self.expr()?);
+                plan = plan.filter(self.bool_pred()?);
             } else {
                 break;
             }
@@ -1585,7 +1683,7 @@ impl Parser {
         self.eat_kw("HAVING");
         self.having_base = keys.len() + select_aggs.len();
         self.having_aggs = Some(Vec::new());
-        let having_raw = self.expr()?;
+        let having_raw = self.bool_pred()?;
         let having_aggs = self.having_aggs.take().expect("in HAVING");
         // A group-key reference in HAVING (`n.age >= 35`) reads the key column, not
         // the input property — rewrite it to the key's post-aggregation slot.
@@ -1967,7 +2065,7 @@ impl Parser {
             }
             let assigns = self.assign_list()?;
             let filter = if self.eat_kw("WHERE") {
-                Some(self.expr()?)
+                Some(self.bool_pred()?)
             } else {
                 None
             };
@@ -2049,7 +2147,7 @@ impl Parser {
             }
             let assigns = self.assign_list_slotted()?;
             let filter = if self.eat_kw("WHERE") {
-                Some(self.expr()?)
+                Some(self.bool_pred()?)
             } else {
                 None
             };
@@ -2736,7 +2834,7 @@ impl Parser {
         if self.eat_kw("WHERE") {
             self.scope = scope.clone();
             self.slots = *slots;
-            plan = plan.filter(self.expr()?);
+            plan = plan.filter(self.bool_pred()?);
         }
         self.expect(&Tok::RParen)?;
         Ok(plan)
@@ -3277,7 +3375,7 @@ impl Parser {
             }
             self.scope = mini;
             self.slots = 2 * k as usize + 1;
-            let pred = self.expr()?;
+            let pred = self.bool_pred()?;
             self.scope = saved_scope;
             self.slots = saved_slots;
             Some(pred)
@@ -3798,7 +3896,7 @@ impl Parser {
             }
             self.slots = width + sub_slots;
             if self.eat_kw("WHERE") {
-                plan = plan.filter(self.expr()?);
+                plan = plan.filter(self.bool_pred()?);
             }
             return Ok(plan);
         }
@@ -3835,7 +3933,7 @@ impl Parser {
         self.scope = scope;
         self.slots = slots;
         if self.eat_kw("WHERE") {
-            plan = plan.filter(self.expr()?);
+            plan = plan.filter(self.bool_pred()?);
         }
         Ok(plan)
     }
@@ -3988,7 +4086,7 @@ impl Parser {
             plan = plan.order_page(keys, skip, limit);
         }
         if self.eat_kw("WHERE") {
-            plan = plan.filter(self.expr()?);
+            plan = plan.filter(self.bool_pred()?);
         }
         Ok(plan)
     }
@@ -4198,7 +4296,7 @@ impl Parser {
         let outer_scope = std::mem::replace(&mut self.scope, sub_scope);
         self.slots = sub_slots;
         if self.eat_kw("WHERE") {
-            body = body.filter(self.expr()?);
+            body = body.filter(self.bool_pred()?);
         }
         if !self.eat_kw("RETURN") {
             self.scope = outer_scope;
@@ -4687,6 +4785,15 @@ impl Parser {
     // Expression precedence: OR < AND < NOT < comparison < primary.
     fn expr(&mut self) -> Result<Expr, String> {
         self.or_expr()
+    }
+
+    /// Parse an expression that sits in a BOOLEAN context (`WHERE` / `FILTER` /
+    /// `HAVING` / per-repetition / edge / `EXISTS`-body predicate) and reject a
+    /// statically-non-boolean value at parse time (see [`check_bool_ctx`]).
+    fn bool_pred(&mut self) -> Result<Expr, String> {
+        let e = self.expr()?;
+        check_bool_ctx(&e, true)?;
+        Ok(e)
     }
 
     fn or_expr(&mut self) -> Result<Expr, String> {
@@ -5802,7 +5909,7 @@ impl Parser {
         let body = if self.eat_kw("WHERE") {
             let saved_scope = std::mem::replace(&mut self.scope, sub_scope.clone());
             let saved_slots = std::mem::replace(&mut self.slots, sub_slots);
-            let pred = self.expr()?;
+            let pred = self.bool_pred()?;
             self.scope = saved_scope;
             self.slots = saved_slots;
             body.filter(pred)

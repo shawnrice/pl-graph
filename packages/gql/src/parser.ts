@@ -29,6 +29,7 @@
  */
 
 import { temporalParse } from '@lenke/core';
+import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type {
   ArithOp,
@@ -75,6 +76,177 @@ import type {
 } from './ast.js';
 import { isTxControl } from './ast.js';
 import { GqlSyntaxError, isReserved, type Token, type TokenType, tokenize } from './lexer.js';
+
+// --- Static boolean-context type check (mirrors the Rust engine's `check_bool_ctx`) ---
+//
+// A value whose type is statically known to be non-boolean is rejected wherever a truth
+// value is required (a WHERE / FILTER / WITH-WHERE predicate, an AND/OR/XOR/NOT operand, a
+// searched-CASE WHEN condition), at PARSE time — matching Postgres and the Rust engine.
+// This fires even on an empty match, and closes the differential-fuzzer divergence where a
+// selective seek narrowed the rows to zero before the sibling non-boolean conjunct could be
+// rejected per-row. A dynamically-typed operand (a bare property, a function result — the
+// engine is schemaless, so its type is unknown here) is left to the per-row truth check.
+
+const BOOL_REQUIRED_MSG =
+  'a boolean is required — a non-boolean value is not coerced to a truth value ' +
+  '(use CAST(x AS BOOLEAN) or to_boolean(x))';
+
+/**
+ * Whether `e`'s type is statically known to be non-boolean. Kept in lockstep with the
+ * engine's `definitely_non_bool`: a `neg`/`arith` (numeric), a `list`/`record` constructor,
+ * a non-boolean scalar `CAST` (desugared to `cast(value, category)`), and a `COUNT { … }`
+ * subquery are non-boolean. `concat` (`||`) is NOT flagged — the engine represents it as a
+ * Call, which it treats as dynamic, so both engines defer it to the per-row check.
+ */
+const definitelyNonBool = (e: Expr): boolean => {
+  switch (e.kind) {
+    case 'lit':
+      return typeof e.value !== 'boolean' && e.value !== null;
+    case 'arith':
+    case 'neg':
+    case 'list':
+    case 'record':
+    case 'countSubquery':
+      return true;
+    case 'func': {
+      if (e.name !== 'cast') {
+        return false;
+      }
+
+      const [, cat] = e.args;
+
+      return !(cat?.kind === 'lit' && cat.value === 'boolean');
+    }
+    default:
+      return false;
+  }
+};
+
+const checkBoolCtx = (e: Expr, boolCtx: boolean): void => {
+  if (boolCtx && definitelyNonBool(e)) {
+    throw new LenkeError(BOOL_REQUIRED_MSG, { code: ErrorCode.InvalidValue });
+  }
+
+  switch (e.kind) {
+    case 'and':
+    case 'or':
+    case 'xor':
+      for (const it of e.items) {
+        checkBoolCtx(it, true);
+      }
+
+      break;
+    case 'not':
+      checkBoolCtx(e.expr, true);
+      break;
+    case 'compare':
+      checkBoolCtx(e.left, false);
+      checkBoolCtx(e.right, false);
+      break;
+    case 'arith':
+      checkBoolCtx(e.head, false);
+
+      for (const [, operand] of e.tail) {
+        checkBoolCtx(operand, false);
+      }
+
+      break;
+    case 'concat':
+    case 'list':
+      for (const it of e.items) {
+        checkBoolCtx(it, false);
+      }
+
+      break;
+    case 'neg':
+      checkBoolCtx(e.expr, false);
+      break;
+    case 'in':
+      checkBoolCtx(e.expr, false);
+      checkBoolCtx(e.list, false);
+      break;
+    case 'func':
+      for (const a of e.args) {
+        checkBoolCtx(a, false);
+      }
+
+      break;
+    case 'case':
+      if (e.subject !== undefined) {
+        checkBoolCtx(e.subject, false);
+      }
+
+      for (const w of e.whens) {
+        // Searched CASE (`CASE WHEN <cond> …`) — the WHEN is a boolean condition; a
+        // simple CASE (`CASE x WHEN <val> …`) compares WHEN to the subject (a value).
+        checkBoolCtx(w.when, e.subject === undefined);
+        checkBoolCtx(w.then, false);
+      }
+
+      if (e.elseExpr !== undefined) {
+        checkBoolCtx(e.elseExpr, false);
+      }
+
+      break;
+    case 'record':
+      for (const f of e.fields) {
+        checkBoolCtx(f.value, false);
+      }
+
+      break;
+    case 'field':
+      checkBoolCtx(e.base, false);
+      break;
+    case 'index':
+      checkBoolCtx(e.base, false);
+      checkBoolCtx(e.index, false);
+      break;
+    case 'isNull':
+    case 'isTruth':
+    case 'isLabeled':
+    case 'isTyped':
+      checkBoolCtx(e.expr, false);
+      break;
+    case 'exists':
+    case 'countSubquery':
+      if (e.where !== undefined) {
+        checkBoolCtx(e.where, true);
+      }
+
+      break;
+    case 'valueSubquery':
+      if (e.where !== undefined) {
+        checkBoolCtx(e.where, true);
+      }
+
+      checkBoolCtx(e.ret, false);
+      break;
+    default:
+      break;
+  }
+};
+
+/** Walk a parsed query, checking every clause-level boolean predicate. */
+const validateBoolContexts = (stmt: Statement): void => {
+  if (isTxControl(stmt)) {
+    return;
+  }
+
+  const visitQuery = (q: Query): void => {
+    for (const part of q.parts) {
+      for (const clause of part.clauses) {
+        if (clause.kind === 'match' || clause.kind === 'with' || clause.kind === 'filter') {
+          if (clause.where !== undefined) {
+            checkBoolCtx(clause.where, true);
+          }
+        } else if (clause.kind === 'callInline') {
+          visitQuery(clause.body);
+        }
+      }
+    }
+  };
+  visitQuery(stmt);
+};
 
 // ISO GQL `CAST` target type name → the conversion function it desugars to.
 // Integer/float/string/bool/list families are representable; anything else
@@ -2921,6 +3093,8 @@ export const parse = (
       peek().pos,
     );
   }
+
+  validateBoolContexts(query);
 
   return query;
 };

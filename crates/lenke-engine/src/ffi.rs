@@ -598,12 +598,15 @@ pub unsafe extern "C" fn lnk_query(
                 Ok(plan) => plan,
                 Err(e) => {
                     // A genuine parse error is E_SYNTAX; a more specific code carried as a
-                    // prefix (unknown function, a supplied-but-missing `$param`) is routed
+                    // prefix (unknown function, a supplied-but-missing `$param`, or a
+                    // static boolean-context type error from the plan-time check) is routed
                     // to its own wire code.
                     if let Some(rest) = e.strip_prefix("E_UNKNOWN_FUNCTION: ") {
                         crate::ffi_error::set("E_UNKNOWN_FUNCTION", rest);
                     } else if let Some(rest) = e.strip_prefix("E_MISSING_PARAMETER: ") {
                         crate::ffi_error::set("E_MISSING_PARAMETER", rest);
+                    } else if let Some(rest) = e.strip_prefix("E_INVALID_VALUE: ") {
+                        crate::ffi_error::set("E_INVALID_VALUE", rest);
                     } else {
                         crate::ffi_error::set("E_SYNTAX", &e);
                     }
