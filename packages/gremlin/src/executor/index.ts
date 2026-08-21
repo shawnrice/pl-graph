@@ -63,7 +63,44 @@ import { applySource } from './sources.js';
  * map producers reset it to 'unknown', where nothing faults — a missed fault is safe, a false
  * one would break a valid query. Code is `E_SYNTAX`, matching the engine's parse-time fault.
  */
-type Frontier = 'vertex' | 'edge' | 'scalar' | 'unknown';
+type Frontier = 'vertex' | 'edge' | 'scalar' | 'path' | 'unknown';
+
+// path()/tree() produce a Path/Tree — not an Element. An element step applied to one throws
+// in TinkerPop (an ImmutablePath is not a Vertex/Edge), verified against gremlin-console:
+// `path().out()`, `path().values('x')`, `path().sum()` all ClassCastException. `unfold()`
+// turns the path into its elements and `count`/`fold`/`limit`/`order`/… consume/preserve it.
+const PATH_PRODUCERS = new Set(['path', 'tree']);
+const PATH_INCOMPATIBLE = new Set([
+  'out',
+  'in',
+  'both',
+  'outE',
+  'inE',
+  'bothE',
+  'inV',
+  'outV',
+  'bothV',
+  'otherV',
+  'values',
+  'value',
+  'valueMap',
+  'propertyMap',
+  'properties',
+  'property',
+  'key',
+  'id',
+  'label',
+  'has',
+  'hasNot',
+  'hasLabel',
+  'hasId',
+  'hasKey',
+  'hasValue',
+  'sum',
+  'min',
+  'max',
+  'mean',
+]);
 
 const VERTEX_STEPS = new Set(['V', 'out', 'in', 'both', 'inV', 'outV', 'bothV', 'otherV', 'addV']);
 const EDGE_STEPS = new Set(['E', 'outE', 'inE', 'bothE', 'addE']);
@@ -153,6 +190,10 @@ const nextFrontier = (kind: Step['kind'], prev: Frontier): Frontier => {
     return 'edge';
   }
 
+  if (PATH_PRODUCERS.has(kind)) {
+    return 'path';
+  }
+
   if (SCALAR_STEPS.has(kind)) {
     return 'scalar';
   }
@@ -210,6 +251,18 @@ const combineHasEdge = (arms: readonly HasEdge[]): HasEdge => {
 
 const checkStep = (step: Step, f: Frontier, hasEdge: HasEdge, edgeHasOrigin: boolean): void => {
   const k = step.kind;
+
+  // An element step (navigation / projection / has-filter / numeric reduce) on a PATH
+  // frontier — `path().out()`, `path().values('x')`, `path().sum()`, and the same inside or
+  // after a branch (`path().union(…, out())`, `coalesce(…, path().out())`). TinkerPop throws
+  // (a Path is not an Element) and the native engine rejects it at parse; fault to match.
+  if (f === 'path' && PATH_INCOMPATIBLE.has(k)) {
+    throw new LenkeError(
+      `${k}() is not defined on a path — a path is not an element; unfold() it into its ` +
+        `elements first`,
+      { code: ErrorCode.Syntax },
+    );
+  }
 
   // Adjacency (out/in/both) and edge hops (outE/inE/bothE) navigate FROM a vertex. On a
   // KNOWN edge or scalar frontier the value is not a vertex, so TinkerPop throws and native
