@@ -19,6 +19,22 @@ fn etypes_of(label: Option<&str>) -> Vec<String> {
     label.into_iter().map(str::to_string).collect()
 }
 
+/// Reject a malformed NAME written by `addV`/`addE`/`property`: an empty name, or one
+/// containing the GraphSON multi-label separator `::` (which would break round-tripping
+/// through the codecs). Gremlin is otherwise permissive about arbitrary label/key
+/// strings — this only guards the write steps, matching the gate core applied there.
+fn check_write_name(kind: &str, name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(format!("a {kind} must not be empty"));
+    }
+    if name.contains("::") {
+        return Err(format!(
+            "a {kind} must not contain the `::` label separator (got `{name}`)"
+        ));
+    }
+    Ok(())
+}
+
 /// Whether `plan` can be used as a correlated-EXISTS body — i.e. it PRESERVES the
 /// provenance column the EXISTS eval appends (only column-appending / row-filtering
 /// ops). A `Project`/`Aggregate`/`Distinct` etc. would drop or reshape that column, so
@@ -1177,6 +1193,7 @@ impl Parser {
                 // g.addE('T').from(V(a)).to(V(b)).property(...)
                 self.expect(&Tok::LParen)?;
                 let etype = self.str_arg()?;
+                check_write_name("edge label", &etype)?;
                 self.expect(&Tok::RParen)?;
                 self.finish_add_edge(None, None, etype)?
             }
@@ -1185,6 +1202,7 @@ impl Parser {
                 // fold into it (see `apply_property`).
                 self.expect(&Tok::LParen)?;
                 let label = self.str_arg()?;
+                check_write_name("vertex label", &label)?;
                 self.expect(&Tok::RParen)?;
                 Plan::Insert {
                     nodes: vec![crate::ir::InsertNode {
@@ -1406,6 +1424,7 @@ impl Parser {
         // --- write steps ---
         if lname == "property" {
             let key = self.str_arg()?;
+            check_write_name("property key", &key)?;
             self.expect(&Tok::Comma)?;
             let val = self.property_value_expr()?;
             self.expect(&Tok::RParen)?;
@@ -4692,6 +4711,7 @@ impl Parser {
                 }
                 "property" => {
                     let key = self.str_arg()?;
+                    check_write_name("property key", &key)?;
                     self.expect(&Tok::Comma)?;
                     let val = self.literal()?;
                     self.expect(&Tok::RParen)?;

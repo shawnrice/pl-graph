@@ -2674,21 +2674,18 @@ fn comparison_of_incomparable_types_faults() {
 
 #[test]
 fn addv_and_property_reject_malformed_names() {
-    use error_codes::ErrorCode::InvalidValue;
-    let mut g = modern();
-    // Gremlin takes arbitrary label/key strings, so a `::` label / empty key is
-    // guarded at the step (codec ingestion has its own gate). try_run surfaces it.
-    let bad = [
+    // A `::` (the GraphSON multi-label separator, which breaks codec round-tripping) or
+    // an empty label/key is rejected — the engine guards the WRITE steps, matching core.
+    // (Gremlin stays permissive about arbitrary strings elsewhere.)
+    for src in [
         "g.addV('a::b')",        // GraphSON multi-label separator in a label
         "g.addV('')",            // empty label
         "g.V().property('', 1)", // empty property key
-    ];
-    for src in bad {
-        let t = parse(src).unwrap();
-        assert_eq!(try_run(&mut g, &t).unwrap_err().code, InvalidValue, "{src}");
+    ] {
+        assert!(rejects(src), "{src}");
     }
-    // A well-formed addV/property is fine.
-    assert!(try_run(&mut g, &parse("g.addV('Robot')").unwrap()).is_ok());
+    // A well-formed addV is fine.
+    assert!(!rejects("g.addV('Robot')"));
 }
 
 #[test]
