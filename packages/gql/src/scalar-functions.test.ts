@@ -356,13 +356,14 @@ describe('GQL: byte-identity regressions from the differential fuzzer', () => {
     expect(val(`RETURN range(0, 10, 0) AS x`)).toBe(null);
   });
 
-  test('the total order ties every pair in the catch-all rank', () => {
-    // Rank 4 holds graph elements, lists, and records. Same-kind pairs compare
-    // structurally; a MIXED pair (list vs record) is a tie, so a stable sort keeps
-    // input order. The old fallback compared their JS string coercions ("1,2" vs
-    // "[object Map]") and invented an order the native engine does not have.
+  test('compound kinds sort by distinct rank: list < record', () => {
+    // The total order gives every kind a distinct rank — Num < Str < Bool < Temporal
+    // < List < Record < Map < Null (value.rs `rank`) — so a list sorts BEFORE a record
+    // (they are NOT a tie), byte-identical to the native engine. Same-kind pairs then
+    // compare structurally. The old TS fallback compared JS string coercions ("1,2" vs
+    // "[object Map]") and invented an order; both engines now agree on the rank order.
     expect(val(`RETURN list_sort([{a: 1}, [1, 2]]) AS x`)).toEqual(
-      val(`RETURN [{a: 1}, [1, 2]] AS x`),
+      val(`RETURN [[1, 2], {a: 1}] AS x`),
     );
     expect(val(`RETURN list_sort([[1, 2], {a: 1}]) AS x`)).toEqual(
       val(`RETURN [[1, 2], {a: 1}] AS x`),

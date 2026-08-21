@@ -942,23 +942,26 @@ const negateDuration = (d: Duration): Duration => {
 const durationRepresentable = (d: Duration): boolean =>
   Number.isSafeInteger(d.months) && Number.isSafeInteger(d.days) && Number.isSafeInteger(d.secs);
 
-/** A duration whose sum/scale overflows the safe-integer range is a **data
- *  exception** (a real duration we can't represent), not a silent null — fail loud,
- *  byte-identical to the native engine (like division by zero). */
+/** A duration whose sum/scale overflows the safe-integer range is a value error (a
+ *  real duration we can't represent), not a silent null — fail loud, byte-identical to
+ *  the native engine (like division by zero). The engine collapses every runtime fault
+ *  to `E_INVALID_VALUE` at the FFI boundary, so this matches that code, not a distinct
+ *  `E_DATA_EXCEPTION`. */
 const durationOverflow = (): never => {
   throw new LenkeError(
     'duration overflow: a component exceeds the representable (float64-safe-integer) range',
-    { code: ErrorCode.DataException },
+    { code: ErrorCode.InvalidValue },
   );
 };
 
 /** Instant ± duration whose result leaves the representable date range (a date is
- *  `i32` days, ≈±5.88M years) is a **data exception** — the target date is real but
- *  unstorable — not a silent null. Fail loud, byte-identical to native's
- *  `FAULT_DATE_OVERFLOW` (supersedes the old D4 → null). */
+ *  `i32` days, ≈±5.88M years) is a value error — the target date is real but
+ *  unstorable — not a silent null. Fail loud with `E_INVALID_VALUE`, byte-identical to
+ *  native's `FAULT_DATE_OVERFLOW` (which the FFI surfaces as `E_INVALID_VALUE`;
+ *  supersedes the old D4 → null). */
 const dateOverflow = (): never => {
   throw new LenkeError('date overflow: arithmetic result is outside the representable date range', {
-    code: ErrorCode.DataException,
+    code: ErrorCode.InvalidValue,
   });
 };
 
