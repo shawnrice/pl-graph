@@ -63,6 +63,27 @@ fn body_is_exists_safe(plan: &Plan) -> bool {
 /// the identity barriers (and dropping a never-firing arm) restores TinkerPop's per-element
 /// semantics. `None` when the arm is not a pure barrier(+filter) chain (it keeps its normal
 /// whole-stream lowering).
+/// A `limit(0)` (or an empty `range(x,x)`) anywhere in a coalesce/branch arm empties the
+/// single traverser regardless of any hops around it, so the arm NEVER fires per element —
+/// `coalesce(limit(0).inE('X'), dedup())` falls entirely through to the `dedup()` arm. Walk
+/// the linear operator chain looking for such a barrier. (`limit(n>=1)`/`skip(n)` depend on
+/// the per-hop stream size and are handled per-arm by `strip_barrier_arm`, not here.)
+fn arm_always_empty(p: &Plan) -> bool {
+    match p {
+        Plan::OrderPage { limit: Some(0), .. } => true,
+        Plan::OrderPage { input, .. }
+        | Plan::Filter { input, .. }
+        | Plan::Distinct { input }
+        | Plan::DistinctBy { input, .. }
+        | Plan::Expand { input, .. }
+        | Plan::EdgeVertex { input, .. }
+        | Plan::VarLength { input, .. }
+        | Plan::Project { input, .. }
+        | Plan::OptionalExpand { input, .. } => arm_always_empty(input),
+        _ => false,
+    }
+}
+
 fn strip_barrier_arm(body: Plan) -> Option<(Plan, bool)> {
     let mut fires = true;
     let mut preds: Vec<Expr> = Vec::new();
@@ -2098,11 +2119,14 @@ impl Parser {
                     // Strip the identity barriers (yield the element where the filters hold),
                     // and DROP a never-firing arm — matching TinkerPop's per-element branch
                     // (`coalesce(hasLabel('X'), range(0,1))` yields every element, not one).
-                    let (final_body, final_oc, contributes) = match strip_barrier_arm(body.clone())
-                    {
-                        Some((_, false)) => (Plan::Row, from, false), // never fires per element
-                        Some((stripped, true)) => (stripped, from, true),
-                        None => (body, oc, true),
+                    let (final_body, final_oc, contributes) = if arm_always_empty(&body) {
+                        (Plan::Row, from, false) // a limit(0)/empty-range kills the arm
+                    } else {
+                        match strip_barrier_arm(body.clone()) {
+                            Some((_, false)) => (Plan::Row, from, false), // never fires per element
+                            Some((stripped, true)) => (stripped, from, true),
+                            None => (body, oc, true),
+                        }
                     };
                     if contributes {
                         // Reconverge every arm to a uniform width-1 frontier at slot 0 so
@@ -2541,13 +2565,21 @@ impl Parser {
                 // A pure-barrier arm (order/limit/range/skip/dedup over filters) is per-element
                 // identity or empty — strip it, exactly as for coalesce, so `choose(cond,
                 // range(0,2), limit(1))` yields every routed element, not a whole-stream slice.
-                let strip_choose_arm = |b: Plan, oc: usize| match strip_barrier_arm(b.clone()) {
-                    Some((stripped, true)) => stripped.reconverge(from),
-                    // Never fires per element → the routed element yields nothing.
-                    Some((_, false)) => Plan::Row
+                let never = || {
+                    Plan::Row
                         .filter(Expr::Lit(Value::Bool(false)))
-                        .reconverge(from),
-                    None => b.reconverge(oc),
+                        .reconverge(from)
+                };
+                let strip_choose_arm = |b: Plan, oc: usize| {
+                    if arm_always_empty(&b) {
+                        return never();
+                    }
+                    match strip_barrier_arm(b.clone()) {
+                        Some((stripped, true)) => stripped.reconverge(from),
+                        // Never fires per element → the routed element yields nothing.
+                        Some((_, false)) => never(),
+                        None => b.reconverge(oc),
+                    }
                 };
                 let then_body = if let Some(agg) = self.try_per_element_agg(from, slots)? {
                     Plan::Row

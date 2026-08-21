@@ -10151,3 +10151,29 @@ fn choose_condition_can_be_a_sub_traversal_not_just_a_predicate() {
         6
     );
 }
+
+#[test]
+fn coalesce_arm_with_a_limit_zero_never_fires() {
+    let mut g = modern();
+    let count = |q: &str, g: &mut EngineGraph| match run_query(q, g).as_slice() {
+        [GVal::Num(n)] => *n as i64,
+        other => panic!("expected one count, got {other:?}"),
+    };
+    // limit(0) anywhere empties the single traverser regardless of a following hop, so the
+    // arm never fires and the branch falls through: dedup() catches all six vertices.
+    assert_eq!(
+        count(
+            "g.V().coalesce(limit(0).inE('CREATED', 'KNOWS'), dedup()).count()",
+            &mut g
+        ),
+        6
+    );
+    // marko's two KNOWS edges fire arm 1; the other five vertices hit limit(0).out() (empty).
+    assert_eq!(
+        count(
+            "g.V().coalesce(outE('KNOWS'), limit(0).out()).count()",
+            &mut g
+        ),
+        2
+    );
+}
