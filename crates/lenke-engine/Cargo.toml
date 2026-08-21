@@ -55,13 +55,11 @@ regex = { version = "1", default-features = false, features = [
   "unicode-case",
 ] }
 
-# lenke-core is a dev-only dependency: the J1 cross-engine conformance suite
-# (tests/conformance.rs) loads an identical fixture into BOTH engines and asserts
-# equal result multisets. A dev-dependency compiles only for the test build, so
-# the normal `cargo build` of lenke-engine stays standalone and dependency-free.
-# This does not touch lenke-core's own sources or build.
 [dev-dependencies]
-lenke-core = { path = "../lenke-core" }
-# Test-only: the shared GQL conformance corpus (tests/gql_corpus.rs) reads JSONL
-# cases. serde_json is a dev-dependency, so the runtime crate stays dependency-free.
+# Test-only: the ported Gremlin suite (tests/gremlin_ported.rs) and the GQL
+# conformance corpus (tests/gql_corpus.rs) read fixtures/JSONL as serde_json.
+# A dev-dependency compiles only for the test build, so the runtime crate stays
+# dependency-free. (The former `lenke-core` dev-dep — the cross-engine oracle — is
+# gone: those suites now run engine-only, with the TS engine as the byte-identity
+# reference; see docs/design/engine-from-scratch.md.)
 serde_json = "1"
