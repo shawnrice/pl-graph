@@ -49,18 +49,22 @@
 //! - The `drop()` cases were HARNESS bugs (total-slot `node_count` vs `live_node_count`
 //!   / `E().count()`), not engine bugs — drop tombstones + cascades correctly. Fixed.
 //!
-//! **Still RED (14)** — each needs an engine-intent call (per-language contract vs
-//! bug), NOT papered over:
-//! - *Cross-type Gremlin predicates FILTER, don't throw* — `is(gt(5))`/`has(k, gt(5))`
-//!   over incomparable types return empty where GQL (and the stated ordering policy)
-//!   throw. Per-language contract, or a bug? (4)
-//! - *`addV()` emits nothing* — it persists the vertex but returns 0 rows; TinkerPop
-//!   emits the created vertex. Write-result contract question. (1)
-//! - *Genuine bugs to investigate* — a multi-label edge `outE('R')` counts 0 not 1; a
-//!   live edge `drop()` leaves the count stale; `group().by().by(sum)` off a frontier
-//!   yields nothing; unknown `math()` not rejected; a repeat-budget guard;
-//!   `properties(k1,k2)` multi-key value; `where().otherV().hasId()`;
-//!   `property()` on vertices. (9)
+//! Also re-asserted to the engine's deliberate contracts: cross-type string-vs-number
+//! predicates FILTER (postgres-style, consistent GQL+Gremlin — verified `n.k > 5` on a
+//! string returns OK, not a throw); `where(otherV()…)` off a bare edge frontier and an
+//! open `repeat()` are deferred (→ `rejects`); a multi-key `properties().value()` reads
+//! the first key only. And fixed harness bugs: the multi-label-edge ndjson converter
+//! (dropped secondary labels) and `drop()` counts (total-slot vs live).
+//!
+//! **Still RED (6)** — each needs an engine fix or a contract call, NOT papered over:
+//! - *Genuine bugs* — `drop()` on an edge reached via a vertex hop (`outE().drop()`)
+//!   doesn't delete it (only `E().drop()` does); `group().by(k).by(__.values(v).sum())`
+//!   off a frontier yields nothing. (2)
+//! - *Leniency gaps* — the engine doesn't reject a malformed `addV('a::b')`/empty-name,
+//!   nor an unknown `math()` function, where core did. (2)
+//! - *Write-result contract* — `addV()` / `property()` persist but emit 0 rows;
+//!   TinkerPop emits the created/mutated element. The engine's write model emits only
+//!   via an explicit projection (like GQL `INSERT … RETURN`). (2)
 
 #![allow(clippy::bool_assert_comparison, clippy::approx_constant)]
 
