@@ -203,6 +203,25 @@ const nextFrontier = (kind: Step['kind'], prev: Frontier): Frontier => {
 
 const isElement = (f: Frontier): boolean => f === 'vertex' || f === 'edge';
 
+// An optional()/branch body ALWAYS produces one output per element when it ends in an
+// aggregate reducer (count/fold/sum/…, empty group → 0/[]/null) or is a bare id()/label()/
+// path() projection — the identity fallback is then dead and the branch takes the body's
+// frontier. (A leading hop can drop rows, so `out().id()` is NOT always-producing.)
+const AGG_TERMINAL = new Set(['count', 'fold', 'sum', 'min', 'max', 'mean']);
+const bodyAlwaysProduces = (steps: readonly Step[]): boolean => {
+  if (steps.length === 0) {
+    return false;
+  }
+
+  const last = steps[steps.length - 1].kind;
+
+  if (AGG_TERMINAL.has(last)) {
+    return true;
+  }
+
+  return steps.length === 1 && (last === 'id' || last === 'label' || last === 'path');
+};
+
 const EDGE_HOPS = new Set(['outE', 'inE', 'bothE']);
 
 // Whether an EDGE is in scope for `inV`/`outV`/`otherV`, which move to an edge's endpoint
@@ -382,11 +401,20 @@ const checkSteps = (
 
     if (k === 'optional') {
       // The output is the matched (body) traversers AND the unmatched (pre-body) ones,
-      // so combine the body's ending edge-scope with the pre-body scope.
-      const body = checkSteps((step as { plan: Plan }).plan.steps, f, hasEdge, edgeHasOrigin);
+      // so combine the body's ending edge-scope with the pre-body scope — UNLESS the body
+      // ALWAYS produces (an aggregate reducer, or a bare id()/label()/path()), in which case
+      // the identity fallback is dead and optional(<always>) ≡ <always>: the frontier is the
+      // body's, matching the native engine (`optional(count()).values('x')` faults on the
+      // scalar in both, not just native).
+      const bodySteps = (step as { plan: Plan }).plan.steps;
+      const body = checkSteps(bodySteps, f, hasEdge, edgeHasOrigin);
 
-      f = 'unknown';
-      hasEdge = combineHasEdge([hasEdge, body.hasEdge]);
+      if (bodyAlwaysProduces(bodySteps)) {
+        ({ f, hasEdge } = body);
+      } else {
+        f = 'unknown';
+        hasEdge = combineHasEdge([hasEdge, body.hasEdge]);
+      }
 
       continue;
     }
