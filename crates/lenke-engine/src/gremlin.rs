@@ -4982,19 +4982,42 @@ impl Parser {
         };
         // Edge-transparent steps operate ON the edge frontier and stay on it, so a
         // following inV()/outV()/otherV() still resolves the hop's landed endpoint —
-        // re-arm the edge-hop pointer the top-of-step take() cleared.
+        // re-arm the edge-hop pointer the top-of-step take() cleared. Covers every frontier-
+        // PRESERVING filter / barrier / slice / order (TinkerPop tracks the path across them,
+        // so `outE().range(0,2).hasLabel('X').otherV()` resolves — it faulted here before).
         if matches!(
             lname.as_str(),
             "has"
                 | "hasnot"
+                | "haslabel"
+                | "hasid"
                 | "haskey"
                 | "hasvalue"
                 | "subgraph"
                 | "aggregate"
                 | "store"
+                | "sideeffect"
                 | "dedup"
                 | "where"
+                | "and"
+                | "or"
+                | "not"
+                | "is"
+                | "filter"
                 | "as"
+                | "identity"
+                | "barrier"
+                | "order"
+                | "limit"
+                | "skip"
+                | "range"
+                | "tail"
+                | "sample"
+                | "coin"
+                | "none"
+                | "simplepath"
+                | "cyclicpath"
+                | "profile"
         ) {
             self.edge_hop = prev_edge_hop;
         }

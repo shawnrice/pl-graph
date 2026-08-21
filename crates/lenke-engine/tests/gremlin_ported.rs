@@ -10103,3 +10103,22 @@ fn coalesce_pure_barrier_arms_are_per_element() {
         6
     );
 }
+
+#[test]
+fn edge_endpoint_move_survives_a_preserving_step() {
+    let mut g = modern();
+    // outE().range()/hasLabel()/order() keep the EDGE frontier, so a following otherV()/inV()
+    // still resolves the hop's reference vertex — TinkerPop tracks the path across a preserving
+    // step. native consumed the edge-hop record on any step and faulted these at parse.
+    let ok = |q: &str| lenke_engine::gremlin::parse(q).is_ok();
+    assert!(ok("g.V().outE('CREATED').range(0, 2).otherV()"));
+    assert!(ok("g.V().outE('CREATED').hasLabel('SOFTWARE').otherV()"));
+    assert!(ok("g.V().outE('NOPE').range(0, 2).otherV().count()"));
+    // The endpoints are the created-software vertices (lop id 3, ripple id 5).
+    let ids: Vec<GVal> = run_query("g.V().outE('CREATED').range(0, 2).otherV()", &mut g);
+    assert_eq!(
+        ids.len(),
+        2,
+        "range(0,2) keeps two edges, each otherV lands its target"
+    );
+}
