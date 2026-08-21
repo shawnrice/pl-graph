@@ -56,15 +56,23 @@
 //! the first key only. And fixed harness bugs: the multi-label-edge ndjson converter
 //! (dropped secondary labels) and `drop()` counts (total-slot vs live).
 //!
-//! **Still RED (6)** — each needs an engine fix or a contract call, NOT papered over:
-//! - *Genuine bugs* — `drop()` on an edge reached via a vertex hop (`outE().drop()`)
-//!   doesn't delete it (only `E().drop()` does); `group().by(k).by(__.values(v).sum())`
-//!   off a frontier yields nothing. (2)
-//! - *Leniency gaps* — the engine doesn't reject a malformed `addV('a::b')`/empty-name,
-//!   nor an unknown `math()` function, where core did. (2)
-//! - *Write-result contract* — `addV()` / `property()` persist but emit 0 rows;
-//!   TinkerPop emits the created/mutated element. The engine's write model emits only
-//!   via an explicit projection (like GQL `INSERT … RETURN`). (2)
+//! Also FIXED in the engine, surfaced by the salvage:
+//! - *drop() after a hop ran as a read* — `outE().drop()` lowered to `Project(Update)`
+//!   (finalizer wraps `current != 0`), which shallow `is_write` missed, so the edge was
+//!   never deleted. `drop()` now resets `current` (it is terminal). Fixed in `gremlin.rs`.
+//! - *math() didn't validate function names* — an unknown `math('nope(_)')` silently
+//!   NULL-ed; now rejected at parse (`E_UNKNOWN_FUNCTION`), like GQL. Fixed.
+//!
+//! **Still RED (4)** — deeper focused fixes, each with byte-identity-vs-TS care:
+//! - *Grouped reducing-body is not numeric-only* — `group().by(k).by(__.values(v).max())`
+//!   returns the string `"text"` for a mixed group, while the streamed
+//!   `fold().unfold().group()…` spelling FAULTS (numeric-only, the intended contract).
+//!   The two spellings must agree — the grouped body needs the same numeric-only guard.
+//! - *Write-result contract* — `addV()` / `property()` persist but emit 0 rows (the
+//!   engine's write model emits only via an explicit projection, like GQL
+//!   `INSERT … RETURN`); TinkerPop emits the created/mutated element. (2)
+//! - *Leniency gap* — the engine doesn't reject a malformed `addV('a::b')`/empty name
+//!   where core guarded it (Gremlin is otherwise permissive about arbitrary strings).
 
 #![allow(clippy::bool_assert_comparison, clippy::approx_constant)]
 
