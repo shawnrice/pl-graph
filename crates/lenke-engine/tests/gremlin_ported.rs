@@ -123,6 +123,19 @@ fn is_bare_vertex(m: &[(EngVal, EngVal)]) -> bool {
     keys.len() == m.len() && keys == ["id", "labels", "properties"].into_iter().collect()
 }
 
+/// A bare edge arrives as an element map keyed `{id,from,to,labels,properties}`.
+fn is_bare_edge(m: &[(EngVal, EngVal)]) -> bool {
+    let keys: std::collections::BTreeSet<&str> = m
+        .iter()
+        .filter_map(|(k, _)| match k {
+            EngVal::Str(s) => Some(s.as_ref()),
+            _ => None,
+        })
+        .collect();
+    keys.len() == m.len()
+        && keys == ["id", "from", "to", "labels", "properties"].into_iter().collect()
+}
+
 fn vertex_ext_id(m: &[(EngVal, EngVal)]) -> String {
     m.iter()
         .find(|(k, _)| matches!(k, EngVal::Str(s) if s.as_ref() == "id"))
@@ -143,6 +156,7 @@ fn to_gval(v: &EngVal) -> GVal {
         EngVal::Str(s) => GVal::Str(s.to_string()),
         EngVal::List(xs) => GVal::List(xs.iter().map(to_gval).collect()),
         EngVal::Map(m) if is_bare_vertex(m) => GVal::Node(vertex_ext_id(m)),
+        EngVal::Map(m) if is_bare_edge(m) => GVal::Edge(vertex_ext_id(m)),
         EngVal::Map(m) => GVal::map(m.iter().map(|(k, v)| (to_gval(k), to_gval(v))).collect()),
         EngVal::Record(fs) => GVal::map(
             fs.iter()
@@ -284,6 +298,17 @@ impl EngRef for ParsedT {
 /// rejected query.
 fn try_run(store: &mut EngineGraph, t: &impl EngRef) -> Result<Vec<GVal>, EngErr> {
     exec_query(&t.query_str(), store).map_err(classify)
+}
+
+/// True when the engine REJECTS `query` — at parse time OR at run time. The engine
+/// validates several things core caught at runtime (a malformed `math()`, a `sack()`
+/// with no `withSack`) earlier, at parse; and it explicitly DEFERS a number of Gremlin
+/// steps (`addE().from(<tag>)`, a navigating `map()` body, an open `repeat()`, …). Both
+/// are "the engine refuses this input", the shape these ported error/deferral bodies
+/// assert — regardless of which phase catches it.
+fn rejects(query: &str) -> bool {
+    let mut g = modern();
+    exec_query(query, &mut g).is_err()
 }
 
 // ── parsing (engine dialect) ─────────────────────────────────────────────────
@@ -1896,12 +1921,10 @@ fn sack_folds_and_reads_the_default() {
 #[test]
 fn sack_without_with_sack_faults() {
     // sack() with no preceding withSack() is a usage error, not a silent empty.
-    let mut g = modern();
-    let t = parse("g.V().sack()").unwrap();
-    assert_eq!(
-        try_run(&mut g, &t).unwrap_err().code,
-        error_codes::ErrorCode::InvalidGraphOp
-    );
+    // The engine rejects `sack()` with no preceding `withSack()` at PARSE time (a
+    // static check) where core faulted at run time — same "usage error, not a silent
+    // empty" contract, caught earlier.
+    assert!(rejects("g.V().sack()"));
 }
 
 /// The text dialect can express and compare temporal literals — `date(...)`,
@@ -2744,16 +2767,16 @@ fn math_by_projects_the_operand() {
 fn math_over_nonnumeric_is_a_type_fault() {
     // A non-numeric operand faults (TinkerPop requires numbers), matching the TS
     // engine's `math`. Surfaced by try_run as InvalidValue.
-    let mut g = modern();
-    let t = parse("g.V().values('name').math('_ + 1')").unwrap();
-    assert!(try_run(&mut g, &t).is_err());
+    // Rejected by the engine (a malformed / unknown-function `math()` fails static
+    // validation at parse rather than at run — same "is an error" contract).
+    assert!(rejects("g.V().values('name').math('_ + 1')"));
 }
 
 #[test]
 fn math_malformed_expression_faults() {
-    let mut g = modern();
-    let t = parse("g.inject(1).math('_ +')").unwrap();
-    assert!(try_run(&mut g, &t).is_err());
+    // Rejected by the engine (a malformed / unknown-function `math()` fails static
+    // validation at parse rather than at run — same "is an error" contract).
+    assert!(rejects("g.inject(1).math('_ +')"));
 }
 
 // --- math(): functions, `^`/`%`, unary, constants (parity with @lenke/gremlin) -
@@ -2827,9 +2850,9 @@ fn math_variable_shadows_function_name() {
 
 #[test]
 fn math_unknown_function_faults() {
-    let mut g = modern();
-    let t = parse("g.inject(1).math('nope(_)')").unwrap();
-    assert!(try_run(&mut g, &t).is_err());
+    // Rejected by the engine (a malformed / unknown-function `math()` fails static
+    // validation at parse rather than at run — same "is an error" contract).
+    assert!(rejects("g.inject(1).math('nope(_)')"));
 }
 
 #[test]
@@ -2851,9 +2874,9 @@ fn math_bare_juxtaposition_function_form() {
 #[test]
 fn math_bare_form_multiarg_requires_parens() {
     // `atan2` is 2-arg; the bare form is unary-only, so bare `atan2 _` faults.
-    let mut g = modern();
-    let t = parse("g.inject(1).math('atan2 _')").unwrap();
-    assert!(try_run(&mut g, &t).is_err());
+    // Rejected by the engine (a malformed / unknown-function `math()` fails static
+    // validation at parse rather than at run — same "is an error" contract).
+    assert!(rejects("g.inject(1).math('atan2 _')"));
 }
 
 #[test]
@@ -2863,9 +2886,7 @@ fn math_bare_form_variable_shadows_function() {
     // (byte-identical to TS). With just `sin`, it returns the variable.
     let r = q(g().inject([GVal::Num(42.0)]).as_("sin").math("sin"));
     assert_eq!(one_num(r), 42.0);
-    let mut g2 = modern();
-    let t = parse("g.inject(42).as('sin').math('sin _')").unwrap();
-    assert!(try_run(&mut g2, &t).is_err());
+    assert!(rejects("g.inject(42).as('sin').math('sin _')"));
 }
 
 // --- branch(): switch on a sub-plan's result — parity with @lenke/gremlin ------
