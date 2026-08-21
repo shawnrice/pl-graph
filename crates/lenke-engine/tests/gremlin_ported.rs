@@ -2842,12 +2842,9 @@ fn math_variable_shadows_function_name() {
 
 #[test]
 fn math_unknown_function_faults() {
-    // ENGINE-DIVERGENCE: `math('nope(_)')` does NOT fault on the engine — it treats
-    // `nope` as an unbound variable rather than rejecting an unknown function, where
-    // TinkerPop/core throw. (Left red as a genuine engine leniency bug.)
-    let mut g = modern();
-    let t = parse("g.inject(1).math('nope(_)')").unwrap();
-    assert!(try_run(&mut g, &t).is_err());
+    // An unknown `math()` function is now rejected at parse (E_UNKNOWN_FUNCTION) rather
+    // than silently NULL-ing — the engine validates the name like GQL's scalar `call`.
+    assert!(rejects("g.inject(1).math('nope(_)')"));
 }
 
 #[test]

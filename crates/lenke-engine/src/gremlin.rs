@@ -188,6 +188,31 @@ fn is_unary_math_fn(name: &str) -> bool {
     )
 }
 
+/// Whether `name` is a known `math()` function — the numeric scalar functions (0/1/2
+/// arg). `math()` is numeric-only, so this is a safe subset of the GQL scalar surface;
+/// a name outside it is an unknown function, rejected at parse (the engine assumes
+/// function names are validated before evaluation, like GQL's `call`).
+fn is_known_math_fn(name: &str) -> bool {
+    is_unary_math_fn(name)
+        || matches!(
+            name,
+            "e" | "pi"
+                | "ceiling"
+                | "sign"
+                | "cot"
+                | "degrees"
+                | "radians"
+                | "round"
+                | "log"
+                | "pow"
+                | "power"
+                | "mod"
+                | "atan2"
+                | "min"
+                | "max"
+        )
+}
+
 /// Map a math() function name to the engine scalar-fn name (identical kernels).
 fn math_fn_name(name: &str) -> &str {
     match name {
@@ -303,6 +328,13 @@ impl MathParser<'_> {
                         return Err("math(): expected `)` after args".into());
                     }
                     self.pos += 1;
+                    // Reject an unknown function at PARSE (the evaluator assumes names
+                    // were validated and silently NULLs an unknown one otherwise).
+                    if !is_known_math_fn(&name) {
+                        return Err(format!(
+                            "E_UNKNOWN_FUNCTION: math(): unknown function `{name}`"
+                        ));
+                    }
                     return Ok(Expr::Call {
                         name: math_fn_name(&name).to_string(),
                         args,
