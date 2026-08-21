@@ -60,9 +60,28 @@ pub fn parse(query: &str) -> Result<Plan, String> {
     // scalars, an edge source, etc. Pre-scanned so the lowering knows to emit those records
     // from the first step; harmless if a `path`/`tree` ident is actually a property name (the
     // records are no-ops when no path is read).
-    let building_full_path = toks.iter().any(|t| {
-        matches!(t, Tok::Ident(s) if s.eq_ignore_ascii_case("path") || s.eq_ignore_ascii_case("tree"))
-    });
+    // Only a TOP-LEVEL `path()`/`tree()` (paren-depth 0) drives the full-history recording;
+    // a `path()` inside a branch arm (`optional(path())`, `union(path(), …)`) keeps the
+    // established per-arm lineage, since `PathRecord` is emitted only on the main chain and
+    // mixing the two layouts is unsound.
+    let building_full_path = {
+        let mut depth = 0i32;
+        let mut found = false;
+        for t in &toks {
+            match t {
+                Tok::LParen => depth += 1,
+                Tok::RParen => depth -= 1,
+                Tok::Ident(s)
+                    if depth == 0
+                        && (s.eq_ignore_ascii_case("path") || s.eq_ignore_ascii_case("tree")) =>
+                {
+                    found = true;
+                }
+                _ => {}
+            }
+        }
+        found
+    };
     let mut p = Parser {
         toks,
         building_full_path,

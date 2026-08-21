@@ -164,9 +164,14 @@ impl Lineage {
         }
     }
 
-    /// Row `i`'s Gremlin step-history slice, paired with the per-element tags.
+    /// Row `i`'s Gremlin step-history slice, paired with the per-element tags. Empty when the
+    /// row has no history recorded (a lineage that carried no `steps`, or a row index past the
+    /// recorded offsets — e.g. a path read inside a branch whose arm did not record steps).
     #[must_use]
     pub fn steps_at(&self, i: usize) -> (&[Value], &[u8]) {
+        if i + 1 >= self.step_off.len() {
+            return (&[], &[]);
+        }
         let (a, b) = (self.step_off[i], self.step_off[i + 1]);
         (&self.steps[a..b], &self.step_tag[a..b])
     }

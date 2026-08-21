@@ -1992,7 +1992,11 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // Append this step's frontier value to each row's Gremlin step-history. `value`
             // is `Slot(frontier)` for a node/edge (its dense id) or the projected scalar; the
             // `tag` records which, so `path()` renders a vertex, an edge, or the raw value.
-            if track {
+            // A `Slot` beyond the runtime width (a branch collapsed the layout, so the parser
+            // frontier slot is gone) is skipped rather than evaluated — matching that a
+            // path-through-a-branch is not yet the full history.
+            let in_range = !matches!(value, Expr::Slot(n) if *n >= batch.slots.len());
+            if track && in_range {
                 if let Some(lin) = batch.lineage.take() {
                     let col = eval(value, store, &batch)?;
                     let vals: Vec<Value> = (0..batch.rows()).map(|i| col.value_at(i)).collect();
@@ -14935,6 +14939,21 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             order_page(&b, store, keys, *skip, *limit)?
         }
         Plan::Distinct { input } => distinct_batch(pull_body(input, store, seed)?),
+        // Gremlin `dedup()` / `dedup('a',…)` inside a branch arm — first-seen per distinct
+        // key tuple over the seeded body (same as the main path's materialized fallback).
+        Plan::DistinctBy { input, key_slots } => {
+            let batch = pull_body(input, store, seed)?;
+            if batch.rows() == 0 {
+                batch
+            } else {
+                let typed = distinct_by_typed(&batch, key_slots);
+                let mut seen_ids: FnvSet<u32> = FnvSet::default();
+                let mut seen_bytes: FnvSet<Vec<u8>> = FnvSet::default();
+                let keep =
+                    distinct_by_keep(&batch, key_slots, typed, &mut seen_ids, &mut seen_bytes);
+                batch.gather(&keep)
+            }
+        }
         Plan::Reconverge { input, slot } => {
             // Collapse a branch arm to its element/value column at `slot` (cloned so a
             // Nodes/Edges frontier keeps its type), preserving the lineage sidecar so
