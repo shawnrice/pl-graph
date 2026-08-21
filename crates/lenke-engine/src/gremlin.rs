@@ -2467,8 +2467,12 @@ impl Parser {
                 // restore and take the EXISTS path only when it is not a predicate.
                 let save = self.pos;
                 let (guard, cond_is_filter): (Expr, bool) = match self.child_filter_expr() {
-                    Ok(pred) => (pred, true),
-                    Err(_) => {
+                    // A complete predicate cond is followed by the `,` before the then-arm.
+                    // If the cursor is still at `.` (`has('age').count()`, `outV().has(…)`),
+                    // child_filter_expr consumed only a PREFIX — the cond is a sub-traversal
+                    // whose truth is "produces output", so fall through to the EXISTS path.
+                    Ok(pred) if self.peek() == Some(&Tok::Comma) => (pred, true),
+                    _ => {
                         self.pos = save;
                         // Reserve slot `slots` for the provenance column the EXISTS eval
                         // inserts (parse at width `slots + 1`) so a multi-hop cond's

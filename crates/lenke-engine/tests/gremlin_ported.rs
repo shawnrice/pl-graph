@@ -10122,3 +10122,32 @@ fn edge_endpoint_move_survives_a_preserving_step() {
         "range(0,2) keeps two edges, each otherV lands its target"
     );
 }
+
+#[test]
+fn choose_condition_can_be_a_sub_traversal_not_just_a_predicate() {
+    let mut g = modern();
+    // A choose() condition that continues past a leading filter (`has('age').count()`,
+    // `has(…).inE(…)`) is a SUB-TRAVERSAL whose truth is "produces output" (a correlated
+    // EXISTS), not a bare predicate. child_filter_expr consumed only the `has(…)` prefix and
+    // the parser then choked on the `.count()`; now a non-`,` cursor routes to the EXISTS path.
+    let count = |q: &str, g: &mut EngineGraph| match run_query(q, g).as_slice() {
+        [GVal::Num(n)] => *n as i64,
+        other => panic!("expected one count, got {other:?}"),
+    };
+    // count() always emits → then-branch (out('KNOWS') = marko's two neighbours).
+    assert_eq!(
+        count(
+            "g.V().choose(has('age', gt(0)).count(), out('KNOWS'), in('KNOWS')).count()",
+            &mut g
+        ),
+        2
+    );
+    // inE('NOPE') never emits → else-branch (label()) for all six vertices.
+    assert_eq!(
+        count(
+            "g.V().choose(has('weight', eq(-1)).inE('NOPE'), id(), label()).count()",
+            &mut g
+        ),
+        6
+    );
+}
