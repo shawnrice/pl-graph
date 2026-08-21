@@ -1991,6 +1991,8 @@ impl Parser {
                     self.slots = 1;
                     self.edge_hop = None;
                     self.edge_scope = Some(false); // an aggregate body yields a scalar
+                    self.current_is_scalar = true; // matches TS bodyAlwaysProduces → a scalar
+                    self.current_is_element = false;
                     return Ok(p);
                 }
                 // A body that ALWAYS produces exactly one output per element — a single
