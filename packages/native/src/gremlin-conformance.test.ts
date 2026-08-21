@@ -495,11 +495,15 @@ const CORPUS: Case[] = [
     plan: traversal(V(), peerPressure(), values('gremlin.peerPressureVertexProgram.cluster')),
     verdict: { kind: 'agree', expected: ['1', '1', '1', '6', '6', '1'] },
   },
-  // Type-fault: incomparable order — both engines throw (shared fault).
+  // Mixed-type order(): lenke sorts by a TOTAL order (numbers before strings) rather
+  // than faulting on incomparability the way stock TinkerPop does — a deliberate,
+  // documented divergence that keeps both engines deterministic and byte-identical.
+  // Both return [1, 'a'] here (number sorts ahead of the string), so they AGREE; this
+  // is not a shared fault.
   {
-    name: "inject(1, 'a').order()  [type fault]",
+    name: "inject(1, 'a').order()  [total order, not a fault]",
     plan: traversal(inject(1, 'a'), order()),
-    verdict: { kind: 'bothThrow' },
+    verdict: { kind: 'agree', expected: [1, 'a'] },
   },
   // Non-finite literal: unreachable across the boundary — classified tsOnly by
   // the emitter (documents that `inject(NaN)` cannot reach the native engine).

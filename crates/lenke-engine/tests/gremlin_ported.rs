@@ -61,7 +61,8 @@
 //!   (finalizer wraps `current != 0`), which shallow `is_write` missed, so the edge was
 //!   never deleted. `drop()` now resets `current` (it is terminal). Fixed in `gremlin.rs`.
 //! - *math() didn't validate function names* — an unknown `math('nope(_)')` silently
-//!   NULL-ed; now rejected at parse (`E_UNKNOWN_FUNCTION`), like GQL. Fixed.
+//!   NULL-ed; now rejected at parse as `E_INVALID_VALUE`, matching the pure-TS engine
+//!   (which treats every math() failure as a value error). Fixed.
 //!
 //! **Still RED (4)** — deeper focused fixes, each with byte-identity-vs-TS care:
 //! - *Grouped reducing-body is not numeric-only* — `group().by(k).by(__.values(v).max())`

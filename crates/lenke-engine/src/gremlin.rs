@@ -345,11 +345,11 @@ impl MathParser<'_> {
                     }
                     self.pos += 1;
                     // Reject an unknown function at PARSE (the evaluator assumes names
-                    // were validated and silently NULLs an unknown one otherwise).
+                    // were validated and silently NULLs an unknown one otherwise). The
+                    // code is E_INVALID_VALUE (applied by `parse_math`) to match the
+                    // pure-TS engine, which treats every math() failure as a value error.
                     if !is_known_math_fn(&name) {
-                        return Err(format!(
-                            "E_UNKNOWN_FUNCTION: math(): unknown function `{name}`"
-                        ));
+                        return Err(format!("math(): unknown function `{name}`"));
                     }
                     return Ok(Expr::Call {
                         name: math_fn_name(&name).to_string(),
@@ -5266,6 +5266,21 @@ impl Parser {
     /// unary `- +` < primary (number, `(expr)`, `name(args)`, bare unary `sin _`,
     /// constant `pi`/`e`, or a variable). Maps to the same f64 kernels GQL uses.
     fn parse_math(&self, src: &str, operand: &Expr) -> Result<Expr, String> {
+        // math() is an evaluation sublanguage: every failure — unknown function,
+        // unknown variable, malformed expression — is a value error, matching the
+        // pure-TS engine (which throws E_INVALID_VALUE for all of them). The prefix
+        // routes it past the Gremlin parser's default E_SYNTAX classification at the
+        // FFI boundary. See `crate::ffi` (Gremlin parse-error branch).
+        self.parse_math_inner(src, operand).map_err(|e| {
+            if e.starts_with("E_INVALID_VALUE: ") {
+                e
+            } else {
+                format!("E_INVALID_VALUE: {e}")
+            }
+        })
+    }
+
+    fn parse_math_inner(&self, src: &str, operand: &Expr) -> Result<Expr, String> {
         let toks = math_lex(src)?;
         let mut mp = MathParser {
             toks,

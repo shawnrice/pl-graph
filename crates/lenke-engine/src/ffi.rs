@@ -631,10 +631,15 @@ pub unsafe extern "C" fn lnk_query(
             let plan = match crate::gremlin::parse(q) {
                 Ok(plan) => plan,
                 Err(e) => {
-                    // A genuine parse error is E_SYNTAX; an unknown function name (caught
-                    // while resolving the call) carries its own more specific code.
+                    // A genuine parse error is E_SYNTAX; a more specific code carried as a
+                    // prefix routes to its own wire code: an unknown function name (caught
+                    // while resolving the call), or a math() evaluation failure (unknown
+                    // function/variable/malformed expression) which is a value error to
+                    // match the pure-TS engine.
                     if let Some(rest) = e.strip_prefix("E_UNKNOWN_FUNCTION: ") {
                         crate::ffi_error::set("E_UNKNOWN_FUNCTION", rest);
+                    } else if let Some(rest) = e.strip_prefix("E_INVALID_VALUE: ") {
+                        crate::ffi_error::set("E_INVALID_VALUE", rest);
                     } else {
                         crate::ffi_error::set("E_SYNTAX", &e);
                     }
