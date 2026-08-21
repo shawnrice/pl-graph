@@ -10236,3 +10236,36 @@ fn coalesce_skip_before_a_hop_empties_the_arm() {
         6
     );
 }
+
+#[test]
+fn endpoint_after_a_branch_needs_an_edge_in_scope() {
+    // An endpoint move (inV/outV/otherV) after a branch faults when NO arm leaves an edge in
+    // scope — native tracks edge-in-scope through branches (a port of the pure-TS hasEdge), so
+    // it agrees with TS instead of yielding. A branch whose arms all keep an edge stays valid.
+    let rejects = |q: &str| lenke_engine::gremlin::parse(q).is_err();
+    assert!(
+        rejects("g.V().coalesce(count(), inE('NOPE')).outV()"),
+        "scalar arm → no edge"
+    );
+    assert!(
+        rejects("g.V().coalesce(outE('CREATED').values('age'), both('CREATED').id()).outV()"),
+        "both arms scalar"
+    );
+    assert!(
+        rejects("g.V().optional(values('name')).inV()"),
+        "optional body scalar + source vertex"
+    );
+    assert!(
+        rejects("g.E().optional(inV()).inV()"),
+        "optional body consumed the edge"
+    );
+    // All arms keep an edge → the endpoint is valid.
+    assert!(
+        !rejects("g.V().coalesce(outE('KNOWS'), inE('KNOWS')).inV()"),
+        "both arms edge"
+    );
+    assert!(
+        !rejects("g.V().coalesce(outE('KNOWS'), out('KNOWS')).count()"),
+        "count needs no edge"
+    );
+}
