@@ -10068,3 +10068,38 @@ fn optional_over_an_always_producing_scalar_does_not_double_emit() {
         vec![GVal::Num(6.0)]
     );
 }
+
+#[test]
+fn coalesce_pure_barrier_arms_are_per_element() {
+    let mut g = modern();
+    let count = |q: &str, g: &mut EngineGraph| match run_query(q, g).as_slice() {
+        [GVal::Num(n)] => *n as i64,
+        other => panic!("expected one count, got {other:?}"),
+    };
+    // range(0,1) as an arm is per-element identity (yields every element), not a whole-stream
+    // slice-to-one: all 6 edges fall through hasLabel('NOPE') to it. (TinkerPop: 6.)
+    assert_eq!(
+        count(
+            "g.E().coalesce(hasLabel('NOPE'), range(0, 1)).count()",
+            &mut g
+        ),
+        6
+    );
+    // range(0,0)/limit(0) NEVER fire per element, so the arm is dropped and the fallback runs.
+    assert_eq!(count("g.V().coalesce(range(0,0), id()).count()", &mut g), 6);
+    assert_eq!(
+        count(
+            "g.V().coalesce(limit(0).has('age', gt(0)), id()).count()",
+            &mut g
+        ),
+        6
+    );
+    // dedup()/order() are per-element identity; chained range(0,1) stays identity.
+    assert_eq!(
+        count(
+            "g.V().coalesce(hasLabel('KNOWS').dedup(), range(0,1).range(0,1)).count()",
+            &mut g
+        ),
+        6
+    );
+}

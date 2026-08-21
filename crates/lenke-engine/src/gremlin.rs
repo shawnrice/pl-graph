@@ -53,6 +53,49 @@ fn body_is_exists_safe(plan: &Plan) -> bool {
     }
 }
 
+/// A coalesce/branch ARM made ONLY of per-element-identity or per-element-empty stream
+/// barriers (order/limit/range/skip/dedup) over leading FILTERS — no hop, projection,
+/// aggregate, or nested branch. Returns `(filter_only_body, always_fires)`: in a PER-ELEMENT
+/// branch each barrier over a single traverser reduces to identity (`range(0,hi>0)`,
+/// `limit(n>=1)`, `skip(0)`, `dedup`, bare `order`) or empties it (`limit(0)`, `skip(n>=1)`,
+/// `range(lo>0,·)`, `range(x,x)`). Native runs the arm WHOLE-STREAM, so `coalesce(hasLabel(
+/// 'X'), range(0,1))` sliced the batch to one row instead of yielding every element. Stripping
+/// the identity barriers (and dropping a never-firing arm) restores TinkerPop's per-element
+/// semantics. `None` when the arm is not a pure barrier(+filter) chain (it keeps its normal
+/// whole-stream lowering).
+fn strip_barrier_arm(body: Plan) -> Option<(Plan, bool)> {
+    let mut fires = true;
+    let mut preds: Vec<Expr> = Vec::new();
+    let mut cur = body;
+    loop {
+        match cur {
+            Plan::OrderPage {
+                input, skip, limit, ..
+            } => {
+                // A single traverser: skip>0 drops it, limit(0) drops it; else identity.
+                if skip.unwrap_or(0) > 0 || limit == Some(0) {
+                    fires = false;
+                }
+                cur = *input;
+            }
+            Plan::Distinct { input } | Plan::DistinctBy { input, .. } => cur = *input,
+            Plan::Filter { input, pred } => {
+                preds.push(pred);
+                cur = *input;
+            }
+            Plan::Row => {
+                let mut b = Plan::Row;
+                for pred in preds.into_iter().rev() {
+                    b = b.filter(pred);
+                }
+                return Some((b, fires));
+            }
+            // A hop / projection / aggregate / nested branch: not a pure barrier arm.
+            _ => return None,
+        }
+    }
+}
+
 pub fn parse(query: &str) -> Result<Plan, String> {
     let toks = lex(query)?;
     // A traversal that reads a full `path()`/`tree()` records each value-producing step's
@@ -2048,15 +2091,30 @@ impl Parser {
                     };
                     let (body, oc, _os) =
                         self.parse_sub_body_seeded(Plan::Row.filter(guard), from, slots)?;
-                    // Reconverge every arm to a uniform width-1 frontier at slot 0 so
-                    // arms of different depth land their element at the SAME slot (a
-                    // 2-hop arm beside a 1-hop arm otherwise diverges downstream);
-                    // lineage-preserving, so `coalesce(...).inV().path()` still answers.
-                    bodies.push(body.reconverge(oc));
-                    prior = Some(match prior {
-                        None => this,
-                        Some(p) => Expr::Or(Box::new(p), Box::new(this)),
-                    });
+                    // A PURE-BARRIER arm (only order/limit/range/skip/dedup over leading
+                    // filters — no hop/projection/aggregate) runs whole-stream here, but per
+                    // element each barrier is identity (`range(0,1)`/`limit(n>=1)`/`dedup`) or
+                    // empties the single traverser (`limit(0)`/`skip(n>=1)`/`range(lo>0,·)`).
+                    // Strip the identity barriers (yield the element where the filters hold),
+                    // and DROP a never-firing arm — matching TinkerPop's per-element branch
+                    // (`coalesce(hasLabel('X'), range(0,1))` yields every element, not one).
+                    let (final_body, final_oc, contributes) = match strip_barrier_arm(body.clone())
+                    {
+                        Some((_, false)) => (Plan::Row, from, false), // never fires per element
+                        Some((stripped, true)) => (stripped, from, true),
+                        None => (body, oc, true),
+                    };
+                    if contributes {
+                        // Reconverge every arm to a uniform width-1 frontier at slot 0 so
+                        // arms of different depth land their element at the SAME slot (a
+                        // 2-hop arm beside a 1-hop arm otherwise diverges downstream);
+                        // lineage-preserving, so `coalesce(...).inV().path()` still answers.
+                        bodies.push(final_body.reconverge(final_oc));
+                        prior = Some(match prior {
+                            None => this,
+                            Some(p) => Expr::Or(Box::new(p), Box::new(this)),
+                        });
+                    }
                     if self.peek() == Some(&Tok::Comma) {
                         self.bump();
                     } else {
