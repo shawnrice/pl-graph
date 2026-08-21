@@ -2534,6 +2534,17 @@ impl Parser {
                 // An aggregate-terminal arm (`count()`/`fold()`/…) reduces PER ELEMENT under
                 // choose (unlike union's whole-stream), so lower it to a correlated per-row
                 // aggregate projection rather than a whole-stream reducing body.
+                // A pure-barrier arm (order/limit/range/skip/dedup over filters) is per-element
+                // identity or empty — strip it, exactly as for coalesce, so `choose(cond,
+                // range(0,2), limit(1))` yields every routed element, not a whole-stream slice.
+                let strip_choose_arm = |b: Plan, oc: usize| match strip_barrier_arm(b.clone()) {
+                    Some((stripped, true)) => stripped.reconverge(from),
+                    // Never fires per element → the routed element yields nothing.
+                    Some((_, false)) => Plan::Row
+                        .filter(Expr::Lit(Value::Bool(false)))
+                        .reconverge(from),
+                    None => b.reconverge(oc),
+                };
                 let then_body = if let Some(agg) = self.try_per_element_agg(from, slots)? {
                     Plan::Row
                         .filter(guard.clone())
@@ -2542,7 +2553,7 @@ impl Parser {
                 } else {
                     let (b, oc, _os) =
                         self.parse_sub_body_seeded(Plan::Row.filter(guard.clone()), from, slots)?;
-                    b.reconverge(oc)
+                    strip_choose_arm(b, oc)
                 };
                 let else_arm = if self.peek() == Some(&Tok::Comma) {
                     self.bump();
@@ -2557,7 +2568,7 @@ impl Parser {
                             from,
                             slots,
                         )?;
-                        else_body.reconverge(else_oc)
+                        strip_choose_arm(else_body, else_oc)
                     }
                 } else {
                     Plan::Row
