@@ -41,6 +41,62 @@ fn check_write_name(kind: &str, name: &str) -> Result<(), String> {
 /// EXISTS over such a body cannot back-map its survivors (it would panic). Used to
 /// decide whether a coalesce arm gets an EXACT full-body existence guard or the
 /// leading-hop approximation.
+/// A frontier-PRESERVING step keeps an edge in scope for a later endpoint move — the same set
+/// the pure-TS engine's `PRESERVE_STEPS` uses so `edge_scope` tracks `hasEdge` byte-for-byte.
+fn is_edge_scope_preserving(lname: &str) -> bool {
+    matches!(
+        lname,
+        "has"
+            | "haslabel"
+            | "hasid"
+            | "haskey"
+            | "hasnot"
+            | "hasnotlabel"
+            | "hasvalue"
+            | "where"
+            | "and"
+            | "or"
+            | "not"
+            | "is"
+            | "dedup"
+            | "limit"
+            | "skip"
+            | "range"
+            | "tail"
+            | "order"
+            | "by"
+            | "as"
+            | "identity"
+            | "barrier"
+            | "sample"
+            | "coin"
+            | "none"
+            | "simplepath"
+            | "cyclicpath"
+            | "aggregate"
+            | "store"
+            | "sideeffect"
+            | "filter"
+            | "profile"
+            | "drop"
+            | "property"
+            | "repeat"
+    )
+}
+
+/// Combine a branch's arms' edge-in-scope (port of the pure-TS `combineHasEdge`): any arm that
+/// DEFINITELY lacks an edge (`Some(false)`) makes a following endpoint faultable; all-edge arms
+/// keep it in scope; anything else is unknown (never faults).
+fn combine_edge_scope(arms: &[Option<bool>]) -> Option<bool> {
+    if arms.contains(&Some(false)) {
+        Some(false)
+    } else if !arms.is_empty() && arms.iter().all(|a| *a == Some(true)) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 fn body_is_exists_safe(plan: &Plan) -> bool {
     match plan {
         Plan::Row => true,
@@ -201,6 +257,8 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         current_is_element: false,
         current_is_path: false,
         current_is_scalar: false,
+        edge_scope: None,
+        last_arm_edge_scope: None,
     };
     p.traversal()
 }
@@ -881,6 +939,17 @@ struct Parser {
     /// Read by the element-type-algebra guard in [`step`] (adjacency/edge-hop/endpoint/
     /// projection on a scalar faults), mirroring the pure-TS engine's `Frontier` classifier.
     current_is_scalar: bool,
+    /// Tri-state "is an EDGE in scope for an endpoint move (`inV`/`outV`/`bothV`/`otherV`)",
+    /// a faithful port of the pure-TS engine's `hasEdge`: `Some(true)` an edge is reachable,
+    /// `Some(false)` definitely none, `None` unknown (never faults). An edge source sets true,
+    /// a vertex move / scalar producer sets false, a frontier-preserving filter/barrier keeps
+    /// it, and a branch COMBINES its arms (any false → false, all true → true, else unknown).
+    /// The endpoint guard in [`step`] faults on `Some(false)` — this is what catches an endpoint
+    /// after a branch (`coalesce(count(), inE()).outV()`), where `current_is_element` is false.
+    edge_scope: Option<bool>,
+    /// The `edge_scope` at the END of the most recent [`parse_sub_body_seeded`] (captured before
+    /// the flags restore), so a branch lowering can combine its arms' edge-in-scope.
+    last_arm_edge_scope: Option<bool>,
     /// True when the traversal reads a full `path()`/`tree()` — the lowering then emits a
     /// `Plan::PathRecord` after each value-producing step (see [`parse`]).
     building_full_path: bool,
@@ -1557,7 +1626,6 @@ impl Parser {
         // false one breaks a valid query.
         {
             let on_edge_frontier = self.current_is_element && self.on_edge;
-            let on_vertex_frontier = self.current_is_element && !self.on_edge;
             let on_scalar_frontier = self.current_is_scalar;
             match lname.as_str() {
                 // Adjacency + edge hops navigate FROM a vertex.
@@ -1574,16 +1642,14 @@ impl Parser {
                         },
                     ));
                 }
-                // Endpoints move to an edge's endpoint, so they need an edge.
-                "inv" | "outv" | "bothv" | "otherv" if on_vertex_frontier || on_scalar_frontier => {
+                // Endpoints move to an edge's endpoint, so they need an edge DEFINITELY in
+                // scope (`edge_scope == Some(false)` — a vertex/scalar frontier, or a branch
+                // whose arms all lack one, e.g. `coalesce(count(), inE()).outV()`). An unknown
+                // scope (`None`) never faults, matching the pure-TS `hasEdge === false` guard.
+                "inv" | "outv" | "bothv" | "otherv" if self.edge_scope == Some(false) => {
                     return Err(format!(
-                        "{lname}() moves to an edge endpoint, but the frontier is {} — reach an \
-                         edge (outE()/inE()/bothE()) before {lname}()",
-                        if on_vertex_frontier {
-                            "a vertex"
-                        } else {
-                            "a scalar"
-                        },
+                        "{lname}() moves to an edge endpoint, but no edge is in scope — reach an \
+                         edge (outE()/inE()/bothE()) before {lname}()"
                     ));
                 }
                 // Projections read a property/id/label off an ELEMENT.
@@ -1874,6 +1940,7 @@ impl Parser {
                 // off `V().outE()` resolves against its origin (see parse_sub_body_seeded).
                 self.edge_hop = prev_edge_hop;
                 let mut bodies = Vec::new();
+                let mut arm_edge_scopes: Vec<Option<bool>> = Vec::new();
                 loop {
                     // union() runs each arm over the WHOLE incoming stream (the branch body
                     // is seeded with the full batch, not per element), so a reducing barrier
@@ -1886,6 +1953,7 @@ impl Parser {
                     // different slot, and a downstream `values()` would read a mid-hop node.
                     // Lineage-preserving, so path()-through-union still works.
                     bodies.push(body.reconverge(oc));
+                    arm_edge_scopes.push(self.last_arm_edge_scope);
                     if self.peek() == Some(&Tok::Comma) {
                         self.bump();
                     } else {
@@ -1896,6 +1964,7 @@ impl Parser {
                 self.current = 0;
                 self.slots = 1;
                 self.edge_hop = None; // the reconverged frontier is not a just-hopped edge
+                self.edge_scope = combine_edge_scope(&arm_edge_scopes);
                 plan.branch(bodies)
             }
             "optional" => {
@@ -1907,8 +1976,9 @@ impl Parser {
                 // single hop.
                 let from = self.current;
                 let slots = self.slots;
-                // Seed the arm with the outer edge hop (see parse_sub_body_seeded) so a
-                // leading `otherV()`/`inV()` off `V().outE()` resolves against its origin.
+                let incoming_edge_scope = self.edge_scope; // the fallback keeps the source
+                                                           // Seed the arm with the outer edge hop (see parse_sub_body_seeded) so a
+                                                           // leading `otherV()`/`inV()` off `V().outE()` resolves against its origin.
                 self.edge_hop = prev_edge_hop;
                 // An aggregate-terminal body ALWAYS produces one value per element, so the
                 // identity fallback never fires — lower straight to the per-element
@@ -1920,6 +1990,7 @@ impl Parser {
                     self.current = 0;
                     self.slots = 1;
                     self.edge_hop = None;
+                    self.edge_scope = Some(false); // an aggregate body yields a scalar
                     return Ok(p);
                 }
                 // A body that ALWAYS produces exactly one output per element — a single
@@ -1971,6 +2042,7 @@ impl Parser {
                     }
                 };
                 let (body, oc, _os) = self.parse_sub_body_seeded(Plan::Row, from, slots)?;
+                let body_edge_scope = self.last_arm_edge_scope;
                 self.expect(&Tok::RParen)?;
                 let fallback = Plan::Row
                     .filter(Expr::Not(Box::new(guard)))
@@ -1978,6 +2050,9 @@ impl Parser {
                 self.current = 0;
                 self.slots = 1;
                 self.edge_hop = None; // the reconverged frontier is not a just-hopped edge
+                                      // The output is the body's frontier OR the source (fallback) — an edge is in
+                                      // scope only where BOTH have one.
+                self.edge_scope = combine_edge_scope(&[incoming_edge_scope, body_edge_scope]);
                 plan.branch(vec![body.reconverge(oc), fallback])
             }
             "coalesce" => {
@@ -2026,6 +2101,7 @@ impl Parser {
                         )]);
                     self.current = 0;
                     self.slots = 1;
+                    self.edge_scope = Some(false); // an all-values coalesce yields a scalar
                     return Ok(p);
                 }
                 // General: each body is a sub-traversal reconverging to one output slot.
@@ -2040,6 +2116,7 @@ impl Parser {
                 let mut bodies = Vec::new();
                 let mut prior: Option<Expr> = None; // OR of the earlier branches' existence
                 let mut any_edge = false; // an edge-hop body → coalesce yields an edge frontier
+                let mut arm_edge_scopes: Vec<Option<bool>> = Vec::new();
                 loop {
                     // An aggregate-terminal arm (`[<hop>.][values('k').](count|fold|sum|
                     // min|max|mean)()`) produces EXACTLY ONE value per incoming element, so
@@ -2055,7 +2132,8 @@ impl Parser {
                         };
                         let body = seed.project(vec![("coalesce".to_string(), agg)]);
                         bodies.push(body.reconverge(0));
-                        // Always fires where reached → later arms are unreachable.
+                        arm_edge_scopes.push(Some(false)); // an aggregate yields a scalar
+                                                           // Always fires where reached → later arms are unreachable.
                         prior = Some(Expr::Lit(Value::Bool(true)));
                         if self.peek() == Some(&Tok::Comma) {
                             self.bump();
@@ -2177,6 +2255,7 @@ impl Parser {
                         // 2-hop arm beside a 1-hop arm otherwise diverges downstream);
                         // lineage-preserving, so `coalesce(...).inV().path()` still answers.
                         bodies.push(final_body.reconverge(final_oc));
+                        arm_edge_scopes.push(self.last_arm_edge_scope);
                         prior = Some(match prior {
                             None => arm_this,
                             Some(p) => Expr::Or(Box::new(p), Box::new(arm_this)),
@@ -2193,6 +2272,9 @@ impl Parser {
                 self.slots = 1;
                 self.edge_hop = None; // the reconverged frontier is not a just-hopped edge
                 self.on_edge = any_edge;
+                // The coalesce output has an edge in scope only where EVERY arm did (port of TS
+                // combineHasEdge) — a following endpoint faults otherwise.
+                self.edge_scope = combine_edge_scope(&arm_edge_scopes);
                 // An edge-yielding coalesce keeps the interleaved edge-path answerable
                 // (its edge lands in the lineage); a non-edge coalesce breaks it.
                 if any_edge {
@@ -2524,8 +2606,9 @@ impl Parser {
                 // absent else is implicit identity — the source element passes through.
                 let from = self.current;
                 let slots = self.slots;
-                // Seed the arms with the outer edge hop so a leading `otherV()`/`inV()`
-                // off `V().outE()` resolves against its origin (see parse_sub_body_seeded).
+                let incoming_edge_scope = self.edge_scope; // an absent else is the source
+                                                           // Seed the arms with the outer edge hop so a leading `otherV()`/`inV()`
+                                                           // off `V().outE()` resolves against its origin (see parse_sub_body_seeded).
                 self.edge_hop = prev_edge_hop;
                 // The cond is a per-row PREDICATE (`has`/`where`/`values('k').is(…)`/
                 // `outE().count().is(…)` — everything `child_filter_expr` parses) OR a
@@ -2593,6 +2676,7 @@ impl Parser {
                                     )]);
                                     self.current = 0;
                                     self.slots = 1;
+                                    self.edge_scope = Some(false); // both arms are scalars
                                     return Ok(p);
                                 }
                             }
@@ -2624,6 +2708,7 @@ impl Parser {
                         None => b.reconverge(oc),
                     }
                 };
+                let mut then_es = Some(false); // an aggregate then-arm yields a scalar
                 let then_body = if let Some(agg) = self.try_per_element_agg(from, slots)? {
                     Plan::Row
                         .filter(guard.clone())
@@ -2632,11 +2717,14 @@ impl Parser {
                 } else {
                     let (b, oc, _os) =
                         self.parse_sub_body_seeded(Plan::Row.filter(guard.clone()), from, slots)?;
+                    then_es = self.last_arm_edge_scope;
                     strip_choose_arm(b, oc)
                 };
+                let mut else_es = incoming_edge_scope; // an absent else is the source element
                 let else_arm = if self.peek() == Some(&Tok::Comma) {
                     self.bump();
                     if let Some(agg) = self.try_per_element_agg(from, slots)? {
+                        else_es = Some(false);
                         Plan::Row
                             .filter(Expr::Not(Box::new(guard)))
                             .project(vec![("choose".to_string(), agg)])
@@ -2647,6 +2735,7 @@ impl Parser {
                             from,
                             slots,
                         )?;
+                        else_es = self.last_arm_edge_scope;
                         strip_choose_arm(else_body, else_oc)
                     }
                 } else {
@@ -2658,6 +2747,7 @@ impl Parser {
                 self.current = 0;
                 self.slots = 1;
                 self.edge_hop = None; // the reconverged frontier is not a just-hopped edge
+                self.edge_scope = combine_edge_scope(&[then_es, else_es]);
                 plan.branch(vec![then_body, else_arm])
             }
             "and" | "or" => {
@@ -5145,6 +5235,22 @@ impl Parser {
             }
             _ => {} // filters / barriers / side-effects / modulators preserve the frontier
         }
+        // Edge-in-scope tracking (port of the pure-TS `nextHasEdge`): an edge source makes an
+        // edge reachable, a vertex move / scalar producer consumes/clears it, a preserving
+        // filter/barrier keeps it, a branch already set its COMBINED value in its own arm, and
+        // everything else is unknown.
+        match lname.as_str() {
+            "e" | "oute" | "ine" | "bothe" | "adde" => self.edge_scope = Some(true),
+            "v" | "out" | "in" | "both" | "addv" | "inv" | "outv" | "bothv" | "otherv"
+            | "values" | "value" | "id" | "label" | "count" | "sum" | "min" | "max" | "mean"
+            | "math" | "loops" | "inject" => self.edge_scope = Some(false),
+            // A branch lowering set `edge_scope` to the combination of its arms — keep it.
+            "union" | "coalesce" | "choose" | "optional" | "branch" => {}
+            // Frontier-PRESERVING filters / barriers / slices / side-effects keep the edge in
+            // scope (matches TS PRESERVE_STEPS); any other producer clears it to unknown.
+            other if is_edge_scope_preserving(other) => {}
+            _ => self.edge_scope = None,
+        }
         Ok(plan)
     }
 
@@ -5977,6 +6083,7 @@ impl Parser {
         let saved_is_scalar = self.current_is_scalar;
         let saved_is_path = self.current_is_path;
         let saved_is_map = self.current_is_map;
+        let saved_edge_scope = self.edge_scope;
         self.current = from;
         self.slots = width;
         // Optional leading `__.` (an anonymous traversal). The body is then a `.`-
@@ -5996,6 +6103,9 @@ impl Parser {
         }
         let out_current = self.current;
         let out_slots = self.slots;
+        // Capture the arm's OUTPUT edge-in-scope before restoring, so a branch lowering can
+        // combine its arms.
+        self.last_arm_edge_scope = self.edge_scope;
         self.current = saved_current;
         self.slots = saved_slots;
         self.edge_hop = saved_edge;
@@ -6006,6 +6116,7 @@ impl Parser {
         self.current_is_scalar = saved_is_scalar;
         self.current_is_path = saved_is_path;
         self.current_is_map = saved_is_map;
+        self.edge_scope = saved_edge_scope;
         Ok((body, out_current, out_slots))
     }
 
