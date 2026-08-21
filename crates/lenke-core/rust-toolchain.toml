@@ -1,7 +1,0 @@
-# Pin the Rust toolchain so local builds and CI lint/format identically —
-# rustfmt and clippy output can change between toolchain versions, so an
-# unpinned toolchain silently drifts `cargo fmt --check` / clippy across machines.
-# Bump this deliberately (and the matching ref in .github/workflows/ci.yml).
-[toolchain]
-channel = "1.96.0"
-components = ["clippy", "rustfmt"]

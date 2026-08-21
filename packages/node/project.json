@@ -14,7 +14,7 @@
         "{projectRoot}/index.d.ts",
         "{projectRoot}/lenke-node.*.node"
       ],
-      "inputs": ["production", "^production", "rustCore"],
+      "inputs": ["production", "^production", "rustEngine"],
       "cache": true
     },
     "test": {
@@ -23,7 +23,7 @@
         "command": "node --test",
         "cwd": "packages/node"
       },
-      "inputs": ["default", "^production", "rustCore"],
+      "inputs": ["default", "^production", "rustEngine"],
       "dependsOn": ["build"]
     }
   }

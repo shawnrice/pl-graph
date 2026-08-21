@@ -8,7 +8,7 @@ import { existsSync } from 'node:fs';
 
 import { hasErrorCode, ErrorCode } from '@lenke/errors';
 import { createStore, graphFromNdjson } from '@lenke/native';
-import { createFfiBackend } from '@lenke/native/ffi';
+import { createFfiEngineBackend } from '@lenke/native/ffi-engine';
 
 import { createSyncClient } from './client.js';
 import { createSyncHost } from './host.js';
@@ -17,7 +17,7 @@ import type { ClientMessage } from './protocol.js';
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
 const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
+  `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
   import.meta.url,
 ).pathname;
 const hasLib = existsSync(LIB);
@@ -36,7 +36,7 @@ const NDJSON = [
 /** Client ↔ host wired directly — the minimal port. `wire` records traffic. */
 const connect = (clientOpts: { maxInactiveQueries?: number } = {}) => {
   const store = createStore(
-    graphFromNdjson(createFfiBackend(LIB), new TextEncoder().encode(NDJSON)),
+    graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
   );
   const wire: ClientMessage[] = [];
   // Declared before the host exists; the host's status message on attach

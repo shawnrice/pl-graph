@@ -13,7 +13,7 @@
 // queue drains on reconnect.
 
 import { createStore, graphFromNdjson } from '@lenke/native';
-import { createWasmBackend } from '@lenke/native/wasm';
+import { createWasmEngineBackend } from '@lenke/native/wasm-engine';
 import {
   createReconnectingClient,
   createSnapshotStore,
@@ -24,7 +24,7 @@ import {
 } from '@lenke/sync';
 
 // oxlint-disable-next-line boundaries/no-cross-package-relative-import -- Vite `?url` asset import of the compiled wasm build output; a build artifact has no package entry point.
-import wasmUrl from '../../crates/lenke-core/target/wasm32-unknown-unknown/release/lenke_core.wasm?url';
+import wasmUrl from '../../crates/lenke-engine/target/wasm32-unknown-unknown/release/lenke_engine.wasm?url';
 import { CLUSTERS } from './datagen.ts';
 
 const SERVER_URL = 'ws://localhost:8787';
@@ -50,7 +50,7 @@ const boot = async () => {
   const snapshots = createSnapshotStore({ filename: 'service-map.lnks' });
   const snap = await snapshots.load({ schemaVersion: SCHEMA_VERSION, userId: USER_ID });
 
-  const backend = await createWasmBackend(fetch(wasmUrl));
+  const backend = await createWasmEngineBackend(fetch(wasmUrl));
   const store = createStore(
     graphFromNdjson(backend, snap ? snap.ndjson : new TextEncoder().encode('')),
   );

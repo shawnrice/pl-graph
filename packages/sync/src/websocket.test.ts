@@ -7,7 +7,7 @@ import { afterAll, describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { createStore, graphFromNdjson } from '@lenke/native';
-import { createFfiBackend } from '@lenke/native/ffi';
+import { createFfiEngineBackend } from '@lenke/native/ffi-engine';
 
 import { createSyncClient, type ClientSnapshot } from './client.js';
 import { createSyncHost, type SyncHost } from './host.js';
@@ -16,7 +16,7 @@ import type { HostMessage, RowsMessage } from './protocol.js';
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
 const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
+  `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
   import.meta.url,
 ).pathname;
 const hasLib = existsSync(LIB);
@@ -40,7 +40,7 @@ suite('@lenke/sync over a real WebSocket', () => {
   // One shared store per server — every connection gets its own host over it,
   // exactly the multi-client topology a production server would run.
   const store = createStore(
-    graphFromNdjson(createFfiBackend(LIB), new TextEncoder().encode(NDJSON)),
+    graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
   );
 
   const hosts = new Map<unknown, SyncHost>();

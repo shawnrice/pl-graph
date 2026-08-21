@@ -7,7 +7,7 @@ import { describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { createStore, graphFromNdjson, type Store } from '@lenke/native';
-import { createFfiBackend } from '@lenke/native/ffi';
+import { createFfiEngineBackend } from '@lenke/native/ffi-engine';
 
 import { createSyncEngine, type SyncWrite } from './engine.js';
 import {
@@ -26,7 +26,7 @@ import {
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
 const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
+  `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
   import.meta.url,
 ).pathname;
 const hasLib = existsSync(LIB);
@@ -43,7 +43,7 @@ const NDJSON = [
 ].join('\n');
 
 const newStore = (seed: string = NDJSON): Store =>
-  createStore(graphFromNdjson(createFfiBackend(LIB), new TextEncoder().encode(seed)));
+  createStore(graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(seed)));
 
 const EXPECT = { schemaVersion: 'v1', userId: 'shawn' };
 const KEY_BYTES = new Uint8Array(32).map((_, i) => i * 7 + 1);
@@ -401,7 +401,7 @@ suite('@lenke/sync snapshot · schema restore', () => {
     });
 
     // Rebuild the graph the complete way — data AND schema replayed.
-    const restored = createStore(graphFromSnapshot(createFfiBackend(LIB), snap!));
+    const restored = createStore(graphFromSnapshot(createFfiEngineBackend(LIB), snap!));
 
     // The unique constraint is live: the keyed `_MERGE` upserts (doesn't duplicate)…
     restored.mutate((g) => g.query("_MERGE (u:User {email: 'a@b.com', age: 31})"));
@@ -424,7 +424,7 @@ suite('@lenke/sync snapshot · schema restore', () => {
     const snap = await decodeSnapshot(bytes, EXPECT, PLAIN);
     expect(snap!.schema).toEqual([]);
     // Data still restores fine through the complete-boot helper.
-    const restored = createStore(graphFromSnapshot(createFfiBackend(LIB), snap!));
+    const restored = createStore(graphFromSnapshot(createFfiEngineBackend(LIB), snap!));
     expect(restored.graph.vertexCount).toBe(2);
   });
 });

@@ -24,27 +24,22 @@ import { query as tsQuery } from '@lenke/gql';
 import { deserialize as tsDeserialize } from '@lenke/serialization';
 
 import { createFfiEngineBackend } from './backend-ffi-engine.js';
-import { createFfiBackend } from './backend-ffi.js';
 import { graphFromNdjson } from './graph.js';
 
 // --- native library bootstrap (mirrors gremlin-conformance.test.ts) ---------
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
-const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
-  import.meta.url,
-).pathname;
-// The retiring lenke-core collapses non-finite → null (Model A); the engine keeps it as
-// a distinct value (Model B), which pure-TS now matches. The D1 suite below therefore
-// runs against the ENGINE backend, not core.
+// The curated GQL function/operator conformance runs pure-TS (@lenke/gql) against the
+// Rust ENGINE. (It formerly also compared the retiring lenke-core, whose Model A
+// non-finite → null the engine and pure-TS both dropped for Model B — a distinct value.)
 const ENGINE_LIB = new URL(
   `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
   import.meta.url,
 ).pathname;
-const hasLib = existsSync(LIB);
+const hasLib = existsSync(ENGINE_LIB);
 
 if (!hasLib) {
-  console.warn(`[gql-conformance] skipping: ${LIB} not found — run \`bun run build:rust\`.`);
+  console.warn(`[gql-conformance] skipping: ${ENGINE_LIB} not found — run \`bun run engine:build:rust\`.`);
 }
 
 const suite = hasLib ? describe : describe.skip;
@@ -63,7 +58,7 @@ const MODERN_NDJSON = [
 ].join('\n');
 
 suite('GQL differential: rich RETURN results (TS vs native)', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, MODERN_NDJSON);
   const tsGraph = tsDeserialize(MODERN_NDJSON, 'ndjson', new Graph());
 
@@ -2147,7 +2142,7 @@ suite('GQL differential: columnar grouped aggregation (TS vs native)', () => {
     '{"type":"edge","id":"13","from":"3","to":"1","labels":["KNOWS"],"properties":{"weight":0.7,"since":2021}}',
   ].join('\n');
 
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
@@ -2303,7 +2298,7 @@ suite('GQL differential: grouped var-length count shortcut (TS vs native)', () =
     '{"type":"edge","id":"15","from":"2","to":"4","labels":["KNOWS"]}',
   ].join('\n');
 
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
@@ -2393,7 +2388,7 @@ suite('GQL differential: comma-join count shortcut (TS vs native)', () => {
     '{"type":"edge","id":"15","from":"2","to":"3","labels":["KNOWS"]}',
   ].join('\n');
 
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
@@ -2448,7 +2443,7 @@ suite('GQL differential: comma-join count shortcut (TS vs native)', () => {
 // opengql:2268), and the COLON label-test predicate `WHERE n:Label` (opengql:2078).
 // Both must produce byte-identical rows across the two engines.
 suite('GQL differential: LIMIT/OFFSET $param + label-test predicate (TS vs native)', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, MODERN_NDJSON);
   const tsGraph = tsDeserialize(MODERN_NDJSON, 'ndjson', new Graph());
   const both = (q: string, params?: Record<string, unknown>): [string, string] => [
@@ -2572,7 +2567,7 @@ suite('GQL differential: non-finite is a distinct value (Model B)', () => {
 // --- D2/D3: TS param validation matches native's FFI param decoder. Both engines
 // accept and reject exactly the same param shapes with the same error code.
 suite('GQL differential: param value validation (D2/D3)', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, MODERN_NDJSON);
   const tsGraph = tsDeserialize(MODERN_NDJSON, 'ndjson', new Graph());
 
@@ -2679,7 +2674,7 @@ suite('gql conformance: ALL SHORTEST — every tied path, byte-identical', () =>
     .map((r) => JSON.stringify(r))
     .join('\n');
 
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
@@ -2740,7 +2735,7 @@ suite('gql conformance: path modes — byte-identical restrictors', () => {
     .map((r) => JSON.stringify(r))
     .join('\n');
 
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
@@ -2791,7 +2786,7 @@ suite('gql conformance: bare path binding — every walk as a Path, byte-identic
     .map((r) => JSON.stringify(r))
     .join('\n');
 
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
@@ -2866,7 +2861,7 @@ suite('gql conformance: per-hop edge predicate on var-length — byte-identical'
     .map((r) => JSON.stringify(r))
     .join('\n');
 
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
@@ -2938,7 +2933,7 @@ suite('gql conformance: ANY / SHORTEST k — byte-identical', () => {
     .map((r) => JSON.stringify(r))
     .join('\n');
 
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
@@ -3012,7 +3007,7 @@ const MAP_NDJSON = [
 ].join('\n');
 
 suite('GQL differential: stored map/record properties (TS vs native)', () => {
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, MAP_NDJSON);
   const tsGraph = tsDeserialize(MAP_NDJSON, 'ndjson', new Graph());
 
@@ -3074,7 +3069,7 @@ suite('ORDER BY + LIMIT projects only the emitted rows', () => {
     '{"type":"node","id":"3","labels":["T"],"properties":{"n":5,"s":"m"}}',
   ].join('\n');
 
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
@@ -3171,7 +3166,7 @@ suite('signed zero is one grouping key, nested or not', () => {
     '{"type":"node","id":"2","labels":["T"],"properties":{"n":7,"x":4}}',
   ].join('\n');
 
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
 
@@ -3212,7 +3207,7 @@ suite('ISO standalone ORDER BY / OFFSET / LIMIT statement', () => {
     '{"type":"node","id":"3","labels":["T"],"properties":{"n":5,"s":"m"}}',
   ].join('\n');
 
-  const backend = createFfiBackend(LIB);
+  const backend = createFfiEngineBackend(ENGINE_LIB);
   const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [

@@ -7,7 +7,7 @@ import { describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { createStore, graphFromNdjson } from '@lenke/native';
-import { createFfiBackend } from '@lenke/native/ffi';
+import { createFfiEngineBackend } from '@lenke/native/ffi-engine';
 
 import { createSyncClient } from './client.js';
 import { createSyncHost } from './host.js';
@@ -18,7 +18,7 @@ import { createWriteLog, type WriteLog } from './writelog.js';
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
 const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
+  `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
   import.meta.url,
 ).pathname;
 const hasLib = existsSync(LIB);
@@ -128,7 +128,7 @@ suite('createReconnectingClient', () => {
 
   test('re-subscribes a standing query after a reconnect', async () => {
     const store = createStore(
-      graphFromNdjson(createFfiBackend(LIB), new TextEncoder().encode(NDJSON)),
+      graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
     );
     const t = makeTransport(store);
     const client = createReconnectingClient({ connect: t.connect, retry: { baseMs: 1, maxMs: 5 } });
@@ -152,7 +152,7 @@ suite('createReconnectingClient', () => {
 
   test('a mutate issued while offline lands after reconnect', async () => {
     const store = createStore(
-      graphFromNdjson(createFfiBackend(LIB), new TextEncoder().encode(NDJSON)),
+      graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
     );
     const t = makeTransport(store);
     const client = createReconnectingClient({ connect: t.connect, retry: { baseMs: 1, maxMs: 5 } });
@@ -182,7 +182,7 @@ suite('createReconnectingClient', () => {
 
   test('the CDC write stream + clientId survive a reconnect (multiplayer + reconnect)', async () => {
     const store = createStore(
-      graphFromNdjson(createFfiBackend(LIB), new TextEncoder().encode(NDJSON)),
+      graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
     );
     // The CDC stream needs a shared op log across every per-connection host.
     const writeLog = createWriteLog();
@@ -233,7 +233,7 @@ suite('createReconnectingClient', () => {
 
   test('reports connectivity flips and stops re-dialing on close', async () => {
     const store = createStore(
-      graphFromNdjson(createFfiBackend(LIB), new TextEncoder().encode(NDJSON)),
+      graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
     );
     const t = makeTransport(store);
     const flips: boolean[] = [];
@@ -261,7 +261,7 @@ suite('createReconnectingClient', () => {
     // opened() fires DURING connect() (a MessagePort / test double). The manager
     // must still replay over the live connection, not a null one.
     const store = createStore(
-      graphFromNdjson(createFfiBackend(LIB), new TextEncoder().encode(NDJSON)),
+      graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
     );
     const t = makeTransport(store, { syncOpen: true });
     const client = createReconnectingClient({ connect: t.connect, retry: { baseMs: 1, maxMs: 5 } });

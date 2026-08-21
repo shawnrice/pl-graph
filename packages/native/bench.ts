@@ -42,18 +42,18 @@ import {
   type FormatName,
 } from '@lenke/serialization';
 
-import { createFfiBackend } from './src/backend-ffi.js';
-import { createWasmBackend } from './src/backend-wasm.js';
+import { createFfiEngineBackend } from './src/backend-ffi-engine.js';
+import { createWasmEngineBackend } from './src/backend-wasm-engine.js';
 import type { Backend } from './src/backend.js';
 import { graphFromFormat, graphFromNdjson, type GraphFormat } from './src/graph.js';
 
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB = new URL(
-  `../../crates/lenke-core/target/release/liblenke_core.${LIB_EXTENSIONS[process.platform] ?? 'so'}`,
+  `../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXTENSIONS[process.platform] ?? 'so'}`,
   import.meta.url,
 ).pathname;
 const WASM = new URL(
-  '../../crates/lenke-core/target/wasm32-unknown-unknown/release/lenke_core.wasm',
+  '../../crates/lenke-engine/target/wasm32-unknown-unknown/release/lenke_engine.wasm',
   import.meta.url,
 ).pathname;
 
@@ -204,7 +204,7 @@ if (WANTED.has('ts')) {
 
 if (WANTED.has('ffi')) {
   if (existsSync(LIB)) {
-    engines.push(nativeEngine('ffi', createFfiBackend(LIB)));
+    engines.push(nativeEngine('ffi', createFfiEngineBackend(LIB)));
   } else {
     console.warn(`skipping ffi: ${LIB} not found — run \`bun run build:rust\``);
   }
@@ -212,7 +212,7 @@ if (WANTED.has('ffi')) {
 
 if (WANTED.has('wasm')) {
   if (existsSync(WASM)) {
-    engines.push(nativeEngine('wasm', await createWasmBackend(await Bun.file(WASM).arrayBuffer())));
+    engines.push(nativeEngine('wasm', await createWasmEngineBackend(await Bun.file(WASM).arrayBuffer())));
   } else {
     console.warn(`skipping wasm: ${WASM} not found — run \`bun run build:wasm\``);
   }

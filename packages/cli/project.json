@@ -3,9 +3,9 @@
   "name": "@lenke/cli",
   "targets": {
     "test": {
-      "//": "The CLI runs on the native/wasm engine, so its tests load the compiled Rust artifact at runtime — key on `rustCore` (else a Rust-only change serves a stale pass) and build the wasm first via `dependsOn`. See packages/native/src/rust-artifact-dependency.test.ts.",
-      "inputs": ["default", "^production", "rustCore"],
-      "dependsOn": ["lenke-core:build-wasm"]
+      "//": "The CLI runs on the native/wasm engine, so its tests load the compiled Rust artifact at runtime — key on `rustEngine` (else a Rust-only change serves a stale pass) and build the wasm first via `dependsOn`. See packages/native/src/rust-artifact-dependency.test.ts.",
+      "inputs": ["default", "^production", "rustEngine"],
+      "dependsOn": ["lenke-engine:build-wasm"]
     }
   }
 }

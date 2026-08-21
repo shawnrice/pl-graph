@@ -31,26 +31,19 @@ import { query as tsQuery } from '@lenke/gql';
 import { deserialize as tsDeserialize } from '@lenke/serialization';
 
 import { createFfiEngineBackend } from './src/backend-ffi-engine.js';
-import { createFfiBackend } from './src/backend-ffi.js';
-import { createWasmBackend } from './src/backend-wasm.js';
+import { createWasmEngineBackend } from './src/backend-wasm-engine.js';
 import type { Backend } from './src/backend.js';
 import { graphFromNdjson } from './src/graph.js';
 
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
-const LIB = new URL(
-  `../../crates/lenke-core/target/release/liblenke_core.${LIB_EXTENSIONS[process.platform] ?? 'so'}`,
-  import.meta.url,
-).pathname;
-// The from-scratch engine's cdylib (built with `bun run engine:build:rust --features
-// capi`). Included so the interleaved read/write workloads below — the ones that used
-// to repack the adjacency on every write — are measured on the ENGINE too, not just
-// core. `BENCH_ENGINES=engine bun run bench:usage`.
+// The engine's cdylib (built with `bun run engine:build:rust --features capi`) — the
+// native backend the interleaved read/write workloads below are measured on.
 const ENGINE_LIB = new URL(
   `../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXTENSIONS[process.platform] ?? 'so'}`,
   import.meta.url,
 ).pathname;
 const WASM = new URL(
-  '../../crates/lenke-core/target/wasm32-unknown-unknown/release/lenke_core.wasm',
+  '../../crates/lenke-engine/target/wasm32-unknown-unknown/release/lenke_engine.wasm',
   import.meta.url,
 ).pathname;
 
@@ -362,15 +355,7 @@ if (WANTED.has('ts')) {
   engines.push(tsEngine);
 }
 
-if (WANTED.has('ffi')) {
-  if (existsSync(LIB)) {
-    engines.push(nativeEngine('ffi', createFfiBackend(LIB)));
-  } else {
-    console.warn(`skipping ffi: ${LIB} not found — run \`bun run build:rust\``);
-  }
-}
-
-if (WANTED.has('engine')) {
+if (WANTED.has('engine') || WANTED.has('ffi')) {
   if (existsSync(ENGINE_LIB)) {
     engines.push(nativeEngine('engine', createFfiEngineBackend(ENGINE_LIB)));
   } else {
@@ -382,7 +367,7 @@ if (WANTED.has('engine')) {
 
 if (WANTED.has('wasm')) {
   if (existsSync(WASM)) {
-    engines.push(nativeEngine('wasm', await createWasmBackend(await Bun.file(WASM).arrayBuffer())));
+    engines.push(nativeEngine('wasm', await createWasmEngineBackend(await Bun.file(WASM).arrayBuffer())));
   } else {
     console.warn(`skipping wasm: ${WASM} not found — run \`bun run build:wasm\``);
   }

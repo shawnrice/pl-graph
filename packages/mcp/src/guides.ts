@@ -16,7 +16,7 @@ lenke is an embeddable labeled-property-graph database. You choose along three a
 
 **Engine** — where the graph lives:
 - \`@lenke/core\` — a pure-TypeScript in-memory graph. Zero native artifacts; runs anywhere JS runs. Great for tests, small/medium graphs, and the browser main thread.
-- \`@lenke/native\` — bindings to the Rust columnar engine, over one of three backends: **FFI** (\`@lenke/native/ffi\`, Bun/server), **N-API** (\`@lenke/node\`, the fast Node path), or **WASM** (\`@lenke/native/wasm\`, browser). Use for large graphs and maximum throughput.
+- \`@lenke/native\` — bindings to the Rust columnar engine, over one of three backends: **FFI** (\`@lenke/native/ffi-engine\`, Bun/server), **N-API** (\`@lenke/node\`, the fast Node path), or **WASM** (\`@lenke/native/wasm-engine\`, browser). Use for large graphs and maximum throughput.
 
 **Query frontend** — how you ask:
 - **GQL** — ISO/IEC 39075 graph query language (\`@lenke/gql\`, or \`g.query(...)\` on a native graph).
@@ -67,12 +67,12 @@ Formats: \`ndjson\`, \`pg-json\`, \`pg-text\`, \`graphson\`, \`csv\`. NDJSON is 
 ## Native graph (Rust engine)
 
 \`\`\`ts
-import { createFfiBackend } from '@lenke/native/ffi';   // Bun/server
+import { createFfiEngineBackend } from '@lenke/native/ffi-engine';   // Bun/server
 import {
   graphFromNdjson,
 } from '@lenke/native';
 
-const backend = createFfiBackend(libPath);   // libPath = the compiled lenke native library
+const backend = createFfiEngineBackend(libPath);   // libPath = the compiled lenke native library
 using g = graphFromNdjson(backend, await Bun.file('graph.ndjson').bytes());
 g.query\`MATCH (a:Person) RETURN a.name\`;   // tagged-template form (safe binding)
 \`\`\`

@@ -8,7 +8,7 @@ import { describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { createStore, graphFromNdjson, type Store } from '@lenke/native';
-import { createFfiBackend } from '@lenke/native/ffi';
+import { createFfiEngineBackend } from '@lenke/native/ffi-engine';
 
 import { createSyncClient, type SyncClient } from './client.js';
 import { createDedupRegistry } from './dedup.js';
@@ -26,7 +26,7 @@ import { createWriteLog, type WriteLog } from './writelog.js';
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
 const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
+  `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
   import.meta.url,
 ).pathname;
 const hasLib = existsSync(LIB);
@@ -40,7 +40,7 @@ const suite = hasLib ? describe : describe.skip;
 
 const SEED = '{"type":"node","id":"seed","labels":["Seed"],"properties":{}}';
 const newStore = (): Store =>
-  createStore(graphFromNdjson(createFfiBackend(LIB), new TextEncoder().encode(SEED)));
+  createStore(graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(SEED)));
 
 /** Count of `Widget` nodes — a cheap way to read a store's state. */
 const widgets = (s: Store): number =>

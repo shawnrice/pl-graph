@@ -3,23 +3,23 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 // Guard for the failure mode the `boundaries/no-cross-package-relative-import`
-// lint rule CANNOT catch: a package that depends on the compiled Rust core by
+// lint rule CANNOT catch: a package that depends on the compiled Rust engine by
 // loading its artifact at runtime — `createFfiBackend('…/liblenke_core.so')` or
 // the wasm module by path. There is no import, so nx's project graph sees no edge
-// to lenke-core. If such a package's nx `test` target does not key on `rustCore`,
+// to lenke-core. If such a package's nx `test` target does not key on `rustEngine`,
 // a Rust-only change leaves its cache key unchanged and nx serves a STALE PASS
 // (exactly the class of bug that let a broken native test cache as green).
 //
 // This test walks every workspace package, finds the ones whose source loads the
 // artifact, and asserts each declares the dependency in its project.json. A new
-// package that starts loading the cdylib/wasm and forgets to wire `rustCore`
+// package that starts loading the cdylib/wasm and forgets to wire `rustEngine`
 // fails here — the automatic backstop the import linter can't provide.
 
 const ROOT = path.resolve(import.meta.dir, '../../..');
 const PACKAGES_DIR = path.join(ROOT, 'packages');
 
 // Runtime paths to the compiled cdylib / wasm — the couplings invisible to nx.
-const ARTIFACT_SIGNATURE = /crates\/lenke-core\/target\/|liblenke_core|lenke_core\.wasm/;
+const ARTIFACT_SIGNATURE = /crates\/lenke-engine\/target\/|liblenke_engine|lenke_engine\.wasm/;
 
 const tsFilesUnder = (dir: string): string[] => {
   const out: string[] = [];
@@ -75,25 +75,25 @@ const consumers = packageDirs.filter(
 
 describe('nx cache correctness: packages that load the Rust artifact declare it', () => {
   for (const pkg of consumers) {
-    test(`@lenke/${pkg} keys its nx test target on rustCore`, () => {
+    test(`@lenke/${pkg} keys its nx test target on rustEngine`, () => {
       const pkgDir = path.join(PACKAGES_DIR, pkg);
       const inputs = testTargetInputs(pkgDir);
 
-      if (!inputs.includes('rustCore')) {
+      if (!inputs.includes('rustEngine')) {
         const hits = filesLoadingArtifact(pkgDir).map((f) => path.relative(ROOT, f));
 
         throw new Error(
-          `packages/${pkg} loads the compiled Rust core at runtime (${hits.join(', ')}) but its ` +
-            `project.json test target does not list "rustCore" in inputs. Without it a Rust-only ` +
+          `packages/${pkg} loads the compiled Rust engine at runtime (${hits.join(', ')}) but its ` +
+            `project.json test target does not list "rustEngine" in inputs. Without it a Rust-only ` +
             `change leaves this package's test cache key unchanged, so nx serves a STALE PASS. ` +
             `Add packages/${pkg}/project.json:\n` +
             `  { "name": "@lenke/${pkg}", "targets": { "test": {\n` +
-            `      "inputs": ["default", "^production", "rustCore"],\n` +
-            `      "dependsOn": ["lenke-core:build"] } } }`,
+            `      "inputs": ["default", "^production", "rustEngine"],\n` +
+            `      "dependsOn": ["lenke-engine:build"] } } }`,
         );
       }
 
-      expect(inputs).toContain('rustCore');
+      expect(inputs).toContain('rustEngine');
     });
   }
 

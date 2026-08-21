@@ -5,7 +5,7 @@ import { describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { createStore, graphFromNdjson, type LiveQuery, type Row, type Store } from '@lenke/native';
-import { createFfiBackend } from '@lenke/native/ffi';
+import { createFfiEngineBackend } from '@lenke/native/ffi-engine';
 
 import { createSyncClient, type SyncClient } from './client.js';
 import { createSyncEngine, type SyncEngineOptions } from './engine.js';
@@ -15,7 +15,7 @@ import type { HostMessage } from './protocol.js';
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
 const LIB = new URL(
-  `../../../crates/lenke-core/target/release/liblenke_core.${LIB_EXT}`,
+  `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
   import.meta.url,
 ).pathname;
 const hasLib = existsSync(LIB);
@@ -30,7 +30,7 @@ const NDJSON =
   '{"type":"node","id":"a","labels":["Person"],"properties":{"name":"local","age":50}}';
 
 const newStore = (): Store =>
-  createStore(graphFromNdjson(createFfiBackend(LIB), new TextEncoder().encode(NDJSON)));
+  createStore(graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)));
 
 const deferred = <T>() => {
   let resolve!: (v: T) => void;

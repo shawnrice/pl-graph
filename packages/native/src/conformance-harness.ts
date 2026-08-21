@@ -1,39 +1,31 @@
 // The switch that runs the TS differential/conformance suites against the native
-// backend. lenke-engine is now the DEFAULT (it has replaced lenke-core as the
-// primary Rust driver), and result comparison is STRUCTURAL (order-independent) —
-// because the engine legitimately differs in unspecified output order (row order,
-// property-key order, label-set order), never in the answer. A structural
-// divergence is therefore a real engine bug. During the migration, `LENKE_CORE=1`
-// still runs the retiring lenke-core with byte-identical comparison (its shipped
-// invariant); that path is removed once the crate is deleted.
+// backend — lenke-engine, the primary (and now only) Rust driver. Result comparison
+// is STRUCTURAL (order-independent), because the engine legitimately differs from the
+// pure-TS engine in unspecified output order (row order, property-key order, label-set
+// order), never in the answer. A structural divergence is therefore a real engine bug.
+// (The retiring `lenke-core` byte-identical path is gone — the crate was deleted.)
 import { existsSync } from 'node:fs';
 
 import { createFfiEngineBackend } from './backend-ffi-engine.js';
-import { createFfiBackend } from './backend-ffi.js';
 import type { Backend } from './backend.js';
 
 const LIB_EXT: string = { darwin: 'dylib', win32: 'dll' }[process.platform as string] ?? 'so';
-const lib = (crate: string): string =>
-  new URL(
-    `../../../crates/${crate}/target/release/lib${crate.replace('-', '_')}.${LIB_EXT}`,
-    import.meta.url,
-  ).pathname;
 
-export const CORE_LIB = lib('lenke-core');
-export const ENGINE_LIB = lib('lenke-engine');
+export const ENGINE_LIB = new URL(
+  `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
+  import.meta.url,
+).pathname;
 
-/** True when the suite runs against the engine — the default now. `LENKE_CORE=1`
- *  runs the retiring lenke-core during the migration. (`LENKE_ENGINE=1` also still
- *  forces the engine, for scripts that set it.) */
-export const USE_ENGINE = process.env.LENKE_CORE !== '1';
+/** Retained (always true) so existing suites that branch on it keep compiling — the
+ *  native backend under test is always the engine now. */
+export const USE_ENGINE = true;
 
 /** The native library under test, and whether it's present (skip the suite if not). */
-export const NATIVE_LIB = USE_ENGINE ? ENGINE_LIB : CORE_LIB;
+export const NATIVE_LIB = ENGINE_LIB;
 export const nativeReady = existsSync(NATIVE_LIB);
 
-/** Build the native backend under test (engine by default; core with LENKE_CORE=1). */
-export const nativeBackend = (): Backend =>
-  USE_ENGINE ? createFfiEngineBackend(ENGINE_LIB) : createFfiBackend(CORE_LIB);
+/** Build the native backend under test — the engine. */
+export const nativeBackend = (): Backend => createFfiEngineBackend(ENGINE_LIB);
 
 // --- structural canonicalization (engine mode only) -------------------------
 
@@ -76,7 +68,7 @@ export const canonResult = (json: string): string => {
   return JSON.stringify(canon);
 };
 
-/** Whether two result JSON strings are equivalent: byte-identical against core (the
- * shipped guarantee); structural (order-independent) against the engine. */
-export const resultsEqual = (a: string, b: string): boolean =>
-  USE_ENGINE ? canonResult(a) === canonResult(b) : a === b;
+/** Whether two result JSON strings are equivalent — structural (order-independent),
+ * because the engine and pure-TS engine agree on the answer but not on unspecified
+ * output order. */
+export const resultsEqual = (a: string, b: string): boolean => canonResult(a) === canonResult(b);

@@ -1,6 +1,6 @@
 {
   "name": "@lenke/native",
-  "description": "JavaScript/TypeScript bindings to the Rust `lenke-core` columnar graph engine, with a single facade over native (FFI) and WebAssembly backends.",
+  "description": "JavaScript/TypeScript bindings to the Rust `lenke-engine` columnar graph engine, with a single facade over native (FFI) and WebAssembly backends.",
   "license": "Apache-2.0",
   "type": "module",
   "sideEffects": false,
@@ -9,14 +9,6 @@
     ".": {
       "types": "./dist/types/index.d.ts",
       "default": "./dist/esm/index.mjs"
-    },
-    "./ffi": {
-      "types": "./dist/types/backend-ffi.d.ts",
-      "default": "./dist/esm/backend-ffi.mjs"
-    },
-    "./wasm": {
-      "types": "./dist/types/backend-wasm.d.ts",
-      "default": "./dist/esm/backend-wasm.mjs"
     },
     "./ffi-engine": {
       "types": "./dist/types/backend-ffi-engine.d.ts",
@@ -33,9 +25,8 @@
   },
   "scripts": {
     "build": "bun build.ts",
-    "build:rust": "cargo build --release --manifest-path ../../crates/lenke-core/Cargo.toml",
-    "build:wasm": "cargo build --release --target wasm32-unknown-unknown --no-default-features --features gql,gremlin,ndjson,codecs,arrow --manifest-path ../../crates/lenke-core/Cargo.toml",
-    "build:wasm:min": "cargo build --release --target wasm32-unknown-unknown --no-default-features --features gql --manifest-path ../../crates/lenke-core/Cargo.toml",
+    "build:rust": "cargo build --release --features capi --manifest-path ../../crates/lenke-engine/Cargo.toml",
+    "build:wasm": "cargo build --release --target wasm32-unknown-unknown --features capi --manifest-path ../../crates/lenke-engine/Cargo.toml",
     "engine:build:rust": "cargo build --release --features capi --manifest-path ../../crates/lenke-engine/Cargo.toml",
     "engine:build:wasm": "cargo build --release --target wasm32-unknown-unknown --features capi --manifest-path ../../crates/lenke-engine/Cargo.toml",
     "test": "bun test",

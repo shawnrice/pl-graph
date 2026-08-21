@@ -8,7 +8,7 @@
   "type": "module",
   "scripts": {
     "build": "nx run-many -t build",
-    "build:wasm": "nx run lenke-core:build-wasm",
+    "build:wasm": "nx run lenke-engine:build-wasm",
     "test": "nx run-many -t test",
     "lint": "oxlint --type-aware . && nx run-many -t lint",
     "lint:fix": "oxlint --type-aware --fix .",

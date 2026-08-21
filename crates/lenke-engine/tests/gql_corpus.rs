@@ -19,7 +19,7 @@
 use lenke_engine::value::Value as EngVal;
 use serde_json::Value as J;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ── a value form engine cells map into ───────────────────────────────────────
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -230,7 +230,7 @@ struct Case {
 }
 
 /// Load every `*.jsonl` case in the corpus dir, in a stable (sorted) order.
-fn load_cases(dir: &PathBuf) -> Vec<Case> {
+fn load_cases(dir: &Path) -> Vec<Case> {
     let mut files: Vec<_> = std::fs::read_dir(dir)
         .expect("read corpus dir")
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -270,13 +270,13 @@ fn load_cases(dir: &PathBuf) -> Vec<Case> {
     cases
 }
 
-fn snapshot_path(dir: &PathBuf) -> PathBuf {
+fn snapshot_path(dir: &Path) -> PathBuf {
     dir.join("snapshots.jsonl")
 }
 
 /// Run every case on the engine and write `snapshots.jsonl` (`{"key","out"}` lines,
 /// key-sorted). Guarded behind `CORPUS_SNAPSHOT=1` — a deliberate, reviewable act.
-fn regenerate_snapshot(dir: &PathBuf, cases: &[Case]) {
+fn regenerate_snapshot(dir: &Path, cases: &[Case]) {
     let mut lines: Vec<(String, String)> = Vec::new();
     for case in cases {
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -300,7 +300,7 @@ fn regenerate_snapshot(dir: &PathBuf, cases: &[Case]) {
 }
 
 /// Load `snapshots.jsonl` into `key → recorded Outcome`.
-fn load_snapshot(dir: &PathBuf) -> HashMap<String, Outcome> {
+fn load_snapshot(dir: &Path) -> HashMap<String, Outcome> {
     let text = std::fs::read_to_string(snapshot_path(dir)).unwrap_or_default();
     let mut map = HashMap::new();
     for line in text.lines() {

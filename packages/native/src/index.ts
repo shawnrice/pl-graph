@@ -1,13 +1,14 @@
 /**
  * `@lenke/native` — the Rust columnar core, callable from JS/TS.
  *
- * One C ABI, two backends behind a single {@link Backend} contract. The
- * backends live behind subpath exports so that loading this package in a
- * browser never pulls in the Bun-only `bun:ffi` builtin:
- *   - `@lenke/native/ffi` → `createFfiBackend` loads the native dynamic
- *     library over `bun:ffi` (server / CLI), and
- *   - `@lenke/native/wasm` → `createWasmBackend` instantiates the wasm
- *     artifact (browser).
+ * One C ABI, two backends over the lenke-engine C ABI behind a single
+ * {@link Backend} contract. The backends live behind subpath exports so that
+ * loading this package in a browser never pulls in the Bun-only `bun:ffi`
+ * builtin:
+ *   - `@lenke/native/ffi-engine` → `createFfiEngineBackend` loads the native
+ *     dynamic library over `bun:ffi` (server / CLI), and
+ *   - `@lenke/native/wasm-engine` → `createWasmEngineBackend` instantiates the
+ *     wasm artifact (browser).
  *
  * This entry is environment-neutral: shared types plus the engine-neutral
  * {@link RustGraph} facade — GQL via `query`, Gremlin via `gremlin`, both with
@@ -15,20 +16,18 @@
  *
  * @example bun / server
  * ```ts
- * import { createFfiBackend } from '@lenke/native/ffi';
- * import {
-  graphFromNdjson,
-} from '@lenke/native';
- * const backend = createFfiBackend('/path/to/liblenke_core.dylib');
+ * import { createFfiEngineBackend } from '@lenke/native/ffi-engine';
+ * import { graphFromNdjson } from '@lenke/native';
+ * const backend = createFfiEngineBackend('/path/to/liblenke_engine.so');
  * const g = graphFromNdjson(backend, await Bun.file('graph.ndjson').bytes());
  * g.query`MATCH (a:Person) RETURN a.name`;
  * ```
  *
  * @example browser
  * ```ts
- * import { createWasmBackend } from '@lenke/native/wasm';
+ * import { createWasmEngineBackend } from '@lenke/native/wasm-engine';
  * import { graphFromNdjson } from '@lenke/native';
- * const backend = await createWasmBackend(fetch('/lenke_core.wasm'));
+ * const backend = await createWasmEngineBackend(fetch('/lenke_engine.wasm'));
  * const g = graphFromNdjson(backend, ndjsonBytes);
  * ```
  */

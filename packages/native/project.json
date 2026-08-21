@@ -3,12 +3,12 @@
   "name": "@lenke/native",
   "targets": {
     "test": {
-      "//": "These tests load the REAL Rust artifacts at runtime — the FFI cdylib (backend-ffi/store/conformance) and the wasm module (backend-wasm) — by file path, not by import, so nx sees no project-graph edge to lenke-core. Without `rustCore` in the inputs the cache would serve a stale pass after a Rust-only change (the native package's own files are unchanged). `dependsOn` rebuilds both artifacts first so an isolated `nx test` never runs against a stale/missing binary.",
-      "inputs": ["default", "^production", "rustCore"],
-      "dependsOn": ["lenke-core:build", "lenke-core:build-wasm"]
+      "//": "These tests load the REAL Rust artifacts at runtime — the FFI cdylib (backend-ffi/store/conformance) and the wasm module (backend-wasm) — by file path, not by import, so nx sees no project-graph edge to lenke-engine. Without `rustEngine` in the inputs the cache would serve a stale pass after a Rust-only change (the native package's own files are unchanged). `dependsOn` rebuilds both artifacts first so an isolated `nx test` never runs against a stale/missing binary.",
+      "inputs": ["default", "^production", "rustEngine"],
+      "dependsOn": ["lenke-engine:build", "lenke-engine:build-wasm"]
     },
     "build:rust": {
-      "//": "Manual dev convenience that shells out to cargo. Its inferred cache key is this package's files, NOT the Rust source it compiles, so caching it would serve a stale cdylib. cargo is incremental anyway — never cache it. The canonical, correctly-keyed builders are lenke-core:build and lenke-core:build-wasm.",
+      "//": "Manual dev convenience that shells out to cargo. Its inferred cache key is this package's files, NOT the Rust source it compiles, so caching it would serve a stale cdylib. cargo is incremental anyway — never cache it. The canonical, correctly-keyed builders are lenke-engine:build and lenke-engine:build-wasm.",
       "cache": false
     },
     "build:wasm": {
