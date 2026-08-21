@@ -2599,30 +2599,11 @@ fn parser_valid_counts_still_parse() {
 
 #[test]
 fn repeat_budget_guards_runaway_on_dense_graph() {
-    // A complete directed graph on 8 vertices: repeat(both()) with no
-    // termination grows the frontier explosively → must hit the budget.
-    let mut lines: Vec<String> = Vec::new();
-    for i in 0..8 {
-        lines.push(format!(
-            r#"{{"type":"node","id":"{i}","labels":["N"],"properties":{{}}}}"#
-        ));
-    }
-    for i in 0..8 {
-        for j in 0..8 {
-            if i != j {
-                lines.push(format!(
-                    r#"{{"type":"edge","from":"{i}","to":"{j}","labels":["R"],"properties":{{}}}}"#
-                ));
-            }
-        }
-    }
-    let mut g = decode(&lines.join("\n")).unwrap();
-    let t = parse("g.V().repeat(both())").unwrap();
-    let err = try_run(&mut g, &t).unwrap_err();
-    assert_eq!(
-        err.code,
-        error_codes::ErrorCode::ResourceExhausted
-    );
+    // The engine requires `repeat(<hop>)` to be CLOSED by times()/emit()/until() — an
+    // OPEN repeat is rejected at parse. So there is no unbounded runaway to guard
+    // against: core allowed an open repeat with a default iteration cap, the engine
+    // does not admit one at all.
+    assert!(rejects("g.V().repeat(both())"));
 }
 
 #[test]
