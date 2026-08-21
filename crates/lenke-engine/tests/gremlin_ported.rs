@@ -9971,3 +9971,23 @@ fn choose_routes_each_element_to_a_per_element_aggregate() {
         "two SOFTWARE vertices each fold to [self]"
     );
 }
+
+#[test]
+fn coalesce_edge_hop_arm_guards_the_fallback() {
+    let mut g = modern();
+    // An edge-hop FIRST arm (`outE('KNOWS')`) must guard the count() fallback the same way a
+    // vertex-adjacency arm does: only marko has an outgoing KNOWS edge, so the other five
+    // vertices fall through to count() → 1. A missing edge-hop guard made the first arm
+    // "always fire", so the fallback produced nothing (only the two edges came back).
+    let rows = run_query("g.V().coalesce(outE('KNOWS'), count())", &mut g);
+    let ones = rows
+        .iter()
+        .filter(|g| matches!(g, GVal::Num(n) if *n == 1.0))
+        .count();
+    let edges = rows.iter().filter(|g| matches!(g, GVal::Edge(_))).count();
+    assert_eq!(edges, 2, "marko's two KNOWS edges");
+    assert_eq!(
+        ones, 5,
+        "the five vertices with no outgoing KNOWS each count themselves"
+    );
+}

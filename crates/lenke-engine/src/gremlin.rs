@@ -1971,6 +1971,31 @@ impl Parser {
                                 },
                             }
                         }
+                        // An EDGE-hop body (`outE('KNOWS')…`) contributes where the hop lands
+                        // an edge — an EXACT correlated EXISTS when prov-safe, else the leading
+                        // edge-hop existence. Without this the arm defaulted to always-true, so
+                        // a later arm (`coalesce(outE('KNOWS'), count())`) could never fire.
+                        None if self.peek_leading_edge_hop().is_some() => {
+                            let (dir, labels) =
+                                self.peek_leading_edge_hop().expect("edge hop just peeked");
+                            let save = self.pos;
+                            let gbody = self
+                                .parse_sub_body_seeded(Plan::Row, from, slots + 1)
+                                .map(|(b, _, _)| b);
+                            self.pos = save;
+                            match gbody {
+                                Ok(b) if body_is_exists_safe(&b) => Expr::Exists {
+                                    body: Box::new(b),
+                                    outer_width: slots,
+                                },
+                                _ => Expr::Exists {
+                                    body: Box::new(
+                                        Plan::Row.expand_edge_gremlin(from, dir, &labels),
+                                    ),
+                                    outer_width: slots,
+                                },
+                            }
+                        }
                         // A body led by a FILTER (`hasLabel('PERSON').values('name')`)
                         // produces output only where the filter holds; that predicate is
                         // the guard. Peek it via child_filter_expr, then restore the
@@ -5999,6 +6024,47 @@ impl Parser {
                 "out" => Dir::Out,
                 "in" => Dir::In,
                 "both" => Dir::Both,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        p += 1;
+        if self.toks.get(p) != Some(&Tok::LParen) {
+            return None;
+        }
+        p += 1;
+        let mut labels = Vec::new();
+        while let Some(Tok::Str(s)) = self.toks.get(p) {
+            labels.push(s.clone());
+            p += 1;
+            if self.toks.get(p) == Some(&Tok::Comma) {
+                p += 1;
+            } else {
+                break;
+            }
+        }
+        Some((dir, labels))
+    }
+
+    /// Like [`peek_leading_hop`] but for a leading EDGE hop (`outE`/`inE`/`bothE`), returning
+    /// its `(direction, edge labels)`. Used to build a coalesce/branch edge-hop arm's
+    /// existence guard — an edge-hop body contributes where the hop lands an edge, exactly as
+    /// a vertex adjacency arm does (without this the arm's guard defaulted to always-true, so
+    /// a later arm — `coalesce(outE('KNOWS'), count())` — could never fire).
+    fn peek_leading_edge_hop(&self) -> Option<(Dir, Vec<String>)> {
+        let mut p = self.pos;
+        if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
+            p += 1;
+            if self.toks.get(p) != Some(&Tok::Dot) {
+                return None;
+            }
+            p += 1;
+        }
+        let dir = match self.toks.get(p) {
+            Some(Tok::Ident(s)) => match s.to_ascii_lowercase().as_str() {
+                "oute" => Dir::Out,
+                "ine" => Dir::In,
+                "bothe" => Dir::Both,
                 _ => return None,
             },
             _ => return None,
