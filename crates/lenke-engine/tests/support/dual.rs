@@ -1,10 +1,14 @@
-//! A dual Gremlin builder: every method has the SAME signature as core's
-//! `lenke_core::gremlin::Traversal`, but each call drives BOTH core's builder AND an
-//! equivalent engine query string. `to_core()` hands back the core `Traversal`;
-//! `query()` the engine string. A ported test runs the two, compares them, and
-//! asserts against the same expected value — so core's test bodies run VERBATIM
-//! against both engines. `P`, `Order`, `Column`, `Pop`, `Token`, `Scope`, `SackOp`
-//! are re-used from core directly; a shim `P` carries the engine fragment alongside.
+//! An engine Gremlin builder: every method has the SAME signature core's
+//! `gremlin::Traversal` had, but each call only appends the equivalent engine query
+//! fragment — `query()` hands back the string, which the harness parses and runs on
+//! the engine. Core's Gremlin test bodies were written against a builder of this
+//! shape, so they still compile and run verbatim; the engine is now the sole engine
+//! (the `lenke-core` oracle it was dual-checked against has been deleted, its
+//! byte-identity contract now upheld by the TS differential fuzzers).
+//!
+//! `GVal`, `Order`, `Column`, `Pop`, `Token`, `Scope`, `SackOp` are small local
+//! mirrors of core's types (the bodies name them); the engine speaks query strings,
+//! not a builder, so it has no equivalents of its own.
 //!
 //! A method whose engine spelling is not yet handled still builds the string; the
 //! engine's parser then errors on it — surfacing the real gap when the test runs.
@@ -16,8 +20,178 @@
     clippy::should_implement_trait
 )]
 
-use lenke_core::gremlin::{self as cg};
-pub use lenke_core::gremlin::{Column, GVal, Order, Pop, SackOp, Scope, Token};
+// ── local value + enum mirrors (the bodies name these) ───────────────────────
+
+/// A Gremlin value, mirroring the variants core's `Value`/`GVal` exposed to the test
+/// bodies. `Node` carries a vertex's EXTERNAL id string (the engine has no interior
+/// `Value::Node`; a bare vertex arrives as a `{id,labels,properties}` map, which the
+/// result converter collapses to `Node(ext_id)` so `V()` reads like core's).
+#[derive(Clone, Debug, PartialEq)]
+pub enum GVal {
+    Null,
+    Bool(bool),
+    Num(f64),
+    Str(String),
+    List(Vec<GVal>),
+    Map(MapVal),
+    /// A vertex, by EXTERNAL id (the engine has no interior `Value::Node`).
+    Node(String),
+    /// An edge, by external id.
+    Edge(String),
+    /// A Gremlin `Property` result: `(owner, key, value)` — owner ignored by equality,
+    /// mirroring core's `PropertyVal`.
+    Property(Box<GVal>, String, Box<GVal>),
+}
+
+/// A TinkerPop map (any-value keys, insertion-ordered) — the shape the ported bodies
+/// name via `GVal::Map`, with the `iter`/`values`/`get`/`into_pairs` surface they use.
+#[derive(Clone, Debug)]
+pub struct MapVal(pub Vec<(GVal, GVal)>);
+
+impl MapVal {
+    pub fn from_pairs(pairs: Vec<(GVal, GVal)>) -> Self {
+        MapVal(pairs)
+    }
+    pub fn iter(&self) -> std::slice::Iter<'_, (GVal, GVal)> {
+        self.0.iter()
+    }
+    pub fn values(&self) -> Vec<GVal> {
+        self.0.iter().map(|(_, v)| v.clone()).collect()
+    }
+    pub fn keys(&self) -> Vec<GVal> {
+        self.0.iter().map(|(k, _)| k.clone()).collect()
+    }
+    pub fn get(&self, key: &GVal) -> Option<&GVal> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+    pub fn into_pairs(self) -> Vec<(GVal, GVal)> {
+        self.0
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+// Insertion-ordered equality (positional), like core's Gremlin `MapVal`.
+impl PartialEq for MapVal {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl GVal {
+    /// A list value (`GVal::list(vec![…])`).
+    pub fn list(items: Vec<GVal>) -> GVal {
+        GVal::List(items)
+    }
+    /// A map value from key/value pairs.
+    pub fn map(pairs: Vec<(GVal, GVal)>) -> GVal {
+        GVal::Map(MapVal::from_pairs(pairs))
+    }
+    /// A Gremlin `Property` value (owner is ignored by equality).
+    pub fn property(owner: GVal, key: impl Into<String>, value: GVal) -> GVal {
+        GVal::Property(Box::new(owner), key.into(), Box::new(value))
+    }
+}
+
+impl From<&str> for GVal {
+    fn from(s: &str) -> Self {
+        GVal::Str(s.to_string())
+    }
+}
+impl From<String> for GVal {
+    fn from(s: String) -> Self {
+        GVal::Str(s)
+    }
+}
+impl From<&String> for GVal {
+    fn from(s: &String) -> Self {
+        GVal::Str(s.clone())
+    }
+}
+impl From<bool> for GVal {
+    fn from(b: bool) -> Self {
+        GVal::Bool(b)
+    }
+}
+impl From<i32> for GVal {
+    fn from(n: i32) -> Self {
+        GVal::Num(n as f64)
+    }
+}
+impl From<i64> for GVal {
+    fn from(n: i64) -> Self {
+        GVal::Num(n as f64)
+    }
+}
+impl From<usize> for GVal {
+    fn from(n: usize) -> Self {
+        GVal::Num(n as f64)
+    }
+}
+impl From<f64> for GVal {
+    fn from(n: f64) -> Self {
+        GVal::Num(n)
+    }
+}
+impl<T: Into<GVal>> From<Vec<T>> for GVal {
+    fn from(xs: Vec<T>) -> Self {
+        GVal::List(xs.into_iter().map(Into::into).collect())
+    }
+}
+
+/// Sort direction (`order().by(..., asc|desc)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    Asc,
+    Desc,
+    Shuffle,
+}
+
+/// `select(keys|values)` on a map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Column {
+    Keys,
+    Values,
+}
+
+/// `select(pop, ...)` — which tagged value when a label was bound many times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pop {
+    First,
+    Last,
+    All,
+    Mixed,
+}
+
+/// A `by(token)` element accessor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Token {
+    Id,
+    Label,
+    Key,
+    Value,
+}
+
+/// `count(local)` / `order(local)` scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Global,
+    Local,
+}
+
+/// A `sack(op)` accumulator operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SackOp {
+    Sum,
+    Mult,
+    Min,
+    Max,
+    Assign,
+}
 
 fn dir_word(d: Order) -> &'static str {
     match d {
@@ -55,72 +229,57 @@ fn labels(ls: &[&str]) -> String {
 
 #[derive(Clone)]
 pub struct P {
-    core: cg::P,
     eng: String,
 }
 
 impl P {
+    /// The engine fragment this predicate renders to (e.g. `gt(30)`).
+    pub fn frag(&self) -> &str {
+        &self.eng
+    }
     pub fn eq(v: impl Into<GVal>) -> Self {
-        let g = v.into();
         Self {
-            eng: format!("eq({})", val(&g)),
-            core: cg::P::eq(g),
+            eng: format!("eq({})", val(&v.into())),
         }
     }
     pub fn neq(v: impl Into<GVal>) -> Self {
-        let g = v.into();
         Self {
-            eng: format!("neq({})", val(&g)),
-            core: cg::P::neq(g),
+            eng: format!("neq({})", val(&v.into())),
         }
     }
     pub fn gt(v: impl Into<GVal>) -> Self {
-        let g = v.into();
         Self {
-            eng: format!("gt({})", val(&g)),
-            core: cg::P::gt(g),
+            eng: format!("gt({})", val(&v.into())),
         }
     }
     pub fn gte(v: impl Into<GVal>) -> Self {
-        let g = v.into();
         Self {
-            eng: format!("gte({})", val(&g)),
-            core: cg::P::gte(g),
+            eng: format!("gte({})", val(&v.into())),
         }
     }
     pub fn lt(v: impl Into<GVal>) -> Self {
-        let g = v.into();
         Self {
-            eng: format!("lt({})", val(&g)),
-            core: cg::P::lt(g),
+            eng: format!("lt({})", val(&v.into())),
         }
     }
     pub fn lte(v: impl Into<GVal>) -> Self {
-        let g = v.into();
         Self {
-            eng: format!("lte({})", val(&g)),
-            core: cg::P::lte(g),
+            eng: format!("lte({})", val(&v.into())),
         }
     }
     pub fn between(a: impl Into<GVal>, b: impl Into<GVal>) -> Self {
-        let (ga, gb) = (a.into(), b.into());
         Self {
-            eng: format!("between({},{})", val(&ga), val(&gb)),
-            core: cg::P::between(ga, gb),
+            eng: format!("between({},{})", val(&a.into()), val(&b.into())),
         }
     }
     pub fn inside(a: impl Into<GVal>, b: impl Into<GVal>) -> Self {
-        let (ga, gb) = (a.into(), b.into());
         Self {
-            eng: format!("inside({},{})", val(&ga), val(&gb)),
-            core: cg::P::inside(ga, gb),
+            eng: format!("inside({},{})", val(&a.into()), val(&b.into())),
         }
     }
     pub fn outside(a: impl Into<GVal>, b: impl Into<GVal>) -> Self {
-        let (ga, gb) = (a.into(), b.into());
         Self {
-            eng: format!("outside({},{})", val(&ga), val(&gb)),
-            core: cg::P::outside(ga, gb),
+            eng: format!("outside({},{})", val(&a.into()), val(&b.into())),
         }
     }
     pub fn within<V: Into<GVal>>(vs: impl IntoIterator<Item = V>) -> Self {
@@ -128,7 +287,6 @@ impl P {
         let frag = gs.iter().map(val).collect::<Vec<_>>().join(",");
         Self {
             eng: format!("within({frag})"),
-            core: cg::P::within(gs),
         }
     }
     pub fn without<V: Into<GVal>>(vs: impl IntoIterator<Item = V>) -> Self {
@@ -136,70 +294,51 @@ impl P {
         let frag = gs.iter().map(val).collect::<Vec<_>>().join(",");
         Self {
             eng: format!("without({frag})"),
-            core: cg::P::without(gs),
         }
     }
     pub fn starts_with(s: &str) -> Self {
         Self {
             eng: format!("startingWith('{s}')"),
-            core: cg::P::starts_with(s),
         }
     }
     pub fn containing(s: &str) -> Self {
         Self {
             eng: format!("containing('{s}')"),
-            core: cg::P::containing(s),
         }
     }
     pub fn regex(s: &str) -> Self {
         Self {
             eng: format!("regex('{s}')"),
-            core: cg::P::regex(s),
         }
     }
     pub fn not(p: Self) -> Self {
         Self {
             eng: format!("not({})", p.eng),
-            core: cg::P::not(p.core),
         }
     }
 }
 
-// ── traversal shim ───────────────────────────────────────────────────────────
+// ── traversal builder ────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct Traversal {
-    core: cg::Traversal,
     eng: String,
 }
 
 pub fn g() -> Traversal {
-    Traversal {
-        core: cg::g(),
-        eng: "g".into(),
-    }
+    Traversal { eng: "g".into() }
 }
 
 pub fn __() -> Traversal {
-    Traversal {
-        core: cg::__(),
-        eng: "__".into(),
-    }
+    Traversal { eng: "__".into() }
 }
 
 impl Traversal {
-    pub fn to_core(self) -> cg::Traversal {
-        self.core
-    }
-    pub fn core_ref(&self) -> &cg::Traversal {
-        &self.core
-    }
     pub fn query(&self) -> String {
         self.eng.clone()
     }
 
-    fn step(mut self, core: cg::Traversal, frag: &str) -> Self {
-        self.core = core;
+    fn step(mut self, frag: &str) -> Self {
         self.eng.push('.');
         self.eng.push_str(frag);
         self
@@ -207,115 +346,88 @@ impl Traversal {
 
     // sources
     pub fn V(self) -> Self {
-        let c = self.core.clone().V();
-        self.step(c, "V()")
+        self.step("V()")
     }
     pub fn E(self) -> Self {
-        let c = self.core.clone().E();
-        self.step(c, "E()")
+        self.step("E()")
     }
     pub fn v_ids(self, ids: &[&str]) -> Self {
-        let c = self.core.clone().v_ids(ids);
-        self.step(c, &format!("V({})", labels(ids)))
+        self.step(&format!("V({})", labels(ids)))
     }
     pub fn e_ids(self, ids: &[&str]) -> Self {
-        let c = self.core.clone().e_ids(ids);
-        self.step(c, &format!("E({})", labels(ids)))
+        self.step(&format!("E({})", labels(ids)))
     }
 
     // hops
     pub fn out(self, l: &[&str]) -> Self {
-        let c = self.core.clone().out(l);
-        self.step(c, &format!("out({})", labels(l)))
+        self.step(&format!("out({})", labels(l)))
     }
     pub fn in_(self, l: &[&str]) -> Self {
-        let c = self.core.clone().in_(l);
-        self.step(c, &format!("in({})", labels(l)))
+        self.step(&format!("in({})", labels(l)))
     }
     pub fn both(self, l: &[&str]) -> Self {
-        let c = self.core.clone().both(l);
-        self.step(c, &format!("both({})", labels(l)))
+        self.step(&format!("both({})", labels(l)))
     }
     pub fn out_e(self, l: &[&str]) -> Self {
-        let c = self.core.clone().out_e(l);
-        self.step(c, &format!("outE({})", labels(l)))
+        self.step(&format!("outE({})", labels(l)))
     }
     pub fn in_e(self, l: &[&str]) -> Self {
-        let c = self.core.clone().in_e(l);
-        self.step(c, &format!("inE({})", labels(l)))
+        self.step(&format!("inE({})", labels(l)))
     }
     pub fn both_e(self, l: &[&str]) -> Self {
-        let c = self.core.clone().both_e(l);
-        self.step(c, &format!("bothE({})", labels(l)))
+        self.step(&format!("bothE({})", labels(l)))
     }
     pub fn out_v(self) -> Self {
-        let c = self.core.clone().out_v();
-        self.step(c, "outV()")
+        self.step("outV()")
     }
     pub fn in_v(self) -> Self {
-        let c = self.core.clone().in_v();
-        self.step(c, "inV()")
+        self.step("inV()")
     }
     pub fn other_v(self) -> Self {
-        let c = self.core.clone().other_v();
-        self.step(c, "otherV()")
+        self.step("otherV()")
     }
     pub fn both_v(self) -> Self {
-        let c = self.core.clone().both_v();
-        self.step(c, "bothV()")
+        self.step("bothV()")
     }
 
     // filters
     pub fn has(self, key: &str, pred: P) -> Self {
-        let c = self.core.clone().has(key, pred.core);
-        self.step(c, &format!("has('{key}',{})", pred.eng))
+        self.step(&format!("has('{key}',{})", pred.eng))
     }
     pub fn has_val(self, key: &str, v: impl Into<GVal>) -> Self {
-        let g = v.into();
-        let c = self.core.clone().has_val(key, g.clone());
-        self.step(c, &format!("has('{key}',{})", val(&g)))
+        self.step(&format!("has('{key}',{})", val(&v.into())))
     }
     pub fn has_label_key(self, label: &str, key: &str, pred: P) -> Self {
-        let c = self.core.clone().has_label_key(label, key, pred.core);
-        self.step(c, &format!("has('{label}','{key}',{})", pred.eng))
+        self.step(&format!("has('{label}','{key}',{})", pred.eng))
     }
     pub fn has_label(self, l: &[&str]) -> Self {
-        let c = self.core.clone().has_label(l);
-        self.step(c, &format!("hasLabel({})", labels(l)))
+        self.step(&format!("hasLabel({})", labels(l)))
     }
     pub fn has_id(self, ids: &[&str]) -> Self {
-        let c = self.core.clone().has_id(ids);
-        self.step(c, &format!("hasId({})", labels(ids)))
+        self.step(&format!("hasId({})", labels(ids)))
     }
     pub fn has_key(self, keys: &[&str]) -> Self {
-        let c = self.core.clone().has_key(keys);
-        self.step(c, &format!("hasKey({})", labels(keys)))
+        self.step(&format!("hasKey({})", labels(keys)))
     }
     pub fn has_not(self, keys: &[&str]) -> Self {
-        let c = self.core.clone().has_not(keys);
-        self.step(c, &format!("hasNot({})", labels(keys)))
+        self.step(&format!("hasNot({})", labels(keys)))
     }
     pub fn has_value<V: Into<GVal>>(self, vs: impl IntoIterator<Item = V>) -> Self {
         let gs: Vec<GVal> = vs.into_iter().map(Into::into).collect();
         let frag = gs.iter().map(val).collect::<Vec<_>>().join(",");
-        let c = self.core.clone().has_value(gs);
-        self.step(c, &format!("hasValue({frag})"))
+        self.step(&format!("hasValue({frag})"))
     }
     pub fn is(self, pred: P) -> Self {
-        let c = self.core.clone().is(pred.core);
-        self.step(c, &format!("is({})", pred.eng))
+        self.step(&format!("is({})", pred.eng))
     }
     pub fn where_(self, sub: Self) -> Self {
-        let c = self.core.clone().where_(sub.core);
-        self.step(c, &format!("where({})", sub.eng))
+        self.step(&format!("where({})", sub.eng))
     }
     pub fn where_key(self, start: &str, pred: P) -> Self {
-        let c = self.core.clone().where_key(start, pred.core);
-        self.step(c, &format!("where('{start}',{})", pred.eng))
+        self.step(&format!("where('{start}',{})", pred.eng))
     }
     pub fn where_pred(self, pred: P) -> Self {
-        let c = self.core.clone().where_pred(pred.core);
-        self.step(c, &format!("where({})", pred.eng))
+        self.step(&format!("where({})", pred.eng))
     }
     pub fn and(self, plans: Vec<Self>) -> Self {
         let frag = plans
@@ -323,11 +435,7 @@ impl Traversal {
             .map(|p| p.eng.clone())
             .collect::<Vec<_>>()
             .join(",");
-        let c = self
-            .core
-            .clone()
-            .and(plans.into_iter().map(|p| p.core).collect());
-        self.step(c, &format!("and({frag})"))
+        self.step(&format!("and({frag})"))
     }
     pub fn or(self, plans: Vec<Self>) -> Self {
         let frag = plans
@@ -335,19 +443,13 @@ impl Traversal {
             .map(|p| p.eng.clone())
             .collect::<Vec<_>>()
             .join(",");
-        let c = self
-            .core
-            .clone()
-            .or(plans.into_iter().map(|p| p.core).collect());
-        self.step(c, &format!("or({frag})"))
+        self.step(&format!("or({frag})"))
     }
     pub fn not(self, sub: Self) -> Self {
-        let c = self.core.clone().not(sub.core);
-        self.step(c, &format!("not({})", sub.eng))
+        self.step(&format!("not({})", sub.eng))
     }
     pub fn dedup(self) -> Self {
-        let c = self.core.clone().dedup();
-        self.step(c, "dedup()")
+        self.step("dedup()")
     }
     pub fn dedup_labels(self, ls: Vec<String>) -> Self {
         let frag = ls
@@ -355,200 +457,149 @@ impl Traversal {
             .map(|l| format!("'{l}'"))
             .collect::<Vec<_>>()
             .join(",");
-        let c = self.core.clone().dedup_labels(ls);
-        self.step(c, &format!("dedup({frag})"))
+        self.step(&format!("dedup({frag})"))
     }
     pub fn simple_path(self) -> Self {
-        let c = self.core.clone().simple_path();
-        self.step(c, "simplePath()")
+        self.step("simplePath()")
     }
     pub fn cyclic_path(self) -> Self {
-        let c = self.core.clone().cyclic_path();
-        self.step(c, "cyclicPath()")
+        self.step("cyclicPath()")
     }
 
     // projections
     pub fn values(self, keys: &[&str]) -> Self {
-        let c = self.core.clone().values(keys);
-        self.step(c, &format!("values({})", labels(keys)))
+        self.step(&format!("values({})", labels(keys)))
     }
     pub fn value_map(self, keys: &[&str]) -> Self {
-        let c = self.core.clone().value_map(keys);
-        self.step(c, &format!("valueMap({})", labels(keys)))
+        self.step(&format!("valueMap({})", labels(keys)))
     }
     pub fn property_map(self, keys: &[&str]) -> Self {
-        let c = self.core.clone().property_map(keys);
-        self.step(c, &format!("propertyMap({})", labels(keys)))
+        self.step(&format!("propertyMap({})", labels(keys)))
     }
     pub fn element_map(self, keys: &[&str]) -> Self {
-        let c = self.core.clone().element_map(keys);
-        self.step(c, &format!("elementMap({})", labels(keys)))
+        self.step(&format!("elementMap({})", labels(keys)))
     }
     pub fn properties(self, keys: &[&str]) -> Self {
-        let c = self.core.clone().properties(keys);
-        self.step(c, &format!("properties({})", labels(keys)))
+        self.step(&format!("properties({})", labels(keys)))
     }
     pub fn value(self) -> Self {
-        let c = self.core.clone().value();
-        self.step(c, "value()")
+        self.step("value()")
     }
     pub fn id(self) -> Self {
-        let c = self.core.clone().id();
-        self.step(c, "id()")
+        self.step("id()")
     }
     pub fn label(self) -> Self {
-        let c = self.core.clone().label();
-        self.step(c, "label()")
+        self.step("label()")
     }
     pub fn path(self) -> Self {
-        let c = self.core.clone().path();
-        self.step(c, "path()")
+        self.step("path()")
     }
     pub fn project(self, keys: &[&str]) -> Self {
-        let c = self.core.clone().project(keys);
-        self.step(c, &format!("project({})", labels(keys)))
+        self.step(&format!("project({})", labels(keys)))
     }
     pub fn tree(self) -> Self {
-        let c = self.core.clone().tree();
-        self.step(c, "tree()")
+        self.step("tree()")
     }
 
     // modulators
     pub fn by(self, key: &str) -> Self {
-        let c = self.core.clone().by(key);
-        self.step(c, &format!("by('{key}')"))
+        self.step(&format!("by('{key}')"))
     }
     pub fn by_identity(self) -> Self {
-        let c = self.core.clone().by_identity();
-        self.step(c, "by()")
+        self.step("by()")
     }
     pub fn by_dir(self, key: &str, dir: Order) -> Self {
-        let c = self.core.clone().by_dir(key, dir);
-        self.step(c, &format!("by('{key}',{})", dir_word(dir)))
+        self.step(&format!("by('{key}',{})", dir_word(dir)))
     }
     pub fn by_identity_dir(self, dir: Order) -> Self {
-        let c = self.core.clone().by_identity_dir(dir);
-        self.step(c, &format!("by({})", dir_word(dir)))
+        self.step(&format!("by({})", dir_word(dir)))
     }
     pub fn by_t(self, t: Self) -> Self {
-        let c = self.core.clone().by_t(t.core);
-        self.step(c, &format!("by({})", t.eng))
+        self.step(&format!("by({})", t.eng))
     }
     pub fn by_t_dir(self, t: Self, dir: Order) -> Self {
-        let c = self.core.clone().by_t_dir(t.core, dir);
-        self.step(c, &format!("by({},{})", t.eng, dir_word(dir)))
+        self.step(&format!("by({},{})", t.eng, dir_word(dir)))
     }
 
     // paging / bounds
     pub fn limit(self, n: usize) -> Self {
-        let c = self.core.clone().limit(n);
-        self.step(c, &format!("limit({n})"))
+        self.step(&format!("limit({n})"))
     }
     pub fn limit_local(self, n: usize) -> Self {
-        let c = self.core.clone().limit_local(n);
-        self.step(c, &format!("limit(local,{n})"))
+        self.step(&format!("limit(local,{n})"))
     }
     pub fn skip(self, n: usize) -> Self {
-        let c = self.core.clone().skip(n);
-        self.step(c, &format!("skip({n})"))
+        self.step(&format!("skip({n})"))
     }
     pub fn range(self, a: usize, b: usize) -> Self {
-        let c = self.core.clone().range(a, b);
-        self.step(c, &format!("range({a},{b})"))
+        self.step(&format!("range({a},{b})"))
     }
     pub fn range_local(self, a: usize, b: usize) -> Self {
-        let c = self.core.clone().range_local(a, b);
-        self.step(c, &format!("range(local,{a},{b})"))
+        self.step(&format!("range(local,{a},{b})"))
     }
     pub fn tail(self, n: usize) -> Self {
-        let c = self.core.clone().tail(n);
-        self.step(c, &format!("tail({n})"))
+        self.step(&format!("tail({n})"))
     }
     pub fn tail_local(self, n: usize) -> Self {
-        let c = self.core.clone().tail_local(n);
-        self.step(c, &format!("tail(local,{n})"))
+        self.step(&format!("tail(local,{n})"))
     }
     pub fn sample(self, n: usize) -> Self {
-        let c = self.core.clone().sample(n);
-        self.step(c, &format!("sample({n})"))
+        self.step(&format!("sample({n})"))
     }
 
     // reducers
     pub fn count(self) -> Self {
-        let c = self.core.clone().count();
-        self.step(c, "count()")
+        self.step("count()")
     }
     pub fn count_local(self) -> Self {
-        let c = self.core.clone().count_local();
-        self.step(c, "count(local)")
+        self.step("count(local)")
     }
     pub fn fold(self) -> Self {
-        let c = self.core.clone().fold();
-        self.step(c, "fold()")
+        self.step("fold()")
     }
     pub fn sum(self) -> Self {
-        let c = self.core.clone().sum();
-        self.step(c, "sum()")
+        self.step("sum()")
     }
     pub fn sum_local(self) -> Self {
-        let c = self.core.clone().sum_local();
-        self.step(c, "sum(local)")
+        self.step("sum(local)")
     }
     pub fn min(self) -> Self {
-        let c = self.core.clone().min();
-        self.step(c, "min()")
+        self.step("min()")
     }
     pub fn min_local(self) -> Self {
-        let c = self.core.clone().min_local();
-        self.step(c, "min(local)")
+        self.step("min(local)")
     }
     pub fn max(self) -> Self {
-        let c = self.core.clone().max();
-        self.step(c, "max()")
+        self.step("max()")
     }
     pub fn max_local(self) -> Self {
-        let c = self.core.clone().max_local();
-        self.step(c, "max(local)")
+        self.step("max(local)")
     }
     pub fn mean(self) -> Self {
-        let c = self.core.clone().mean();
-        self.step(c, "mean()")
+        self.step("mean()")
     }
     pub fn mean_local(self) -> Self {
-        let c = self.core.clone().mean_local();
-        self.step(c, "mean(local)")
+        self.step("mean(local)")
     }
     pub fn group(self) -> Self {
-        let c = self.core.clone().group();
-        self.step(c, "group()")
+        self.step("group()")
     }
     pub fn group_count(self) -> Self {
-        let c = self.core.clone().group_count();
-        self.step(c, "groupCount()")
+        self.step("groupCount()")
     }
 
     // order
     pub fn order(self) -> Self {
-        let c = self.core.clone().order();
-        self.step(c, "order()")
+        self.step("order()")
     }
     pub fn order_local(self) -> Self {
-        let c = self.core.clone().order_local();
-        self.step(c, "order(local)")
+        self.step("order(local)")
     }
-    pub fn order_dir(self, dir: Order, scope: Scope) -> Self {
-        let c = self.core.clone().order_dir(dir, scope);
-        let sc = if matches!(scope, Scope::Local) {
-            "local"
-        } else {
-            "global"
-        };
-        let _ = sc;
-        self.step(c, &format!("order({}).by({})", "", dir_word(dir)))
+    pub fn order_dir(self, dir: Order, _scope: Scope) -> Self {
+        self.step(&format!("order().by({})", dir_word(dir)))
     }
     pub fn order_by(self, key: &str, dir: Order) -> Self {
-        let c = self.core.clone().order_by(key, dir);
-        self.step(c, &format!("order().by('{key}',{})", dir_word(dir)))
+        self.step(&format!("order().by('{key}',{})", dir_word(dir)))
     }
 
     // branch / control
@@ -558,11 +609,7 @@ impl Traversal {
             .map(|p| p.eng.clone())
             .collect::<Vec<_>>()
             .join(",");
-        let c = self
-            .core
-            .clone()
-            .union(plans.into_iter().map(|p| p.core).collect());
-        self.step(c, &format!("union({frag})"))
+        self.step(&format!("union({frag})"))
     }
     pub fn coalesce(self, plans: Vec<Self>) -> Self {
         let frag = plans
@@ -570,62 +617,40 @@ impl Traversal {
             .map(|p| p.eng.clone())
             .collect::<Vec<_>>()
             .join(",");
-        let c = self
-            .core
-            .clone()
-            .coalesce(plans.into_iter().map(|p| p.core).collect());
-        self.step(c, &format!("coalesce({frag})"))
+        self.step(&format!("coalesce({frag})"))
     }
     pub fn optional(self, sub: Self) -> Self {
-        let c = self.core.clone().optional(sub.core);
-        self.step(c, &format!("optional({})", sub.eng))
+        self.step(&format!("optional({})", sub.eng))
     }
     pub fn local(self, sub: Self) -> Self {
-        let c = self.core.clone().local(sub.core);
-        self.step(c, &format!("local({})", sub.eng))
+        self.step(&format!("local({})", sub.eng))
     }
     pub fn choose(self, test: Self, then_: Self) -> Self {
-        let c = self.core.clone().choose(test.core, then_.core);
-        self.step(c, &format!("choose({},{})", test.eng, then_.eng))
+        self.step(&format!("choose({},{})", test.eng, then_.eng))
     }
     pub fn choose_else(self, test: Self, then_: Self, else_: Self) -> Self {
-        let c = self
-            .core
-            .clone()
-            .choose_else(test.core, then_.core, else_.core);
-        self.step(
-            c,
-            &format!("choose({},{},{})", test.eng, then_.eng, else_.eng),
-        )
+        self.step(&format!("choose({},{},{})", test.eng, then_.eng, else_.eng))
     }
     pub fn branch(self, test: Self) -> Self {
-        let c = self.core.clone().branch(test.core);
-        self.step(c, &format!("branch({})", test.eng))
+        self.step(&format!("branch({})", test.eng))
     }
     pub fn option(self, m: impl Into<GVal>, plan: Self) -> Self {
-        let g = m.into();
-        let c = self.core.clone().option(g.clone(), plan.core);
-        self.step(c, &format!("option({},{})", val(&g), plan.eng))
+        self.step(&format!("option({},{})", val(&m.into()), plan.eng))
     }
     pub fn option_none(self, plan: Self) -> Self {
-        let c = self.core.clone().option_none(plan.core);
-        self.step(c, &format!("option(none,{})", plan.eng))
+        self.step(&format!("option(none,{})", plan.eng))
     }
     pub fn map(self, sub: Self) -> Self {
-        let c = self.core.clone().map(sub.core);
-        self.step(c, &format!("map({})", sub.eng))
+        self.step(&format!("map({})", sub.eng))
     }
     pub fn flat_map(self, sub: Self) -> Self {
-        let c = self.core.clone().flat_map(sub.core);
-        self.step(c, &format!("flatMap({})", sub.eng))
+        self.step(&format!("flatMap({})", sub.eng))
     }
     pub fn filter(self, sub: Self) -> Self {
-        let c = self.core.clone().filter(sub.core);
-        self.step(c, &format!("filter({})", sub.eng))
+        self.step(&format!("filter({})", sub.eng))
     }
     pub fn side_effect(self, sub: Self) -> Self {
-        let c = self.core.clone().side_effect(sub.core);
-        self.step(c, &format!("sideEffect({})", sub.eng))
+        self.step(&format!("sideEffect({})", sub.eng))
     }
     pub fn match_(self, patterns: Vec<Self>) -> Self {
         let frag = patterns
@@ -633,173 +658,135 @@ impl Traversal {
             .map(|p| p.eng.clone())
             .collect::<Vec<_>>()
             .join(",");
-        let c = self
-            .core
-            .clone()
-            .match_(patterns.into_iter().map(|p| p.core).collect());
-        self.step(c, &format!("match({frag})"))
+        self.step(&format!("match({frag})"))
     }
 
     // side effects / bags
     pub fn aggregate(self, key: &str) -> Self {
-        let c = self.core.clone().aggregate(key);
-        self.step(c, &format!("aggregate('{key}')"))
+        self.step(&format!("aggregate('{key}')"))
     }
     pub fn store(self, key: &str) -> Self {
-        let c = self.core.clone().store(key);
-        self.step(c, &format!("store('{key}')"))
+        self.step(&format!("store('{key}')"))
     }
     pub fn cap(self, key: &str) -> Self {
-        let c = self.core.clone().cap(key);
-        self.step(c, &format!("cap('{key}')"))
+        self.step(&format!("cap('{key}')"))
     }
     pub fn subgraph(self, key: &str) -> Self {
-        let c = self.core.clone().subgraph(key);
-        self.step(c, &format!("subgraph('{key}')"))
+        self.step(&format!("subgraph('{key}')"))
     }
     pub fn barrier(self) -> Self {
-        let c = self.core.clone().barrier();
-        self.step(c, "barrier()")
+        self.step("barrier()")
     }
 
     // OLAP
     pub fn shortest_path(self) -> Self {
-        let c = self.core.clone().shortest_path();
-        self.step(c, "shortestPath()")
+        self.step("shortestPath()")
     }
     pub fn shortest_path_to(self, target: Self) -> Self {
-        let c = self.core.clone().shortest_path_to(target.core);
         // Engine has no target-filtered form; render the target selector so the engine
         // parser surfaces it as a gap rather than silently computing all paths.
-        self.step(c, &format!("shortestPath().with(target,{})", target.eng))
+        self.step(&format!("shortestPath().with(target,{})", target.eng))
     }
     pub fn from_tag(self, label: &str) -> Self {
-        let c = self.core.clone().from_tag(label);
-        self.step(c, &format!("from('{label}')"))
+        self.step(&format!("from('{label}')"))
     }
     pub fn page_rank(self, alpha: Option<f64>) -> Self {
-        let c = self.core.clone().page_rank(alpha);
         match alpha {
-            Some(a) => self.step(c, &format!("pageRank({a})")),
-            None => self.step(c, "pageRank()"),
+            Some(a) => self.step(&format!("pageRank({a})")),
+            None => self.step("pageRank()"),
         }
     }
     pub fn connected_component(self) -> Self {
-        let c = self.core.clone().connected_component();
-        self.step(c, "connectedComponent()")
+        self.step("connectedComponent()")
     }
     pub fn peer_pressure(self) -> Self {
-        let c = self.core.clone().peer_pressure();
-        self.step(c, "peerPressure()")
+        self.step("peerPressure()")
     }
 
     // repeat
     pub fn repeat(self, body: Self) -> Self {
-        let c = self.core.clone().repeat(body.core);
-        self.step(c, &format!("repeat({})", body.eng))
+        self.step(&format!("repeat({})", body.eng))
     }
     pub fn times(self, n: usize) -> Self {
-        let c = self.core.clone().times(n);
-        self.step(c, &format!("times({n})"))
+        self.step(&format!("times({n})"))
     }
     pub fn until(self, cond: Self) -> Self {
-        let c = self.core.clone().until(cond.core);
-        self.step(c, &format!("until({})", cond.eng))
+        self.step(&format!("until({})", cond.eng))
     }
     pub fn emit(self, cond: Self) -> Self {
-        let c = self.core.clone().emit(cond.core);
-        self.step(c, &format!("emit({})", cond.eng))
+        self.step(&format!("emit({})", cond.eng))
     }
     pub fn emit_all(self) -> Self {
-        let c = self.core.clone().emit_all();
-        self.step(c, "emit()")
+        self.step("emit()")
     }
 
     // tags / select
     pub fn as_(self, label: &str) -> Self {
-        let c = self.core.clone().as_(label);
-        self.step(c, &format!("as('{label}')"))
+        self.step(&format!("as('{label}')"))
     }
     pub fn select(self, labels_: &[&str]) -> Self {
-        let c = self.core.clone().select(labels_);
-        self.step(c, &format!("select({})", labels(labels_)))
+        self.step(&format!("select({})", labels(labels_)))
     }
     pub fn select_pop(self, pop: Pop, labels_: &[&str]) -> Self {
-        let c = self.core.clone().select_pop(pop, labels_);
         let pw = format!("{pop:?}");
-        self.step(c, &format!("select({},{})", pw, labels(labels_)))
+        self.step(&format!("select({},{})", pw, labels(labels_)))
     }
     pub fn select_column(self, col: Column) -> Self {
-        let c = self.core.clone().select_column(col);
         let cw = if matches!(col, Column::Keys) {
             "keys"
         } else {
             "values"
         };
-        self.step(c, &format!("select({cw})"))
+        self.step(&format!("select({cw})"))
     }
 
     // misc
     pub fn unfold(self) -> Self {
-        let c = self.core.clone().unfold();
-        self.step(c, "unfold()")
+        self.step("unfold()")
     }
     pub fn constant(self, v: impl Into<GVal>) -> Self {
-        let g = v.into();
-        let c = self.core.clone().constant(g.clone());
-        self.step(c, &format!("constant({})", val(&g)))
+        self.step(&format!("constant({})", val(&v.into())))
     }
     pub fn math(self, expr: &str) -> Self {
-        let c = self.core.clone().math(expr);
-        self.step(c, &format!("math('{expr}')"))
+        self.step(&format!("math('{expr}')"))
     }
     pub fn identity(self) -> Self {
-        let c = self.core.clone().identity();
-        self.step(c, "identity()")
+        self.step("identity()")
     }
     pub fn inject<V: Into<GVal>>(self, vs: impl IntoIterator<Item = V>) -> Self {
         let gs: Vec<GVal> = vs.into_iter().map(Into::into).collect();
         let frag = gs.iter().map(val).collect::<Vec<_>>().join(",");
-        let c = self.core.clone().inject(gs);
-        self.step(c, &format!("inject({frag})"))
+        self.step(&format!("inject({frag})"))
     }
     pub fn none(self) -> Self {
-        let c = self.core.clone().none();
-        self.step(c, "none()")
+        self.step("none()")
     }
     pub fn none_pred(self, pred: P) -> Self {
-        let c = self.core.clone().none_pred(pred.core);
-        self.step(c, &format!("none({})", pred.eng))
+        self.step(&format!("none({})", pred.eng))
     }
     pub fn fail(self, msg: &str) -> Self {
-        let c = self.core.clone().fail(msg);
-        self.step(c, &format!("fail('{msg}')"))
+        self.step(&format!("fail('{msg}')"))
     }
     pub fn index(self) -> Self {
-        let c = self.core.clone().index();
-        self.step(c, "index()")
+        self.step("index()")
     }
     pub fn loops(self) -> Self {
-        let c = self.core.clone().loops();
-        self.step(c, "loops()")
+        self.step("loops()")
     }
 
     // sack
     pub fn with_sack(self, init: impl Into<GVal>) -> Self {
-        let g = init.into();
-        let c = self.core.clone().with_sack(g.clone());
         // withSack is a source prefix — it must precede the head. Model as prefix.
         let mut t = self;
-        t.core = c;
-        t.eng = t.eng.replacen("g", &format!("g.withSack({})", val(&g)), 1);
+        t.eng = t
+            .eng
+            .replacen("g", &format!("g.withSack({})", val(&init.into())), 1);
         t
     }
     pub fn sack(self) -> Self {
-        let c = self.core.clone().sack();
-        self.step(c, "sack()")
+        self.step("sack()")
     }
     pub fn sack_op(self, op: SackOp) -> Self {
-        let c = self.core.clone().sack_op(op);
         let ow = match op {
             SackOp::Sum => "sum",
             SackOp::Mult => "mult",
@@ -807,63 +794,53 @@ impl Traversal {
             SackOp::Max => "max",
             SackOp::Assign => "assign",
         };
-        self.step(c, &format!("sack({ow})"))
+        self.step(&format!("sack({ow})"))
     }
 
     pub fn by_label(self) -> Self {
-        let c = self.core.clone().by_label();
-        self.step(c, "by(label)")
+        self.step("by(label)")
     }
     pub fn by_id(self) -> Self {
-        let c = self.core.clone().by_id();
-        self.step(c, "by(id)")
+        self.step("by(id)")
     }
     pub fn by_token(self, tok: Token) -> Self {
-        let c = self.core.clone().by_token(tok);
         let w = match tok {
             Token::Id => "id",
             Token::Label => "label",
             Token::Key => "key",
             Token::Value => "value",
         };
-        self.step(c, &format!("by({w})"))
+        self.step(&format!("by({w})"))
     }
 
     // writes
     pub fn add_v(self, label: Option<&str>) -> Self {
-        let c = self.core.clone().add_v(label);
         match label {
-            Some(l) => self.step(c, &format!("addV('{l}')")),
-            None => self.step(c, "addV()"),
+            Some(l) => self.step(&format!("addV('{l}')")),
+            None => self.step("addV()"),
         }
     }
     pub fn add_e(self, label: &str) -> Self {
-        let c = self.core.clone().add_e(label);
-        self.step(c, &format!("addE('{label}')"))
+        self.step(&format!("addE('{label}')"))
     }
     pub fn property(self, key: &str, v: impl Into<GVal>) -> Self {
-        let g = v.into();
-        let c = self.core.clone().property(key, g.clone());
-        self.step(c, &format!("property('{key}',{})", val(&g)))
+        self.step(&format!("property('{key}',{})", val(&v.into())))
     }
     pub fn drop(self) -> Self {
-        let c = self.core.clone().drop();
-        self.step(c, "drop()")
+        self.step("drop()")
     }
 
     // OLAP config modulators (attach to the preceding algo step)
     pub fn with_algo_property(self, name: String) -> Self {
-        let c = self.core.clone().with_algo_property(name.clone());
-        self.step(c, &format!("with(propertyName,'{name}')"))
+        self.step(&format!("with(propertyName,'{name}')"))
     }
     pub fn with_algo_times(self, n: u32) -> Self {
-        let c = self.core.clone().with_algo_times(n);
-        self.step(c, &format!("with(times,{n})"))
+        self.step(&format!("with(times,{n})"))
     }
 
-    /// Run on core (returns core's result). The dual comparison lives in the ported
-    /// test's `q`, which also parses+runs `query()` on the engine.
-    pub fn run(self, graph: &mut lenke_core::graph::Graph) -> Vec<GVal> {
-        self.core.run(graph)
+    /// Parse + run this traversal's engine query on `store`, returning the flattened
+    /// results as `GVal`. The test body's own `assert_eq!` then checks the expected.
+    pub fn run(self, store: &mut super::EngineGraph) -> Vec<GVal> {
+        super::run_query(&self.eng, store)
     }
 }
