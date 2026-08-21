@@ -1576,11 +1576,15 @@ fn max_slot(expr: &Expr) -> Option<usize> {
     match expr {
         Expr::Slot(n) => Some(*n),
         Expr::Prop { slot, .. } | Expr::IsLabeled { slot, .. } => Some(*slot),
-        Expr::Lit(_)
-        | Expr::Param(_)
-        | Expr::Path
-        | Expr::PathAccess { .. }
-        | Expr::GremlinPath { .. } => None,
+        Expr::Lit(_) | Expr::Param(_) => None,
+        // A path-reading expression (`simplePath`'s `not(path_has_dup(Path))`,
+        // `path()` accessors) depends on EVERY hop taken, not on a fixed slot — so it
+        // must never be pushed below an Expand / VarLength / ShortestPath that extends
+        // the path. Claim it reads the topmost possible slot so `refs_below` is always
+        // false. (Without this, filter-pushdown moved the simplePath filter below the
+        // Expands that build the path, where it saw a one-node path and passed
+        // everything — silently dropping the filter.)
+        Expr::Path | Expr::PathAccess { .. } | Expr::GremlinPath { .. } => Some(usize::MAX),
         Expr::Not(x) => max_slot(x),
         Expr::And(a, b)
         | Expr::Or(a, b)
