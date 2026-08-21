@@ -1726,20 +1726,17 @@ impl Parser {
                 self.edge_hop = prev_edge_hop;
                 let mut bodies = Vec::new();
                 loop {
-                    // A `<hop>.count()` branch is a PER-ELEMENT count (each input keeps
-                    // its own degree), not a global fold — lower it to a Row-projected
-                    // CountSubquery. Any other body parses as a Row-rooted sub-plan.
-                    if let Some(body) = self.try_count_body(from, width)? {
-                        bodies.push(body.reconverge(0));
-                    } else {
-                        let (body, oc, _os) = self.parse_sub_body(from, width)?;
-                        // Reconverge every arm to a UNIFORM width-1 frontier with its
-                        // element at slot 0 — a 2-hop arm beside a 1-hop arm otherwise
-                        // lands its element at a different slot, and a downstream
-                        // `values()` would read a mid-hop node. Lineage-preserving, so
-                        // path()-through-union still works.
-                        bodies.push(body.reconverge(oc));
-                    }
+                    // union() runs each arm over the WHOLE incoming stream (the branch body
+                    // is seeded with the full batch, not per element), so a reducing barrier
+                    // in an arm — `count()`, `limit(1)`, `fold()` — reduces the whole stream:
+                    // `union(out().count(), in().count())` yields the TOTAL out- and in-degree,
+                    // not per-vertex, matching TinkerPop.
+                    let (body, oc, _os) = self.parse_sub_body(from, width)?;
+                    // Reconverge every arm to a UNIFORM width-1 frontier with its element at
+                    // slot 0 — a 2-hop arm beside a 1-hop arm otherwise lands its element at a
+                    // different slot, and a downstream `values()` would read a mid-hop node.
+                    // Lineage-preserving, so path()-through-union still works.
+                    bodies.push(body.reconverge(oc));
                     if self.peek() == Some(&Tok::Comma) {
                         self.bump();
                     } else {
@@ -5641,9 +5638,11 @@ impl Parser {
     /// hop `[__.](out|in|both)('L', …)`, returning its `(direction, edge labels)`. Used
     /// to form a body's existence guard before parsing it. `None` when the body does not
     /// start with a hop (a value body such as `constant(v)` always produces output).
-    /// Parse a union branch that is a PER-ELEMENT `[__.](out|in|both)('L'…).count()`,
-    /// returning a `Row`-projected `CountSubquery` (one count per input row). Returns
-    /// `None` with the cursor unchanged when the body is not that shape.
+    /// Parse a PER-ELEMENT `[__.](out|in|both)('L'…).count()` branch body, returning a
+    /// `Row`-projected `CountSubquery` (one count per input row). Returns `None` with the
+    /// cursor unchanged when the body is not that shape. Retained for the coalesce
+    /// per-element-aggregate fix (union is now whole-stream and no longer uses it).
+    #[allow(dead_code)]
     fn try_count_body(&mut self, from: usize, width: usize) -> Result<Option<Plan>, String> {
         let save = self.pos;
         let mut p = self.pos;

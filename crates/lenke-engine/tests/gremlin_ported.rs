@@ -5093,18 +5093,11 @@ fn p3_union_out_in_names_flattened() {
 
 #[test]
 fn p3_union_terminal_counts_per_branch() {
-    // V('1','4').union(out().count(), in_().count()) — the per-branch counts {3,0,2,1}
-    // in an unspecified order; compare as a multiset.
+    // V('1','4').union(out().count(), in_().count()) — union runs each arm over the WHOLE
+    // {marko, josh} stream, so each count() is a WHOLE-STREAM total, not per vertex: out()
+    // over both = 3 + 2 = 5, in() over both = 0 + 1 = 1. Matches TinkerPop.
     let r = qs("g.V('1','4').union(__.out().count(), __.in().count())");
-    assert_eq!(
-        bag(r),
-        bag(vec![
-            GVal::Num(3.0),
-            GVal::Num(0.0),
-            GVal::Num(2.0),
-            GVal::Num(1.0)
-        ])
-    );
+    assert_eq!(bag(r), bag(vec![GVal::Num(5.0), GVal::Num(1.0)]));
 }
 
 #[test]

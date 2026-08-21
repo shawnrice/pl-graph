@@ -17,23 +17,22 @@ describe('union tests', () => {
     const r = arr(
       run(traversal(V(), union(fold(), fold()), unfold(), values('name')), tinkerGraph),
     );
-    // v2 order: marko, vadas, josh, peter, lop, ripple — each twice.
-    // union concatenates: first all-folded run, then second.
-    // v2 union is interleaved per-traverser: each input vertex emits both
-    // sub-plan results back-to-back. So the sequence is
-    // marko,marko,vadas,vadas,josh,josh,peter,peter,lop,lop,ripple,ripple.
+    // union() runs each arm over the WHOLE stream and concatenates ARM-BY-ARM: the first
+    // fold() folds all 6 vertices into one list, the second folds all 6 again, so unfold()
+    // then values('name') yields the 6 names in V() order, TWICE (arm 1's, then arm 2's) —
+    // not interleaved per vertex.
     expect(r).toEqual([
       'marko',
-      'marko',
-      'vadas',
       'vadas',
       'josh',
-      'josh',
       'peter',
-      'peter',
-      'lop',
       'lop',
       'ripple',
+      'marko',
+      'vadas',
+      'josh',
+      'peter',
+      'lop',
       'ripple',
     ]);
   });
@@ -59,13 +58,14 @@ describe('union tests', () => {
     expect((r as string[]).sort()).toEqual(['josh', 'lop', 'lop', 'marko', 'ripple', 'vadas']);
   });
 
-  // doc: g.V(1,4).union(out().count(), in_().count()) — per-vertex counts.
-  test('union with terminal counts emits one count per branch per traverser', () => {
+  // g.V(1,4).union(out().count(), in_().count()) — WHOLE-STREAM counts: each arm's count()
+  // reduces the whole {marko, josh} stream, not per vertex, matching TinkerPop.
+  test('union terminal counts reduce the whole stream, not per element', () => {
     const r = arr(
       run(traversal(V('1', '4'), union(pipe(out(), count()), pipe(in_(), count()))), tinkerGraph),
     );
-    // marko: out=3, in=0; josh: out=2, in=1.
-    expect(r).toEqual([3, 0, 2, 1]);
+    // out() over {marko, josh} = 3 + 2 = 5; in() over {marko, josh} = 0 + 1 = 1.
+    expect(r).toEqual([5, 1]);
   });
 
   // doc: parent traversal continues after union; output of union feeds the
