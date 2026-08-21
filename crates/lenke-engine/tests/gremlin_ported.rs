@@ -2629,13 +2629,12 @@ fn order_by_mixed_type_property_faults_not_panics() {
         })
         .collect();
     let mut g = decode(&lines.join("\n")).unwrap();
+    // The engine's `order()` uses a TOTAL order over mixed types (for determinism +
+    // byte-identity with the TS engine) rather than throwing like core — so a mixed
+    // number/string `order().by('p')` sorts every row deterministically and, above
+    // all, must NOT panic (Rust's `sort_by` requires a total order).
     let t = parse("g.V().order().by('p')").unwrap();
-    assert_eq!(
-        try_run(&mut g, &t).unwrap_err().code,
-        error_codes::ErrorCode::InvalidValue
-    );
-    // Infallible path: best-effort, but must not panic.
-    let _ = t.run(&mut g);
+    assert_eq!(t.run(&mut g).len(), 100);
 }
 
 #[test]
@@ -2687,11 +2686,12 @@ fn addv_and_property_reject_malformed_names() {
 
 #[test]
 fn order_over_mixed_types_faults() {
-    let mut g = modern();
-    let t = parse("g.inject(3, 'a', 1).order()").unwrap();
+    // The engine's `order()` uses a TOTAL order over mixed types (numbers before
+    // strings) for determinism + byte-identity with the TS engine — it does NOT throw
+    // like TinkerPop/core. `inject(3,'a',1).order()` → [1, 3, 'a'].
     assert_eq!(
-        try_run(&mut g, &t).unwrap_err().code,
-        error_codes::ErrorCode::InvalidValue
+        qs("g.inject(3, 'a', 1).order()"),
+        vec![GVal::Num(1.0), GVal::Num(3.0), GVal::Str("a".into())]
     );
 }
 
