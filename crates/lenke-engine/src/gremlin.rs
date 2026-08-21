@@ -1761,6 +1761,18 @@ impl Parser {
                 // Seed the arm with the outer edge hop (see parse_sub_body_seeded) so a
                 // leading `otherV()`/`inV()` off `V().outE()` resolves against its origin.
                 self.edge_hop = prev_edge_hop;
+                // An aggregate-terminal body ALWAYS produces one value per element, so the
+                // identity fallback never fires — lower straight to the per-element
+                // aggregate projection (`optional(count())` → `[1,1,…]`, not the whole-
+                // stream `[6, …source…]`).
+                if let Some(agg) = self.try_per_element_agg(from, slots)? {
+                    self.expect(&Tok::RParen)?;
+                    let p = plan.project(vec![("optional".to_string(), agg)]);
+                    self.current = 0;
+                    self.slots = 1;
+                    self.edge_hop = None;
+                    return Ok(p);
+                }
                 // The fallback fires where the body produced NOTHING — a correlated
                 // EXISTS over the body. The general EXISTS eval inserts a provenance
                 // column at slot `slots`, which would shift a multi-hop body's
@@ -1848,6 +1860,28 @@ impl Parser {
                 let mut prior: Option<Expr> = None; // OR of the earlier branches' existence
                 let mut any_edge = false; // an edge-hop body → coalesce yields an edge frontier
                 loop {
+                    // An aggregate-terminal arm (`[<hop>.][values('k').](count|fold|sum|
+                    // min|max|mean)()`) produces EXACTLY ONE value per incoming element, so
+                    // per TinkerPop it fires wherever no earlier arm did. Lower it to a
+                    // correlated per-outer-row aggregate PROJECTION (count of the self-row is
+                    // 1, fold is `[self]`, `out().count()` is the per-element out-degree) —
+                    // NOT a whole-stream reducing body, which would collapse the whole batch
+                    // to a single number (`coalesce(count())` → `[3]` instead of `[1,1,1]`).
+                    if let Some(agg) = self.try_per_element_agg(from, slots)? {
+                        let seed = match &prior {
+                            None => Plan::Row,
+                            Some(p) => Plan::Row.filter(Expr::Not(Box::new(p.clone()))),
+                        };
+                        let body = seed.project(vec![("coalesce".to_string(), agg)]);
+                        bodies.push(body.reconverge(0));
+                        // Always fires where reached → later arms are unreachable.
+                        prior = Some(Expr::Lit(Value::Bool(true)));
+                        if self.peek() == Some(&Tok::Comma) {
+                            self.bump();
+                            continue;
+                        }
+                        break;
+                    }
                     if self.peek_leading_is_edge() {
                         any_edge = true;
                     }
@@ -2324,16 +2358,34 @@ impl Parser {
                 }
                 // General: THEN guarded by the cond, ELSE by its negation (or, if the else
                 // arm is absent, implicit identity — the source element). Both reconverge.
-                let (then_body, then_oc, _os) =
-                    self.parse_sub_body_seeded(Plan::Row.filter(guard.clone()), from, slots)?;
+                // An aggregate-terminal arm (`count()`/`fold()`/…) reduces PER ELEMENT under
+                // choose (unlike union's whole-stream), so lower it to a correlated per-row
+                // aggregate projection rather than a whole-stream reducing body.
+                let then_body = if let Some(agg) = self.try_per_element_agg(from, slots)? {
+                    Plan::Row
+                        .filter(guard.clone())
+                        .project(vec![("choose".to_string(), agg)])
+                        .reconverge(0)
+                } else {
+                    let (b, oc, _os) =
+                        self.parse_sub_body_seeded(Plan::Row.filter(guard.clone()), from, slots)?;
+                    b.reconverge(oc)
+                };
                 let else_arm = if self.peek() == Some(&Tok::Comma) {
                     self.bump();
-                    let (else_body, else_oc, _os) = self.parse_sub_body_seeded(
-                        Plan::Row.filter(Expr::Not(Box::new(guard))),
-                        from,
-                        slots,
-                    )?;
-                    else_body.reconverge(else_oc)
+                    if let Some(agg) = self.try_per_element_agg(from, slots)? {
+                        Plan::Row
+                            .filter(Expr::Not(Box::new(guard)))
+                            .project(vec![("choose".to_string(), agg)])
+                            .reconverge(0)
+                    } else {
+                        let (else_body, else_oc, _os) = self.parse_sub_body_seeded(
+                            Plan::Row.filter(Expr::Not(Box::new(guard))),
+                            from,
+                            slots,
+                        )?;
+                        else_body.reconverge(else_oc)
+                    }
                 } else {
                     Plan::Row
                         .filter(Expr::Not(Box::new(guard)))
@@ -2343,7 +2395,7 @@ impl Parser {
                 self.current = 0;
                 self.slots = 1;
                 self.edge_hop = None; // the reconverged frontier is not a just-hopped edge
-                plan.branch(vec![then_body.reconverge(then_oc), else_arm])
+                plan.branch(vec![then_body, else_arm])
             }
             "and" | "or" => {
                 // and(f1, f2, …) / or(f1, f2, …): each child is an element filter
@@ -5634,64 +5686,183 @@ impl Parser {
         Ok((body, out_current, out_slots))
     }
 
-    /// Look ahead — WITHOUT consuming — for a coalesce/branch body's leading navigating
-    /// hop `[__.](out|in|both)('L', …)`, returning its `(direction, edge labels)`. Used
-    /// to form a body's existence guard before parsing it. `None` when the body does not
-    /// start with a hop (a value body such as `constant(v)` always produces output).
-    /// Parse a PER-ELEMENT `[__.](out|in|both)('L'…).count()` branch body, returning a
-    /// `Row`-projected `CountSubquery` (one count per input row). Returns `None` with the
-    /// cursor unchanged when the body is not that shape. Retained for the coalesce
-    /// per-element-aggregate fix (union is now whole-stream and no longer uses it).
-    #[allow(dead_code)]
-    fn try_count_body(&mut self, from: usize, width: usize) -> Result<Option<Plan>, String> {
+    /// Peek-parse a per-element aggregate-terminal branch arm for coalesce/choose/
+    /// optional (NOT union, which is whole-stream): an optional single navigating hop,
+    /// an optional `values('k')`, then `count`/`fold`/`sum`/`min`/`max`/`mean`, arm-
+    /// terminal (`,`/`)`). Returns the correlated per-outer-row aggregate expression —
+    /// one value per incoming element (bare `count()` counts the self-row → 1, bare
+    /// `fold()` collects the self-row → `[self]`, `out().count()` is the per-element
+    /// out-degree). Returns `None` with the cursor restored when the arm is not that
+    /// shape, so it falls through to the whole-stream branch body.
+    fn try_per_element_agg(&mut self, from: usize, width: usize) -> Result<Option<Expr>, String> {
         let save = self.pos;
-        let mut p = self.pos;
-        if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
-            p += 1;
-            if self.toks.get(p) == Some(&Tok::Dot) {
-                p += 1;
-            }
-        }
-        let dir = match self.toks.get(p) {
-            Some(Tok::Ident(s)) => match s.to_ascii_lowercase().as_str() {
-                "out" => Dir::Out,
-                "in" => Dir::In,
-                "both" => Dir::Both,
-                _ => return Ok(None),
-            },
-            _ => return Ok(None),
-        };
-        // Consume `[__.]<hop>(labels).count()`, bailing (cursor restored) on any mismatch.
         if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
             self.bump();
-            self.expect(&Tok::Dot)?;
-        }
-        self.ident()?; // hop (dir already resolved)
-        self.expect(&Tok::LParen)?;
-        let mut labels: Vec<String> = Vec::new();
-        if matches!(self.peek(), Some(Tok::Str(_))) {
-            labels.push(self.str_arg()?);
-            while self.peek() == Some(&Tok::Comma) {
+            if self.peek() == Some(&Tok::Dot) {
                 self.bump();
-                labels.push(self.str_arg()?);
             }
         }
-        self.expect(&Tok::RParen)?;
-        let is_count = self.peek() == Some(&Tok::Dot)
-            && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("count"));
-        if !is_count {
+        // Optional single navigating hop; else reduce over the element itself. The
+        // neighbour lands one past the provenance column (inserted at `width`), mirroring
+        // `project_by_body`.
+        let hop_dir = match self.peek() {
+            Some(Tok::Ident(s)) => match s.to_ascii_lowercase().as_str() {
+                "out" => Some((Dir::Out, false)),
+                "in" => Some((Dir::In, false)),
+                "both" => Some((Dir::Both, false)),
+                "oute" => Some((Dir::Out, true)),
+                "ine" => Some((Dir::In, true)),
+                "bothe" => Some((Dir::Both, true)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let (mut body, landed) = if let Some((dir, is_edge)) = hop_dir {
+            self.bump();
+            if self.expect(&Tok::LParen).is_err() {
+                self.pos = save;
+                return Ok(None);
+            }
+            let mut labels: Vec<String> = Vec::new();
+            if matches!(self.peek(), Some(Tok::Str(_))) {
+                labels.push(self.str_arg()?);
+                while self.peek() == Some(&Tok::Comma) {
+                    self.bump();
+                    labels.push(self.str_arg()?);
+                }
+            }
+            if self.expect(&Tok::RParen).is_err() {
+                self.pos = save;
+                return Ok(None);
+            }
+            if self.peek() != Some(&Tok::Dot) {
+                self.pos = save;
+                return Ok(None);
+            }
+            self.bump();
+            let b = if is_edge {
+                Plan::Row.expand_edge_gremlin(from, dir, &labels)
+            } else {
+                Plan::Row.expand(from, dir, &labels)
+            };
+            (b, width + 1)
+        } else {
+            (Plan::Row, from)
+        };
+        // Optional single-key `values('k')` before the reducer.
+        let mut val_key: Option<String> = None;
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("values")) {
+            self.bump();
+            if self.expect(&Tok::LParen).is_err() {
+                self.pos = save;
+                return Ok(None);
+            }
+            if !matches!(self.peek(), Some(Tok::Str(_))) {
+                self.pos = save;
+                return Ok(None);
+            }
+            let k = self.str_arg()?;
+            // A multi-key values() is not a single scalar — bail.
+            if self.peek() == Some(&Tok::Comma) || self.expect(&Tok::RParen).is_err() {
+                self.pos = save;
+                return Ok(None);
+            }
+            if self.peek() != Some(&Tok::Dot) {
+                self.pos = save;
+                return Ok(None);
+            }
+            self.bump();
+            val_key = Some(k);
+        }
+        let reducer = match self.peek() {
+            Some(Tok::Ident(s)) => s.to_ascii_lowercase(),
+            _ => {
+                self.pos = save;
+                return Ok(None);
+            }
+        };
+        if !matches!(
+            reducer.as_str(),
+            "count" | "fold" | "sum" | "min" | "max" | "mean"
+        ) {
             self.pos = save;
             return Ok(None);
         }
-        self.expect(&Tok::Dot)?;
-        self.ident()?; // count
-        self.expect(&Tok::LParen)?;
-        self.expect(&Tok::RParen)?;
-        let count = Expr::CountSubquery {
-            body: Box::new(Plan::Row.expand(from, dir, &labels)),
-            outer_width: width,
+        self.bump();
+        // Only the nullary reducer form is a per-element scalar (`fold(seed, fn)` etc.
+        // are not) — require exactly `()` then an arm terminator.
+        if self.expect(&Tok::LParen).is_err() || self.peek() != Some(&Tok::RParen) {
+            self.pos = save;
+            return Ok(None);
+        }
+        self.bump();
+        if !matches!(self.peek(), Some(&Tok::Comma) | Some(&Tok::RParen)) {
+            self.pos = save;
+            return Ok(None);
+        }
+        let expr = match reducer.as_str() {
+            "count" => {
+                if let Some(k) = &val_key {
+                    body = body.filter(Expr::PropertyExists {
+                        slot: landed,
+                        key: k.clone(),
+                    });
+                }
+                Expr::CountSubquery {
+                    body: Box::new(body),
+                    outer_width: width,
+                }
+            }
+            "fold" => {
+                let scalar = match val_key {
+                    Some(k) => {
+                        body = body.filter(Expr::PropertyExists {
+                            slot: landed,
+                            key: k.clone(),
+                        });
+                        Expr::Prop {
+                            slot: landed,
+                            key: k,
+                        }
+                    }
+                    None => Expr::Slot(landed),
+                };
+                Expr::CollectSubquery {
+                    body: Box::new(body),
+                    scalar: Box::new(scalar),
+                    outer_width: width,
+                }
+            }
+            other => {
+                // sum/min/max/mean need a numeric scalar — a `values('k')` to reduce.
+                // Without one (reducing over a node/edge) there is no per-element scalar;
+                // let it fall through to the whole-stream body.
+                let Some(k) = val_key else {
+                    self.pos = save;
+                    return Ok(None);
+                };
+                let func = match other {
+                    "sum" => AggFn::Sum,
+                    "min" => AggFn::Min,
+                    "max" => AggFn::Max,
+                    _ => AggFn::Avg,
+                };
+                body = body.filter(Expr::PropertyExists {
+                    slot: landed,
+                    key: k.clone(),
+                });
+                Expr::AggSubquery {
+                    body: Box::new(body),
+                    scalar: Box::new(Expr::Prop {
+                        slot: landed,
+                        key: k,
+                    }),
+                    func,
+                    outer_width: width,
+                }
+            }
         };
-        Ok(Some(Plan::Row.project(vec![("count".to_string(), count)])))
+        Ok(Some(expr))
     }
 
     /// True when the coalesce body ahead starts with an element FILTER

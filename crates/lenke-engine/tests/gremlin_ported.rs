@@ -9886,3 +9886,88 @@ fn a_path_reading_step_inside_a_container_still_tracks_the_path() {
     // stays green AND flips the day the feature lands.
     assert!(rejects("g.V().repeat(__.both().simplePath()).times(3).count()"), "expected the engine to reject a_path_reading_step_inside_a_container_still_tracks_the_path");
 }
+
+// ── per-element aggregate arms in coalesce/choose/optional ────────────────────
+// A count()/fold()/sum() arm of coalesce/choose/optional reduces PER ELEMENT (each
+// arm runs on a single traverser), unlike union's WHOLE-STREAM barriers. Matches the
+// pure-TS engine (the byte-identity target); verified against it directly. Order is
+// unspecified, so numeric arms are compared as a sorted multiset.
+fn sorted_nums(rows: Vec<GVal>) -> Vec<f64> {
+    let mut ns: Vec<f64> = rows
+        .into_iter()
+        .map(|g| match g {
+            GVal::Num(n) => n,
+            other => panic!("expected a number, got {other:?}"),
+        })
+        .collect();
+    ns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ns
+}
+
+#[test]
+fn coalesce_bare_count_is_one_per_element() {
+    let mut g = modern();
+    // Six vertices, each counting only itself → six 1s (NOT a whole-stream [6]).
+    assert_eq!(
+        sorted_nums(run_query("g.V().coalesce(count())", &mut g)),
+        vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    );
+}
+
+#[test]
+fn coalesce_hop_count_is_per_element_out_degree() {
+    let mut g = modern();
+    // Per-element out-degree: {marko:3, josh:2, peter:1, vadas:0, lop:0, ripple:0}
+    // (NOT a whole-stream total of 6).
+    assert_eq!(
+        sorted_nums(run_query("g.V().coalesce(out().count())", &mut g)),
+        vec![0.0, 0.0, 0.0, 1.0, 2.0, 3.0]
+    );
+}
+
+#[test]
+fn coalesce_first_hop_then_count_falls_through_per_element() {
+    let mut g = modern();
+    // marko's two KNOWS neighbours fire arm 1; the other five vertices have no
+    // outgoing KNOWS, so arm 2 counts each alone → 1. Two elements + five 1s.
+    let rows = run_query("g.V().coalesce(out('KNOWS'), count())", &mut g);
+    let ones = rows
+        .iter()
+        .filter(|g| matches!(g, GVal::Num(n) if *n == 1.0))
+        .count();
+    let nodes = rows.iter().filter(|g| matches!(g, GVal::Node(_))).count();
+    assert_eq!(ones, 5, "five no-KNOWS vertices each count themselves");
+    assert_eq!(nodes, 2, "marko's two KNOWS neighbours");
+}
+
+#[test]
+fn optional_bare_count_is_one_per_element() {
+    let mut g = modern();
+    // A count() body always produces one value per element, so the identity fallback
+    // never fires: six 1s, not a whole-stream [6] followed by the source vertices.
+    assert_eq!(
+        sorted_nums(run_query("g.V().optional(count())", &mut g)),
+        vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    );
+}
+
+#[test]
+fn choose_routes_each_element_to_a_per_element_aggregate() {
+    let mut g = modern();
+    // has('age') routes the 4 PERSON vertices to count() (→ 1 each) and the 2 SOFTWARE
+    // vertices to fold() (→ a one-element list each). Whole-stream would give [4, [..2..]].
+    let rows = run_query("g.V().choose(has('age'), count(), fold())", &mut g);
+    let ones = rows
+        .iter()
+        .filter(|g| matches!(g, GVal::Num(n) if *n == 1.0))
+        .count();
+    let singleton_lists = rows
+        .iter()
+        .filter(|g| matches!(g, GVal::List(xs) if xs.len() == 1))
+        .count();
+    assert_eq!(ones, 4, "four PERSON vertices each count themselves");
+    assert_eq!(
+        singleton_lists, 2,
+        "two SOFTWARE vertices each fold to [self]"
+    );
+}
