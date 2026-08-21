@@ -33,21 +33,34 @@
 //! - *Unspecified order* — union-branch interleave and multi-key `values()` flatten
 //!   compare as a multiset (`bag()`).
 //!
-//! **Left RED as genuine engine bugs** (real correctness gaps to fix in the engine,
-//! NOT papered over — each fails with a clear diff):
-//! - *Cross-/mixed-type predicates don't fault* — `is(gt(5))` / `has(k, gt(5))` /
-//!   `order()` over mixed types FILTER or SORT instead of throwing (contra the stated
-//!   cross-type policy). (6 tests)
-//! - *Path-uniqueness filters wrong* — `simplePath()` does not drop revisits and
-//!   `cyclicPath()` returns nothing on several shapes. (8)
-//! - *Writes/mutations differ* — a builder-path `addV().property()` does not persist;
-//!   `drop()` does not cascade incident edges; a live edge `drop()` leaves the index
-//!   count stale; malformed `addV`/`property` names are not rejected. (6)
-//! - *`properties()` yields the vertex*, not core's `Property(owner,key,value)` (the
-//!   engine has no `Property` value). (4)
-//! - *Misc* — a multi-label edge counts 0 not 1; `group().by().by(sum)` off a frontier
-//!   yields nothing; unknown `math()` function not rejected; a repeat-budget guard;
-//!   `where().otherV().hasId()`. (5)
+//! - *order() total order* — `order()` over mixed types sorts by the engine's TOTAL
+//!   order (numbers before strings) rather than throwing; deterministic + byte-identical
+//!   to TS. Re-asserted.
+//! - *properties()* — the engine has no `Property` value type; the value is read via
+//!   `properties('k').value()` (single-key), and multi/all-key `.value()` is deferred.
+//!   Re-asserted to that contract.
+//!
+//! **FIXED in the engine** (real production bug the salvage surfaced):
+//! - *Optimizer dropped a path filter* — `optimize_indexed` pushed a path-reading
+//!   predicate (`simplePath`'s `not(path_has_dup(Path))`) below the Expands that build
+//!   the path, silently no-op-ing `simplePath()`/`cyclicPath()` on every production
+//!   path. Fixed in `opt.rs` (`max_slot` of a path expr → `usize::MAX`); the 8
+//!   simplePath/cyclicPath cases now pass.
+//! - The `drop()` cases were HARNESS bugs (total-slot `node_count` vs `live_node_count`
+//!   / `E().count()`), not engine bugs — drop tombstones + cascades correctly. Fixed.
+//!
+//! **Still RED (14)** — each needs an engine-intent call (per-language contract vs
+//! bug), NOT papered over:
+//! - *Cross-type Gremlin predicates FILTER, don't throw* — `is(gt(5))`/`has(k, gt(5))`
+//!   over incomparable types return empty where GQL (and the stated ordering policy)
+//!   throw. Per-language contract, or a bug? (4)
+//! - *`addV()` emits nothing* — it persists the vertex but returns 0 rows; TinkerPop
+//!   emits the created vertex. Write-result contract question. (1)
+//! - *Genuine bugs to investigate* — a multi-label edge `outE('R')` counts 0 not 1; a
+//!   live edge `drop()` leaves the count stale; `group().by().by(sum)` off a frontier
+//!   yields nothing; unknown `math()` not rejected; a repeat-budget guard;
+//!   `properties(k1,k2)` multi-key value; `where().otherV().hasId()`;
+//!   `property()` on vertices. (9)
 
 #![allow(clippy::bool_assert_comparison, clippy::approx_constant)]
 
