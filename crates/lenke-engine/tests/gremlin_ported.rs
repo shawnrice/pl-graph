@@ -10285,3 +10285,30 @@ fn per_element_aggregate_arm_respects_the_frontier_type() {
     // out().count() on a vertex frontier stays valid.
     assert!(lenke_engine::gremlin::parse("g.V().coalesce(out('KNOWS').count(), id())").is_ok());
 }
+
+#[test]
+fn choose_condition_ending_in_an_aggregate_is_always_true() {
+    let mut g = modern();
+    let count = |q: &str, g: &mut EngineGraph| match run_query(q, g).as_slice() {
+        [GVal::Num(n)] => *n as i64,
+        other => panic!("expected one count, got {other:?}"),
+    };
+    // count()/has(…).count() ALWAYS emit a value, so the choose condition is unconditionally
+    // true → the then-arm for every element. native parsed a bare count() cond as a wrong value
+    // predicate (routing to else) and evaluated a has(…).count() cond as an EXISTS over an
+    // Aggregate body (collapsed to one row, losing per-outer provenance).
+    assert_eq!(
+        count(
+            "g.V().choose(count(), out('KNOWS'), in('KNOWS')).count()",
+            &mut g
+        ),
+        2
+    );
+    assert_eq!(
+        count(
+            "g.V().choose(has('name', lte('a')).count(), out('KNOWS'), in('KNOWS')).count()",
+            &mut g
+        ),
+        2
+    );
+}

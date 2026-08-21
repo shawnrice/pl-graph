@@ -2618,26 +2618,74 @@ impl Parser {
                 // "produces output" = a correlated EXISTS. Try the predicate first;
                 // restore and take the EXISTS path only when it is not a predicate.
                 let save = self.pos;
-                let (guard, cond_is_filter): (Expr, bool) = match self.child_filter_expr() {
-                    // A complete predicate cond is followed by the `,` before the then-arm.
-                    // If the cursor is still at `.` (`has('age').count()`, `outV().has(…)`),
-                    // child_filter_expr consumed only a PREFIX — the cond is a sub-traversal
-                    // whose truth is "produces output", so fall through to the EXISTS path.
-                    Ok(pred) if self.peek() == Some(&Tok::Comma) => (pred, true),
-                    _ => {
-                        self.pos = save;
-                        // Reserve slot `slots` for the provenance column the EXISTS eval
-                        // inserts (parse at width `slots + 1`) so a multi-hop cond's
-                        // intermediate slots stay aligned.
-                        let (cond_body, _oc, _os) =
-                            self.parse_sub_body_seeded(Plan::Row, from, slots + 1)?;
-                        (
-                            Expr::Exists {
-                                body: Box::new(cond_body),
-                                outer_width: slots,
-                            },
-                            false,
-                        )
+                // A cond whose LAST step is a nullary aggregate (`count()`, `has(…).count()`)
+                // ALWAYS emits a value, so its truth is unconditionally true → the then-arm for
+                // every element. Detect it before child_filter_expr (which would parse a bare
+                // `count()` as a wrong value predicate) by scanning to the top-level `,`.
+                let cond_agg_comma = {
+                    let mut p = self.pos;
+                    let mut depth = 0i32;
+                    loop {
+                        match self.toks.get(p) {
+                            Some(Tok::LParen) => depth += 1,
+                            Some(Tok::RParen) => {
+                                if depth == 0 {
+                                    break None;
+                                }
+                                depth -= 1;
+                            }
+                            Some(Tok::Comma) if depth == 0 => break Some(p),
+                            None => break None,
+                            _ => {}
+                        }
+                        p += 1;
+                    }
+                    .filter(|&c| {
+                        c >= 3
+                            && self.toks.get(c - 1) == Some(&Tok::RParen)
+                            && self.toks.get(c - 2) == Some(&Tok::LParen)
+                            && matches!(self.toks.get(c - 3), Some(Tok::Ident(s)) if {
+                                let l = s.to_ascii_lowercase();
+                                matches!(l.as_str(), "count" | "fold" | "sum" | "min" | "max" | "mean")
+                            })
+                    })
+                };
+                if let Some(comma) = cond_agg_comma {
+                    self.pos = comma; // consume the always-true cond
+                }
+                let (guard, cond_is_filter): (Expr, bool) = if cond_agg_comma.is_some() {
+                    (Expr::Lit(Value::Bool(true)), false)
+                } else {
+                    match self.child_filter_expr() {
+                        // A complete predicate cond is followed by the `,` before the then-arm.
+                        // If the cursor is still at `.` (`has('age').count()`, `outV().has(…)`),
+                        // child_filter_expr consumed only a PREFIX — the cond is a sub-traversal
+                        // whose truth is "produces output", so fall through to the EXISTS path.
+                        Ok(pred) if self.peek() == Some(&Tok::Comma) => (pred, true),
+                        _ => {
+                            self.pos = save;
+                            // Reserve slot `slots` for the provenance column the EXISTS eval
+                            // inserts (parse at width `slots + 1`) so a multi-hop cond's
+                            // intermediate slots stay aligned.
+                            let (cond_body, _oc, _os) =
+                                self.parse_sub_body_seeded(Plan::Row, from, slots + 1)?;
+                            // A cond that ends in an AGGREGATE (`count()`, `has(…).count()`) ALWAYS
+                            // emits a value, so its truth is unconditionally true → the then-arm for
+                            // every element (matches TinkerPop/TS). EXISTS over an Aggregate body is
+                            // also wrong here: the aggregate collapses to one row, losing the
+                            // per-outer provenance, so it fired for only one element.
+                            if matches!(cond_body, Plan::Aggregate { .. }) {
+                                (Expr::Lit(Value::Bool(true)), false)
+                            } else {
+                                (
+                                    Expr::Exists {
+                                        body: Box::new(cond_body),
+                                        outer_width: slots,
+                                    },
+                                    false,
+                                )
+                            }
+                        }
                     }
                 };
                 self.expect(&Tok::Comma)?;
