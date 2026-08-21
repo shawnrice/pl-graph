@@ -106,7 +106,9 @@ fn core_line_to_engine(line: &str) -> String {
         // multi-label edge round-trips — the engine loader reads it like gql_corpus's.
         m.insert(
             "labels".into(),
-            o.get("labels").cloned().unwrap_or_else(|| serde_json::json!([])),
+            o.get("labels")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
         );
         m.insert("props".into(), props);
         serde_json::Value::Object(m).to_string()
@@ -179,7 +181,10 @@ fn is_bare_edge(m: &[(EngVal, EngVal)]) -> bool {
         })
         .collect();
     keys.len() == m.len()
-        && keys == ["id", "from", "to", "labels", "properties"].into_iter().collect()
+        && keys
+            == ["id", "from", "to", "labels", "properties"]
+                .into_iter()
+                .collect()
 }
 
 fn vertex_ext_id(m: &[(EngVal, EngVal)]) -> String {
@@ -225,7 +230,9 @@ fn to_engval(v: &GVal) -> EngVal {
         GVal::Str(s) => EngVal::Str(s.as_str().into()),
         GVal::List(xs) => EngVal::List(xs.iter().map(to_engval).collect()),
         GVal::Map(m) => EngVal::Map(std::sync::Arc::new(
-            m.iter().map(|(k, v)| (to_engval(k), to_engval(v))).collect(),
+            m.iter()
+                .map(|(k, v)| (to_engval(k), to_engval(v)))
+                .collect(),
         )),
         other => panic!("no engine value for {other:?}"),
     }
@@ -1284,7 +1291,10 @@ fn add_vertex_and_property() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.addV('PERSON').property('name','newbie').property('age',40).values('name')"), "expected the engine to reject add_vertex_and_property");
+    assert!(
+        rejects("g.addV('PERSON').property('name','newbie').property('age',40).values('name')"),
+        "expected the engine to reject add_vertex_and_property"
+    );
 }
 
 // ===== null is a first-class property value (deliberate TinkerPop divergence) =====
@@ -1421,7 +1431,10 @@ fn drop_cannot_be_spoofed_by_a_project_map() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V().project('key').by(constant('age')).drop()"), "expected the engine to reject drop_cannot_be_spoofed_by_a_project_map");
+    assert!(
+        rejects("g.V().project('key').by(constant('age')).drop()"),
+        "expected the engine to reject drop_cannot_be_spoofed_by_a_project_map"
+    );
 }
 
 #[test]
@@ -1915,13 +1928,15 @@ fn assert_emap(got: &GVal, want: &[(&str, GVal)]) {
 #[allow(dead_code)]
 fn map_get_num(r: &[GVal], key: &GVal) -> Option<f64> {
     match r.first() {
-        Some(GVal::Map(entries)) => entries
-            .iter()
-            .find(|(k, _)| *k == *key)
-            .map(|(_, v)| match v {
-                GVal::Num(n) => *n,
-                other => panic!("expected num value, got {other:?}"),
-            }),
+        Some(GVal::Map(entries)) => {
+            entries
+                .iter()
+                .find(|(k, _)| *k == *key)
+                .map(|(_, v)| match v {
+                    GVal::Num(n) => *n,
+                    other => panic!("expected num value, got {other:?}"),
+                })
+        }
         other => panic!("expected map, got {other:?}"),
     }
 }
@@ -3000,7 +3015,9 @@ fn results_json(vals: Vec<GVal>) -> String {
     // the byte format (string escaping, `js_number`) is the engine's real output.
     let rows = lenke_engine::exec::Rows {
         names: vec!["value".to_string()],
-        rows: lenke_engine::exec::Flat::from_rows(vals.iter().map(|v| vec![to_engval(v)]).collect()),
+        rows: lenke_engine::exec::Flat::from_rows(
+            vals.iter().map(|v| vec![to_engval(v)]).collect(),
+        ),
     };
     lenke_engine::json::gremlin_results_json(&rows)
 }
@@ -3713,7 +3730,10 @@ fn p1_not_predicate_inside_has() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V().has('name',not(within('vadas','marko'))).values('name')"), "expected the engine to reject p1_not_predicate_inside_has");
+    assert!(
+        rejects("g.V().has('name',not(within('vadas','marko'))).values('name')"),
+        "expected the engine to reject p1_not_predicate_inside_has"
+    );
 }
 
 #[test]
@@ -4581,7 +4601,10 @@ fn p2_adde_to_subplan() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V('1').addE('NEMESIS').to(__.V('6'))"), "expected the engine to reject p2_adde_to_subplan");
+    assert!(
+        rejects("g.V('1').addE('NEMESIS').to(__.V('6'))"),
+        "expected the engine to reject p2_adde_to_subplan"
+    );
 }
 
 #[test]
@@ -4589,7 +4612,10 @@ fn p2_adde_from_tag() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V('1').as('start').out('KNOWS').addE('META').from('start').to(__.V('6'))"), "expected the engine to reject p2_adde_from_tag");
+    assert!(
+        rejects("g.V('1').as('start').out('KNOWS').addE('META').from('start').to(__.V('6'))"),
+        "expected the engine to reject p2_adde_from_tag"
+    );
 }
 
 #[test]
@@ -4597,7 +4623,10 @@ fn p2_adde_with_property() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V('1').addE('KNOWS').to(__.V('6')).property('weight', 0.42)"), "expected the engine to reject p2_adde_with_property");
+    assert!(
+        rejects("g.V('1').addE('KNOWS').to(__.V('6')).property('weight', 0.42)"),
+        "expected the engine to reject p2_adde_with_property"
+    );
 }
 
 #[test]
@@ -4605,7 +4634,10 @@ fn p2_add_e_unresolvable_endpoint_faults() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V('1').addE('NEMESIS').to(__.V('999'))"), "expected the engine to reject p2_add_e_unresolvable_endpoint_faults");
+    assert!(
+        rejects("g.V('1').addE('NEMESIS').to(__.V('999'))"),
+        "expected the engine to reject p2_add_e_unresolvable_endpoint_faults"
+    );
 }
 
 #[test]
@@ -4634,7 +4666,10 @@ fn p2_fail_throws_with_message() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V().hasLabel('PERSON').has('name', eq('peter')).fold().fail('Test Fail')"), "expected the engine to reject p2_fail_throws_with_message");
+    assert!(
+        rejects("g.V().hasLabel('PERSON').has('name', eq('peter')).fold().fail('Test Fail')"),
+        "expected the engine to reject p2_fail_throws_with_message"
+    );
 }
 
 #[test]
@@ -4642,7 +4677,10 @@ fn p2_fail_no_throw_on_empty_stream() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V().has('name', eq('nobody')).fail('should not fire')"), "expected the engine to reject p2_fail_no_throw_on_empty_stream");
+    assert!(
+        rejects("g.V().has('name', eq('nobody')).fail('should not fire')"),
+        "expected the engine to reject p2_fail_no_throw_on_empty_stream"
+    );
 }
 
 #[test]
@@ -4650,7 +4688,10 @@ fn p2_fail_default_message() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V().fail()"), "expected the engine to reject p2_fail_default_message");
+    assert!(
+        rejects("g.V().fail()"),
+        "expected the engine to reject p2_fail_default_message"
+    );
 }
 
 #[test]
@@ -4947,7 +4988,10 @@ fn p3_subplan_repeat_body_adds_vertices() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V('1').repeat(__.addV('REP').property('via', 'rep')).times(2)"), "expected the engine to reject p3_subplan_repeat_body_adds_vertices");
+    assert!(
+        rejects("g.V('1').repeat(__.addV('REP').property('via', 'rep')).times(2)"),
+        "expected the engine to reject p3_subplan_repeat_body_adds_vertices"
+    );
 }
 
 #[test]
@@ -4955,7 +4999,10 @@ fn p3_subplan_map_body_adds_vertices() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V().hasLabel('PERSON').map(__.addV('SHADOW').property('via', 'map'))"), "expected the engine to reject p3_subplan_map_body_adds_vertices");
+    assert!(
+        rejects("g.V().hasLabel('PERSON').map(__.addV('SHADOW').property('via', 'map'))"),
+        "expected the engine to reject p3_subplan_map_body_adds_vertices"
+    );
 }
 
 #[test]
@@ -5000,10 +5047,22 @@ fn p3_union_fold_fold_unfold_interleaved() {
     assert_eq!(
         bag(r),
         bag(vec![
-            "marko".into(), "marko".into(), "vadas".into(), "vadas".into(), "josh".into(),
-            "josh".into(), "peter".into(), "peter".into(), "lop".into(), "lop".into(),
-            "ripple".into(), "ripple".into(),
-        ].into_iter().map(GVal::Str).collect())
+            "marko".into(),
+            "marko".into(),
+            "vadas".into(),
+            "vadas".into(),
+            "josh".into(),
+            "josh".into(),
+            "peter".into(),
+            "peter".into(),
+            "lop".into(),
+            "lop".into(),
+            "ripple".into(),
+            "ripple".into(),
+        ]
+        .into_iter()
+        .map(GVal::Str)
+        .collect())
     );
 }
 
@@ -5289,7 +5348,10 @@ fn p3_drop_vertex_cascades_incident_edges() {
     let edges_before = one_num(dual::g().E().count().run(&mut g));
     // marko (id 1) has 3 incident edges.
     let _ = parse("g.V('1').drop()").unwrap().run(&mut g);
-    assert_eq!(one_num(dual::g().E().count().run(&mut g)), edges_before - 3.0);
+    assert_eq!(
+        one_num(dual::g().E().count().run(&mut g)),
+        edges_before - 3.0
+    );
 }
 
 #[test]
@@ -5823,7 +5885,10 @@ fn p4_map_drops_empty_subplan() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V().map(outE('CREATED'))"), "expected the engine to reject p4_map_drops_empty_subplan");
+    assert!(
+        rejects("g.V().map(outE('CREATED'))"),
+        "expected the engine to reject p4_map_drops_empty_subplan"
+    );
 }
 
 #[test]
@@ -5997,7 +6062,10 @@ fn p4_mut_repeat_addv_times() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V('1').repeat(addV('PING')).times(3)"), "expected the engine to reject p4_mut_repeat_addv_times");
+    assert!(
+        rejects("g.V('1').repeat(addV('PING')).times(3)"),
+        "expected the engine to reject p4_mut_repeat_addv_times"
+    );
 }
 
 #[test]
@@ -6005,7 +6073,10 @@ fn p4_mut_repeat_addv_property_chain() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V('1').repeat(addV('CHAIN').property('seq', 1)).times(2)"), "expected the engine to reject p4_mut_repeat_addv_property_chain");
+    assert!(
+        rejects("g.V('1').repeat(addV('CHAIN').property('seq', 1)).times(2)"),
+        "expected the engine to reject p4_mut_repeat_addv_property_chain"
+    );
 }
 
 #[test]
@@ -6013,7 +6084,10 @@ fn p4_mut_map_addv_property() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V().hasLabel('PERSON').map(addV('SHADOW').property('via', 'map'))"), "expected the engine to reject p4_mut_map_addv_property");
+    assert!(
+        rejects("g.V().hasLabel('PERSON').map(addV('SHADOW').property('via', 'map'))"),
+        "expected the engine to reject p4_mut_map_addv_property"
+    );
 }
 
 #[test]
@@ -6021,7 +6095,10 @@ fn p4_mut_union_addv() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V('1').union(addV('A'), addV('B'))"), "expected the engine to reject p4_mut_union_addv");
+    assert!(
+        rejects("g.V('1').union(addV('A'), addV('B'))"),
+        "expected the engine to reject p4_mut_union_addv"
+    );
 }
 
 #[test]
@@ -6029,7 +6106,10 @@ fn p4_mut_choose_gates_addv() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V().hasLabel('PERSON').choose(identity(), addV('VISITED'))"), "expected the engine to reject p4_mut_choose_gates_addv");
+    assert!(
+        rejects("g.V().hasLabel('PERSON').choose(identity(), addV('VISITED'))"),
+        "expected the engine to reject p4_mut_choose_gates_addv"
+    );
 }
 
 #[test]
@@ -6050,7 +6130,10 @@ fn p4_mut_adde_repeat_smoke() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V('1').repeat(addV('CHAIN').property('via', 'repeat')).times(3)"), "expected the engine to reject p4_mut_adde_repeat_smoke");
+    assert!(
+        rejects("g.V('1').repeat(addV('CHAIN').property('via', 'repeat')).times(3)"),
+        "expected the engine to reject p4_mut_adde_repeat_smoke"
+    );
 }
 
 // ==== 48 tests from step_tests_5.rs ====
@@ -6330,7 +6413,9 @@ fn p5_properties_multiple_keys_flatten() {
     // only the FIRST key's value (a known limitation — the full flatten needs the
     // Property objects the engine intentionally doesn't model).
     assert_eq!(
-        ordered(q_eids(g().V().has_id(&["1"]).properties(&["name", "age"]).value())),
+        ordered(q_eids(
+            g().V().has_id(&["1"]).properties(&["name", "age"]).value()
+        )),
         vec!["marko"]
     );
 }
@@ -6339,7 +6424,9 @@ fn p5_properties_multiple_keys_flatten() {
 fn p5_properties_no_keys_yields_all() {
     // Same: reading VALUES across an all-key `properties()` needs the `Property` stream
     // the engine lacks — `.value()` after a keyless `properties()` is deferred.
-    assert!(rejects(&g().V().has_id(&["3"]).properties(&[]).value().query()));
+    assert!(rejects(
+        &g().V().has_id(&["3"]).properties(&[]).value().query()
+    ));
 }
 
 #[test]
@@ -7050,7 +7137,10 @@ fn p6_path_includes_values() {
     // Deferred Gremlin form (path() over value projections / with by() modulators / a
     // simplePath() repeat body — the engine rejects it). Re-asserted as a rejection so it
     // stays green AND flips the day the feature lands.
-    assert!(rejects("g.V('1').out('KNOWS').values('name').path()"), "expected the engine to reject p6_path_includes_values");
+    assert!(
+        rejects("g.V('1').out('KNOWS').values('name').path()"),
+        "expected the engine to reject p6_path_includes_values"
+    );
 }
 
 #[test]
@@ -7058,7 +7148,10 @@ fn p6_path_multiple_by_round_robin() {
     // Deferred Gremlin form (path() over value projections / with by() modulators / a
     // simplePath() repeat body — the engine rejects it). Re-asserted as a rejection so it
     // stays green AND flips the day the feature lands.
-    assert!(rejects("g.V().out().out().path().by('name').by('age')"), "expected the engine to reject p6_path_multiple_by_round_robin");
+    assert!(
+        rejects("g.V().out().out().path().by('name').by('age')"),
+        "expected the engine to reject p6_path_multiple_by_round_robin"
+    );
 }
 
 #[test]
@@ -7444,7 +7537,12 @@ fn p6_optional_nested_path() {
     // Deferred Gremlin form (path() over value projections / with by() modulators / a
     // simplePath() repeat body — the engine rejects it). Re-asserted as a rejection so it
     // stays green AND flips the day the feature lands.
-    assert!(rejects("g.V().hasLabel('PERSON').optional(__.out('KNOWS').optional(__.out('CREATED'))).path()"), "expected the engine to reject p6_optional_nested_path");
+    assert!(
+        rejects(
+            "g.V().hasLabel('PERSON').optional(__.out('KNOWS').optional(__.out('CREATED'))).path()"
+        ),
+        "expected the engine to reject p6_optional_nested_path"
+    );
 }
 
 #[test]
@@ -7506,7 +7604,10 @@ fn p6_addv_no_label() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.addV()"), "expected the engine to reject p6_addv_no_label");
+    assert!(
+        rejects("g.addV()"),
+        "expected the engine to reject p6_addv_no_label"
+    );
 }
 
 #[test]
@@ -7514,7 +7615,10 @@ fn p6_addv_mid_traversal_per_traverser() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
     // rejection so it stays green AND flips the day the feature lands.
-    assert!(rejects("g.V().hasLabel('PERSON').addV('SHADOW')"), "expected the engine to reject p6_addv_mid_traversal_per_traverser");
+    assert!(
+        rejects("g.V().hasLabel('PERSON').addV('SHADOW')"),
+        "expected the engine to reject p6_addv_mid_traversal_per_traverser"
+    );
 }
 
 #[test]
@@ -9372,10 +9476,9 @@ fn a_label_terminal_matches_the_walk_exactly() {
 
 #[test]
 fn a_label_terminal_reports_only_the_first_label() {
-    let mut graph = decode(
-        r#"{"type":"node","id":"a","labels":["First","Second"],"properties":{}}"#,
-    )
-    .expect("fixture decodes");
+    let mut graph =
+        decode(r#"{"type":"node","id":"a","labels":["First","Second"],"properties":{}}"#)
+            .expect("fixture decodes");
 
     // TinkerPop's `label()` is `vertex_labels(i).first()`, not "any label". A
     // lowering that read the whole label list would return both.

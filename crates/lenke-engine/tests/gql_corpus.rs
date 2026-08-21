@@ -360,7 +360,10 @@ fn gql_corpus_engine_matches_snapshot() {
             }
             Some(want) => {
                 if !eq_outcome(want, &got, case.ordered) {
-                    fails.push(format!("{}: engine != snapshot for: {}", case.key, case.query));
+                    fails.push(format!(
+                        "{}: engine != snapshot for: {}",
+                        case.key, case.query
+                    ));
                 }
             }
         }

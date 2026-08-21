@@ -367,7 +367,9 @@ if (WANTED.has('engine') || WANTED.has('ffi')) {
 
 if (WANTED.has('wasm')) {
   if (existsSync(WASM)) {
-    engines.push(nativeEngine('wasm', await createWasmEngineBackend(await Bun.file(WASM).arrayBuffer())));
+    engines.push(
+      nativeEngine('wasm', await createWasmEngineBackend(await Bun.file(WASM).arrayBuffer())),
+    );
   } else {
     console.warn(`skipping wasm: ${WASM} not found — run \`bun run build:wasm\``);
   }

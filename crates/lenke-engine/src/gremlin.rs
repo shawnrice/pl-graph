@@ -1268,7 +1268,9 @@ impl Parser {
             // Update, which no-ops and returns empty.
             Plan::Update { input, ops }
                 if self.current_is_element
-                    && !ops.iter().any(|o| matches!(o, crate::ir::SetOp::Delete { .. })) =>
+                    && !ops
+                        .iter()
+                        .any(|o| matches!(o, crate::ir::SetOp::Delete { .. })) =>
             {
                 Plan::UpdateReturn {
                     input,
@@ -7378,7 +7380,6 @@ mod tests {
     /// path (like `path()`), so they are scoped to pure vertex-hop chains. A 2-hop
     /// `both` walk from a node returns to it on half the paths (the cyclic ones).
     #[test]
-
 
     fn gremlin_simple_and_cyclic_path() {
         let store = social();

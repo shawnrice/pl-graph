@@ -39,7 +39,9 @@ const ENGINE_LIB = new URL(
 const hasLib = existsSync(ENGINE_LIB);
 
 if (!hasLib) {
-  console.warn(`[gql-conformance] skipping: ${ENGINE_LIB} not found — run \`bun run engine:build:rust\`.`);
+  console.warn(
+    `[gql-conformance] skipping: ${ENGINE_LIB} not found — run \`bun run engine:build:rust\`.`,
+  );
 }
 
 const suite = hasLib ? describe : describe.skip;
