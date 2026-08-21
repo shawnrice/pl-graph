@@ -84,7 +84,7 @@ fn arm_always_empty(p: &Plan) -> bool {
     }
 }
 
-fn strip_barrier_arm(body: Plan) -> Option<(Plan, bool)> {
+fn strip_barrier_arm(body: Plan) -> Option<(Plan, bool, Vec<Expr>)> {
     let mut fires = true;
     let mut preds: Vec<Expr> = Vec::new();
     let mut cur = body;
@@ -105,11 +105,21 @@ fn strip_barrier_arm(body: Plan) -> Option<(Plan, bool)> {
                 cur = *input;
             }
             Plan::Row => {
+                // `preds` is outermost-first: the LAST is the seed guard (the caller seeds
+                // `Row.filter(guard)`), the rest are the arm's OWN filters. Those are the arm's
+                // firing condition — a barrier-LED arm (`dedup().has('lang')`) otherwise
+                // defaults `this` to Lit(true), wrongly claiming it always fires and killing a
+                // later arm. Return them so the caller can rebuild `prior`.
+                let arm_filters = if preds.is_empty() {
+                    Vec::new()
+                } else {
+                    preds[..preds.len() - 1].to_vec()
+                };
                 let mut b = Plan::Row;
                 for pred in preds.into_iter().rev() {
                     b = b.filter(pred);
                 }
-                return Some((b, fires));
+                return Some((b, fires, arm_filters));
             }
             // A hop / projection / aggregate / nested branch: not a pure barrier arm.
             _ => return None,
@@ -2120,13 +2130,29 @@ impl Parser {
                     // Strip the identity barriers (yield the element where the filters hold),
                     // and DROP a never-firing arm — matching TinkerPop's per-element branch
                     // (`coalesce(hasLabel('X'), range(0,1))` yields every element, not one).
-                    let (final_body, final_oc, contributes) = if arm_always_empty(&body) {
-                        (Plan::Row, from, false) // a limit(0)/empty-range kills the arm
+                    // `arm_this` is what this arm adds to `prior` (which rows a LATER arm must
+                    // exclude). For a barrier-LED arm it is the arm's own filters, not the
+                    // Lit(true) that `this` defaulted to (`coalesce(dedup().has('lang'), id())`
+                    // otherwise marked arm 1 always-firing and dropped the id() arm).
+                    let (final_body, final_oc, contributes, arm_this) = if arm_always_empty(&body) {
+                        (Plan::Row, from, false, this.clone()) // a limit(0)/empty-range kills it
                     } else {
                         match strip_barrier_arm(body.clone()) {
-                            Some((_, false)) => (Plan::Row, from, false), // never fires per element
-                            Some((stripped, true)) => (stripped, from, true),
-                            None => (body, oc, true),
+                            Some((_, false, _)) => (Plan::Row, from, false, this.clone()), // never fires
+                            Some((stripped, true, _)) => {
+                                // The arm fires where its (filter) body produces a row — a
+                                // DEFINITE `EXISTS` over the stripped body, not the raw filter
+                                // conjunction. A `has('k', pred)` filters absent `k` via a
+                                // three-valued Compare(null,·)=null; negating that for a later
+                                // arm's guard leaves null (dropped), so the later arm wrongly
+                                // saw no rows. EXISTS collapses it to true/false.
+                                let at = Expr::Exists {
+                                    body: Box::new(stripped.clone()),
+                                    outer_width: slots,
+                                };
+                                (stripped, from, true, at)
+                            }
+                            None => (body, oc, true, this.clone()),
                         }
                     };
                     if contributes {
@@ -2136,8 +2162,8 @@ impl Parser {
                         // lineage-preserving, so `coalesce(...).inV().path()` still answers.
                         bodies.push(final_body.reconverge(final_oc));
                         prior = Some(match prior {
-                            None => this,
-                            Some(p) => Expr::Or(Box::new(p), Box::new(this)),
+                            None => arm_this,
+                            Some(p) => Expr::Or(Box::new(p), Box::new(arm_this)),
                         });
                     }
                     if self.peek() == Some(&Tok::Comma) {
@@ -2576,9 +2602,9 @@ impl Parser {
                         return never();
                     }
                     match strip_barrier_arm(b.clone()) {
-                        Some((stripped, true)) => stripped.reconverge(from),
+                        Some((stripped, true, _)) => stripped.reconverge(from),
                         // Never fires per element → the routed element yields nothing.
-                        Some((_, false)) => never(),
+                        Some((_, false, _)) => never(),
                         None => b.reconverge(oc),
                     }
                 };

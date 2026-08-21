@@ -10189,3 +10189,31 @@ fn optional_over_path_does_not_double_emit() {
         vec![GVal::Num(6.0)]
     );
 }
+
+#[test]
+fn coalesce_barrier_led_filter_arm_guards_the_fallback() {
+    let mut g = modern();
+    let count = |q: &str, g: &mut EngineGraph| match run_query(q, g).as_slice() {
+        [GVal::Num(n)] => *n as i64,
+        other => panic!("expected one count, got {other:?}"),
+    };
+    // arm 1 is BARRIER-led (`dedup().has(…)`), so `this` defaulted to Lit(true) and marked it
+    // always-firing, dropping the id() fallback. Its real firing condition is the has() filter;
+    // a definite EXISTS over the stripped body drives `prior` (a raw three-valued Compare would
+    // leave absent-property rows null, so Not(prior) dropped them). Two software fire arm 1, the
+    // four persons (no lang) fall through to id().
+    assert_eq!(
+        count(
+            "g.V().coalesce(dedup().has('lang', gt('')), id()).count()",
+            &mut g
+        ),
+        6
+    );
+    assert_eq!(
+        count(
+            "g.V().coalesce(dedup().hasLabel('SOFTWARE'), id()).count()",
+            &mut g
+        ),
+        6
+    );
+}
