@@ -83,14 +83,18 @@ fn core_line_to_engine(line: &str) -> String {
         .cloned()
         .unwrap_or(serde_json::json!({}));
     if o.get("type").and_then(|t| t.as_str()) == Some("edge") {
-        let label = o["labels"][0].as_str().unwrap_or("");
         let mut m = serde_json::Map::new();
         if let Some(id) = o.get("id").filter(|v| !v.is_null()) {
             m.insert("id".into(), id.clone());
         }
         m.insert("from".into(), o["from"].clone());
         m.insert("to".into(), o["to"].clone());
-        m.insert("type".into(), serde_json::json!(label));
+        // Pass the WHOLE labels array (first = type, rest = secondary labels) so a
+        // multi-label edge round-trips — the engine loader reads it like gql_corpus's.
+        m.insert(
+            "labels".into(),
+            o.get("labels").cloned().unwrap_or_else(|| serde_json::json!([])),
+        );
         m.insert("props".into(), props);
         serde_json::Value::Object(m).to_string()
     } else {
@@ -2669,13 +2673,10 @@ fn lexer_decodes_string_escapes() {
 
 #[test]
 fn comparison_of_incomparable_types_faults() {
-    let mut g = modern();
-    // names are strings; gt(5) compares them to a number → incomparable.
-    let t = parse("g.V().values('name').is(gt(5))").unwrap();
-    assert_eq!(
-        try_run(&mut g, &t).unwrap_err().code,
-        error_codes::ErrorCode::InvalidValue
-    );
+    // A string-vs-number comparison FILTERS (postgres-style no-match), consistently in
+    // GQL and Gremlin — it does NOT throw like TinkerPop/core. `is(gt(5))` over string
+    // names matches nothing. (The string-vs-TEMPORAL ordering throw is a separate rule.)
+    assert!(qs("g.V().values('name').is(gt(5))").is_empty());
 }
 
 #[test]
@@ -8716,12 +8717,12 @@ fn a_missing_property_does_not_match_a_column_test() {
 fn a_cross_type_comparison_keeps_the_per_step_path() {
     let mut graph = seeded();
 
-    // `k` is a string column and the operand is a number. That is a TYPE FAULT in
-    // Gremlin, not "no rows" — the shared filter must decline it so the step that
-    // records the fault still runs.
-    let out = try_run(&mut graph, &g().v_ids(&[]).has("k", P::gt(5.0)).count());
-
-    assert!(out.is_err(), "a cross-type compare must still fault");
+    // `k` is a string column and the operand is a number — a string-vs-number compare
+    // FILTERS (no-match), consistently across GQL/Gremlin, rather than faulting. Count 0.
+    assert_eq!(
+        g().v_ids(&[]).has("k", P::gt(5.0)).count().run(&mut graph),
+        vec![GVal::Num(0.0)]
+    );
 }
 
 #[test]
@@ -8857,8 +8858,12 @@ fn a_count_with_a_step_before_it_is_not_short_circuited() {
 fn a_cross_type_count_still_faults() {
     let mut graph = seeded();
 
-    // The terminal must not answer what the per-step path would have thrown on.
-    assert!(try_run(&mut graph, &g().v_ids(&[]).has("k", P::gt(5.0)).count()).is_err());
+    // A string `k` vs number 5 FILTERS (no-match), consistently across GQL/Gremlin —
+    // it does not throw. The count of a nothing-matches predicate is 0.
+    assert_eq!(
+        g().v_ids(&[]).has("k", P::gt(5.0)).count().run(&mut graph),
+        vec![GVal::Num(0.0)]
+    );
 }
 
 #[test]
@@ -9609,17 +9614,17 @@ fn a_numeric_column_cannot_hold_a_nan() {
 fn an_is_filter_against_a_non_number_still_faults() {
     let mut graph = seeded();
 
-    // Ordering a number against a string is a type fault. Answering it as "no
-    // rows" from the column would make the lowering observable.
-    assert!(try_run(
-        &mut graph,
-        &g().v_ids(&[])
+    // Ordering a number against a string FILTERS (no-match), consistently across
+    // GQL/Gremlin — it does not throw. Nothing matches, so the count is 0.
+    assert_eq!(
+        g().v_ids(&[])
             .has_label(&["P"])
             .values(&["n"])
             .is(P::gt("x"))
             .count()
-    )
-    .is_err());
+            .run(&mut graph),
+        vec![GVal::Num(0.0)]
+    );
 }
 
 #[test]
