@@ -3565,6 +3565,16 @@ impl Parser {
                 self.expect(&Tok::Comma)?;
                 let hi = self.usize_arg()?;
                 self.expect(&Tok::RParen)?;
+                // range(lo, hi) with hi < lo is an invalid window — TinkerPop throws
+                // IllegalArgumentException at build time (data-independent), so fault at parse
+                // to match (the pure-TS engine does the same). limit(0) = range(0, 0) stays
+                // valid (hi == lo → the empty window). `hi == -1` (unlimited) is unsupported.
+                if hi < lo {
+                    return Err(format!(
+                        "E_INVALID_VALUE: range({lo}, {hi}) is not a valid window — the high \
+                         bound must be greater than or equal to the low bound"
+                    ));
+                }
                 if is_local {
                     let p = plan.project(vec![(
                         "range".to_string(),

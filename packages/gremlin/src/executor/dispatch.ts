@@ -280,6 +280,18 @@ export const applyStep = (
         : skipTraversers(stream, step.n);
 
     case 'range':
+      // range(start, end) with end < start (end >= 0) is an invalid window — TinkerPop
+      // throws IllegalArgumentException at build time and the native engine rejects it at
+      // parse, so fault to match rather than silently yielding []. `limit(0)` = range(0,0)
+      // stays valid (end == start → the empty window); end < 0 means unlimited.
+      if (step.end >= 0 && step.end < step.start) {
+        throw new LenkeError(
+          `range(${step.start}, ${step.end}) is not a valid window — the high bound must be ` +
+            `greater than or equal to the low bound`,
+          { code: ErrorCode.InvalidValue },
+        );
+      }
+
       if (step.scope === 'local') {
         const end = step.end < 0 ? Infinity : step.end;
 
