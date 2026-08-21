@@ -1,25 +1,27 @@
-//! Shared GQL conformance corpus — one set of cases, both engines.
+//! GQL conformance corpus — an engine regression snapshot.
 //!
-//! Cases are extracted (mechanically) from lenke-core's behavioral GQL tests into
-//! `tests/gql_corpus/*.jsonl`. Each case carries a core-dialect NDJSON `fixture` and
-//! a read `query`; the runner loads the fixture into BOTH lenke-core (the reference)
-//! and lenke-engine (converting the fixture to the engine's dialect so ONE fixture
-//! drives both), runs the query on each, and asserts the engine's result matches
-//! core's. Core's own inline tests still pin core to the spec; this extends that same
-//! query surface to the engine.
+//! ~1200 curated GQL read/write cases (`tests/gql_corpus/*.jsonl`), each a
+//! core-dialect NDJSON `fixture` and a `query`. This was a differential against
+//! `lenke-core`; core has since been deleted, its byte-identity contract now upheld
+//! by the TS engine fuzzers. The frozen `snapshots.jsonl` — captured while core still
+//! existed and the differential was green, so each recorded outcome equals core's
+//! spec-anchored answer — is now the oracle: the engine must reproduce every case's
+//! recorded outcome (rows, compared as a multiset unless `ordered`, or a rejection).
 //!
-//! A case is JSON: `{ "name", "fixture" (ndjson string), "query", "ordered"? }`.
-//! When core rejects the query (parse/exec error), the engine must reject it too.
-//! Comparison is by VALUE (multiset unless `ordered`), through `num_key` (exact
-//! integers, 1e-9 otherwise) — cross-engine float bit-identity is not claimed.
+//! A case is JSON `{ "name", "fixture" (ndjson string or `@modern`), "query",
+//! "ordered"? }`. Comparison is by VALUE through `num_key` (exact integers, 1e-9
+//! otherwise) — cross-run float bit-identity is not claimed.
+//!
+//! Regenerate the snapshot with `CORPUS_SNAPSHOT=1 cargo test -p lenke-engine --test
+//! gql_corpus` after an INTENDED behavior change (review the diff — an unexplained
+//! change there is a regression). A new case with no snapshot fails until regenerated.
 
-use lenke_core::gql::eval::Params as CoreParams;
-use lenke_core::graph::Value as CoreVal;
 use lenke_engine::value::Value as EngVal;
 use serde_json::Value as J;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-// ── a value form both engines' cells map into ────────────────────────────────
+// ── a value form engine cells map into ───────────────────────────────────────
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Cell {
     Null,
@@ -48,27 +50,67 @@ fn norm_eng(v: &EngVal) -> Cell {
         o => Cell::Other(format!("{o:?}")),
     }
 }
-fn norm_core(v: &CoreVal) -> Cell {
-    match v {
-        CoreVal::Null => Cell::Null,
-        CoreVal::Bool(b) => Cell::Bool(*b),
-        CoreVal::Num(n) => Cell::Num(num_key(*n)),
-        CoreVal::Str(s) => Cell::Str(s.to_string()),
-        o => Cell::Other(format!("{o:?}")),
-    }
-}
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 enum Outcome {
     Rows(Vec<Vec<Cell>>),
     Err,
 }
 
+// ── snapshot (de)serialization: Outcome ⇄ JSON ───────────────────────────────
+fn cell_to_json(c: &Cell) -> J {
+    match c {
+        Cell::Null => J::Null,
+        Cell::Bool(b) => J::Bool(*b),
+        Cell::Num(s) => serde_json::json!({ "n": s }),
+        Cell::Str(s) => serde_json::json!({ "s": s }),
+        Cell::Other(s) => serde_json::json!({ "o": s }),
+    }
+}
+fn cell_from_json(j: &J) -> Cell {
+    match j {
+        J::Null => Cell::Null,
+        J::Bool(b) => Cell::Bool(*b),
+        J::Object(m) if m.contains_key("n") => Cell::Num(m["n"].as_str().unwrap_or("").to_string()),
+        J::Object(m) if m.contains_key("s") => Cell::Str(m["s"].as_str().unwrap_or("").to_string()),
+        J::Object(m) if m.contains_key("o") => {
+            Cell::Other(m["o"].as_str().unwrap_or("").to_string())
+        }
+        other => Cell::Other(other.to_string()),
+    }
+}
+fn outcome_to_json(o: &Outcome) -> J {
+    match o {
+        Outcome::Err => serde_json::json!({ "err": true }),
+        Outcome::Rows(rows) => serde_json::json!({
+            "rows": rows.iter().map(|r| J::Array(r.iter().map(cell_to_json).collect())).collect::<Vec<_>>()
+        }),
+    }
+}
+fn outcome_from_json(j: &J) -> Outcome {
+    if j.get("err").and_then(J::as_bool) == Some(true) {
+        return Outcome::Err;
+    }
+    let rows = j
+        .get("rows")
+        .and_then(J::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    r.as_array()
+                        .map(|cells| cells.iter().map(cell_from_json).collect())
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Outcome::Rows(rows)
+}
+
 // ── fixture conversion: core-dialect NDJSON → engine dialect ─────────────────
 /// One core NDJSON line → the engine's dialect (`{"id","labels","props"}` for a
-/// node, `{"id"?,"from","to","type","props"}` for an edge). Non-data lines (schema
-/// ops the engine loader does not need) pass through as-is if unrecognized. Returns
-/// `None` to drop a line that is not node/edge data.
+/// node, `{"id"?,"from","to","labels","props"}` for an edge). Returns `None` to drop
+/// a line that is not node/edge data (a schema op the engine loader does not need).
 fn core_line_to_engine(line: &str) -> Option<String> {
     let line = line.trim();
     if line.is_empty() {
@@ -115,9 +157,10 @@ fn core_line_to_engine(line: &str) -> Option<String> {
     }
 }
 
-/// The TinkerPop "Modern" graph (core-dialect NDJSON) — many core tests use it, so
-/// a case may set `"fixture": "@modern"` instead of inlining these 12 lines.
-const MODERN: &str = include_str!("../../lenke-core/src/fixtures/modern_gql.ndjson");
+/// The TinkerPop "Modern" graph (core-dialect NDJSON) — many cases set
+/// `"fixture": "@modern"` instead of inlining these lines. Vendored into the engine
+/// test tree (was `../lenke-core/src/fixtures/modern_gql.ndjson`).
+const MODERN: &str = include_str!("fixtures/modern_gql.ndjson");
 
 /// Resolve a `fixture` field: `@modern` → the Modern graph, else the string is the
 /// fixture's core-dialect NDJSON verbatim.
@@ -125,25 +168,6 @@ fn resolve_fixture(fixture: &str) -> &str {
     match fixture.trim() {
         "@modern" => MODERN,
         other => other,
-    }
-}
-
-fn run_core(fixture: &str, query: &str) -> Outcome {
-    let fixture = resolve_fixture(fixture);
-    let mut g = match lenke_core::ndjson::decode(fixture) {
-        Ok(g) => g,
-        Err(e) => panic!("core fixture failed to decode: {e}"),
-    };
-    let Ok(prep) = lenke_core::gql::prepare(query) else {
-        return Outcome::Err;
-    };
-    match prep.execute(&mut g, &CoreParams::new()) {
-        Ok(rs) => Outcome::Rows(
-            rs.rows()
-                .map(|r| r.iter().map(norm_core).collect())
-                .collect(),
-        ),
-        Err(_) => Outcome::Err,
     }
 }
 
@@ -162,10 +186,10 @@ fn run_engine(fixture: &str, query: &str) -> Outcome {
         return Outcome::Err;
     };
     let plan = lenke_engine::opt::optimize_indexed(plan, &store);
-    // `execute` handles both reads and writes: a write mutates the (fresh, single-
-    // use) store and may RETURN rows (`INSERT … RETURN`); a read falls through to
-    // `try_run` over a shared borrow. Routing everything through it keeps write-
-    // then-return cases comparable to core's `prepare(...).execute(...)`.
+    // `execute` handles both reads and writes: a write mutates the (fresh, single-use)
+    // store and may RETURN rows (`INSERT … RETURN`); a read falls through to `try_run`
+    // over a shared borrow. Routing everything through it keeps write-then-return cases
+    // comparable to how the snapshot was captured.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         lenke_engine::exec::execute(&plan, &mut store)
     })) {
@@ -197,150 +221,168 @@ fn eq_outcome(a: &Outcome, b: &Outcome, ordered: bool) -> bool {
     }
 }
 
+/// One corpus case as loaded from a `*.jsonl` line.
+struct Case {
+    key: String, // `file::name`
+    fixture: String,
+    query: String,
+    ordered: bool,
+}
+
+/// Load every `*.jsonl` case in the corpus dir, in a stable (sorted) order.
+fn load_cases(dir: &PathBuf) -> Vec<Case> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .expect("read corpus dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        // `snapshots.jsonl` is the recorded oracle, not a corpus file — never a case.
+        .filter(|p| p.file_name().is_some_and(|n| n != "snapshots.jsonl"))
+        .collect();
+    files.sort();
+    let mut cases = Vec::new();
+    for path in files {
+        let fname = path.file_name().unwrap().to_string_lossy().to_string();
+        let text = std::fs::read_to_string(&path).expect("read corpus file");
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            let case: J = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("{fname}: bad case JSON: {e}\n{line}"));
+            let name = case.get("name").and_then(J::as_str).unwrap_or("?");
+            cases.push(Case {
+                key: format!("{fname}::{name}"),
+                fixture: case
+                    .get("fixture")
+                    .and_then(J::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                query: case
+                    .get("query")
+                    .and_then(J::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                ordered: case.get("ordered").and_then(J::as_bool).unwrap_or(false),
+            });
+        }
+    }
+    cases
+}
+
+fn snapshot_path(dir: &PathBuf) -> PathBuf {
+    dir.join("snapshots.jsonl")
+}
+
+/// Run every case on the engine and write `snapshots.jsonl` (`{"key","out"}` lines,
+/// key-sorted). Guarded behind `CORPUS_SNAPSHOT=1` — a deliberate, reviewable act.
+fn regenerate_snapshot(dir: &PathBuf, cases: &[Case]) {
+    let mut lines: Vec<(String, String)> = Vec::new();
+    for case in cases {
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_engine(&case.fixture, &case.query)
+        }))
+        .unwrap_or(Outcome::Err);
+        let rec = serde_json::json!({ "key": case.key, "out": outcome_to_json(&out) });
+        lines.push((case.key.clone(), rec.to_string()));
+    }
+    lines.sort();
+    lines.dedup_by(|a, b| a.0 == b.0);
+    let body = lines
+        .into_iter()
+        .map(|(_, l)| l)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let header = "// Engine regression snapshot for the GQL corpus — regenerate with\n\
+                  // CORPUS_SNAPSHOT=1 (see gql_corpus.rs). One {\"key\",\"out\"} per case.\n";
+    std::fs::write(snapshot_path(dir), format!("{header}{body}\n")).expect("write snapshot");
+    eprintln!("wrote {} snapshot cases to snapshots.jsonl", cases.len());
+}
+
+/// Load `snapshots.jsonl` into `key → recorded Outcome`.
+fn load_snapshot(dir: &PathBuf) -> HashMap<String, Outcome> {
+    let text = std::fs::read_to_string(snapshot_path(dir)).unwrap_or_default();
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let rec: J = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if let Some(key) = rec.get("key").and_then(J::as_str) {
+            if let Some(out) = rec.get("out") {
+                map.insert(key.to_string(), outcome_from_json(out));
+            }
+        }
+    }
+    map
+}
+
 #[test]
-fn gql_corpus_engine_matches_core() {
+fn gql_corpus_engine_matches_snapshot() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/gql_corpus");
     if !dir.exists() {
         eprintln!("no corpus dir yet: {}", dir.display());
         return;
     }
-    let mut total = 0usize;
-    let mut skipped_core_err = 0usize;
+    let cases = load_cases(&dir);
+
+    if std::env::var("CORPUS_SNAPSHOT").is_ok() {
+        regenerate_snapshot(&dir, &cases);
+        return;
+    }
+
+    let snapshot = load_snapshot(&dir);
     let mut fails: Vec<String> = Vec::new();
-    let mut files: Vec<_> = std::fs::read_dir(&dir)
-        .expect("read corpus dir")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .collect();
-    files.sort();
-    for path in files {
-        let text = std::fs::read_to_string(&path).expect("read corpus file");
-        for (lineno, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with("//") {
-                continue;
+    let mut missing = 0usize;
+
+    for case in &cases {
+        if std::env::var("CORPUS_TRACE").is_ok() {
+            eprintln!("[case] {}", case.key);
+        }
+        let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_engine(&case.fixture, &case.query)
+        }))
+        .unwrap_or_else(|_| {
+            fails.push(format!("{}: panicked for: {}", case.key, case.query));
+            Outcome::Err
+        });
+        match snapshot.get(&case.key) {
+            None => {
+                missing += 1;
+                fails.push(format!(
+                    "{}: no snapshot (regenerate with CORPUS_SNAPSHOT=1): {}",
+                    case.key, case.query
+                ));
             }
-            let fname = path.file_name().unwrap().to_string_lossy().to_string();
-            let case: J = match serde_json::from_str(line) {
-                Ok(c) => c,
-                Err(e) => {
-                    fails.push(format!("{fname}:{}: bad JSON: {e}", lineno + 1));
-                    continue;
+            Some(want) => {
+                if !eq_outcome(want, &got, case.ordered) {
+                    fails.push(format!("{}: engine != snapshot for: {}", case.key, case.query));
                 }
-            };
-            let name = case
-                .get("name")
-                .and_then(J::as_str)
-                .unwrap_or("?")
-                .to_string();
-            let fixture = case
-                .get("fixture")
-                .and_then(J::as_str)
-                .unwrap_or("")
-                .to_string();
-            let query = case
-                .get("query")
-                .and_then(J::as_str)
-                .unwrap_or("")
-                .to_string();
-            let ordered = case.get("ordered").and_then(J::as_bool).unwrap_or(false);
-            total += 1;
-            if std::env::var("CORPUS_TRACE").is_ok() {
-                eprintln!("[case] {fname}::{name}");
-                use std::io::Write;
-                let _ = std::io::stderr().flush();
-            }
-            // A fixture that fails to load or a run that panics is recorded, not fatal —
-            // one bad case must not abort the whole corpus run.
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let core = run_core(&fixture, &query);
-                let eng = run_engine(&fixture, &query);
-                (core, eng)
-            }));
-            let (core, eng) = match ran {
-                Ok(p) => p,
-                Err(_) => {
-                    fails.push(format!(
-                        "{fname}::{name}: panicked (fixture/run) for: {query}"
-                    ));
-                    continue;
-                }
-            };
-            // A query core itself rejects is not an engine-conformance case; still
-            // require the engine to reject it too (error parity).
-            if matches!(core, Outcome::Err) {
-                skipped_core_err += 1;
-                if !matches!(eng, Outcome::Err) {
-                    fails.push(format!(
-                        "{fname}::{name}: core rejects but engine accepts: {query}"
-                    ));
-                }
-                continue;
-            }
-            if !eq_outcome(&core, &eng, ordered) {
-                fails.push(format!("{fname}::{name}: engine != core for: {query}"));
             }
         }
     }
-    // Baseline gate: `known_gaps.txt` lists case keys (`file::name`) that currently
-    // diverge — features the engine does not yet match core on. The test is GREEN as
-    // long as no case OUTSIDE that baseline mismatches (a regression), and it reports
-    // any baseline case that now PASSES (a fixed gap to prune). Regenerate the
-    // baseline with CORPUS_BASELINE=<path>.
-    // Key = `file::name` — the text before the first ": " (the message separator).
-    let fail_keys: Vec<String> = fails
-        .iter()
-        .map(|f| f.split(": ").next().unwrap_or(f).to_string())
-        .collect();
-    let baseline_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/gql_corpus/known_gaps.txt");
-    if std::env::var("CORPUS_BASELINE").is_ok() {
-        let mut keys = fail_keys.clone();
-        keys.sort();
-        keys.dedup();
-        let header =
-            "# Baselined engine conformance gaps: cases where lenke-engine diverges from\n\
-                      # lenke-core. The corpus gate is green as long as no case OUTSIDE this list\n\
-                      # mismatches. As gaps are fixed, their keys are reported as now-passing and\n\
-                      # should be removed. Regenerate with CORPUS_BASELINE=1.\n";
-        std::fs::write(&baseline_path, format!("{header}{}", keys.join("\n"))).ok();
-        eprintln!(
-            "wrote {} baseline keys to {}",
-            keys.len(),
-            baseline_path.display()
-        );
-        return;
-    }
-    let baseline: std::collections::HashSet<String> = std::fs::read_to_string(&baseline_path)
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect();
-    let new_fails: Vec<&String> = fails
-        .iter()
-        .zip(&fail_keys)
-        .filter(|(_, k)| !baseline.contains(*k))
-        .map(|(f, _)| f)
-        .collect();
-    let fixed = baseline.iter().filter(|k| !fail_keys.contains(k)).count();
-    eprintln!(
-        "gql corpus: {total} cases, {skipped_core_err} core-rejected, {} diverge ({} baselined engine gaps, {} NEW, {fixed} baselined-now-passing)",
-        fails.len(),
-        fails.len() - new_fails.len(),
-        new_fails.len(),
-    );
+
     if let Ok(dump) = std::env::var("CORPUS_DUMP") {
         std::fs::write(&dump, fails.join("\n")).ok();
     }
+    eprintln!(
+        "gql corpus: {} cases, {} snapshot mismatches ({missing} missing snapshots)",
+        cases.len(),
+        fails.len(),
+    );
     assert!(
-        new_fails.is_empty(),
-        "{} NEW corpus mismatches (not in known_gaps.txt — a regression):\n{}",
-        new_fails.len(),
-        new_fails
+        fails.is_empty(),
+        "{} corpus mismatches vs snapshot (a regression, or a new/changed case needing \
+         CORPUS_SNAPSHOT=1):\n{}",
+        fails.len(),
+        fails
             .iter()
             .take(40)
-            .map(|s| s.as_str())
+            .map(String::as_str)
             .collect::<Vec<_>>()
             .join("\n")
     );
