@@ -1384,12 +1384,18 @@ impl Parser {
             if is_write(&plan) {
                 return Err("drop() cannot follow a write step".into());
             }
-            // Delete the current elements of the traversal.
+            // Delete the current elements of the traversal. `drop()` is TERMINAL and
+            // emits nothing, so reset `current` to 0: otherwise the finalizer wraps this
+            // Update in a render Project (for an element left in slot != 0, e.g. the edge
+            // from `outE()`), and shallow `is_write(Project(Update))` would miss the
+            // write — running `outE().drop()` as a read that deletes nothing.
+            let del_slot = self.current;
+            self.current = 0;
             return Ok(Plan::Update {
                 input: Box::new(plan),
                 // Gremlin drop() removes the element AND its incident edges.
                 ops: vec![crate::ir::SetOp::Delete {
-                    slot: self.current,
+                    slot: del_slot,
                     detach: true,
                 }],
             });
@@ -7269,6 +7275,8 @@ mod tests {
     /// path (like `path()`), so they are scoped to pure vertex-hop chains. A 2-hop
     /// `both` walk from a node returns to it on half the paths (the cyclic ones).
     #[test]
+
+
     fn gremlin_simple_and_cyclic_path() {
         let store = social();
         // 2-hop BOTH from alice: [0,1,0] and [0,2,0] return to alice (cyclic); [0,1,2]
