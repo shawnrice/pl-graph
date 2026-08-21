@@ -10049,3 +10049,22 @@ fn sum_over_a_branch_of_elements_faults() {
     )
     .is_empty());
 }
+
+#[test]
+fn optional_over_an_always_producing_scalar_does_not_double_emit() {
+    let mut g = modern();
+    // optional(id())/optional(label()) always produce one value per element, so the identity
+    // fallback is dead: optional(id()) ≡ id(). The Exists guard over a projecting body wrongly
+    // reported "empty" and re-emitted the SOURCE vertices alongside the ids.
+    let ids = run_query("g.V().limit(3).optional(id())", &mut g);
+    assert!(
+        ids.iter().all(|v| matches!(v, GVal::Str(_))),
+        "only ids, no source vertices: {ids:?}"
+    );
+    assert_eq!(ids.len(), 3);
+    // count() sees one value per vertex, not two.
+    assert_eq!(
+        run_query("g.V().optional(id()).count()", &mut g),
+        vec![GVal::Num(6.0)]
+    );
+}

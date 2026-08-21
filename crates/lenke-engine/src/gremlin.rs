@@ -1832,6 +1832,37 @@ impl Parser {
                     self.edge_hop = None;
                     return Ok(p);
                 }
+                // A body that ALWAYS produces exactly one output per element — a single
+                // `id()`/`label()` projection (no hop or filter to drop a row) — makes the
+                // identity fallback dead: `optional(id()) ≡ id()`. Lower to just the body,
+                // else the Exists guard over a projecting body wrongly reports "empty" and
+                // the fallback double-emits (`limit(3).optional(id())` returned the ids AND
+                // the source vertices).
+                {
+                    let mut p = self.pos;
+                    if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
+                        p += 1;
+                        if self.toks.get(p) == Some(&Tok::Dot) {
+                            p += 1;
+                        }
+                    }
+                    let is_always_scalar = matches!(self.toks.get(p), Some(Tok::Ident(s)) if {
+                        let l = s.to_ascii_lowercase();
+                        l == "id" || l == "label"
+                    }) && self.toks.get(p + 1) == Some(&Tok::LParen)
+                        && self.toks.get(p + 2) == Some(&Tok::RParen)
+                        && self.toks.get(p + 3) == Some(&Tok::RParen); // arm-terminal `)`
+                    if is_always_scalar {
+                        // Parse the single projection step straight onto the frontier.
+                        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                            self.bump();
+                            self.expect(&Tok::Dot)?;
+                        }
+                        let body = self.step(plan)?;
+                        self.expect(&Tok::RParen)?;
+                        return Ok(body);
+                    }
+                }
                 // The fallback fires where the body produced NOTHING — a correlated
                 // EXISTS over the body. The general EXISTS eval inserts a provenance
                 // column at slot `slots`, which would shift a multi-hop body's
