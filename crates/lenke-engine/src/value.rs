@@ -49,6 +49,14 @@ pub enum Value {
     /// equality and ordering are POSITIONAL (order-sensitive), unlike a `Record`.
     /// `Arc`-boxed for a cheap per-row clone.
     Map(Arc<Vec<(Value, Value)>>),
+    /// An UNBOXED graph element reference carrying its dense id — a node or an edge that
+    /// has flowed into a VALUE position (a heterogeneous `Col::Gen`, e.g. Gremlin
+    /// `inject(…)` or a mixed branch) WITHOUT being rendered to an element map. Lets a
+    /// downstream `out()`/`hasLabel()`/`values()` recognize and traverse it (identity
+    /// preserved), and renders to its element map only at egress. `Col::Nodes`/`Edges`
+    /// frontiers stay the unboxed representation; this is the value-column carrier.
+    Node(u32),
+    Edge(u32),
 }
 
 /// Build a [`Value::Record`] from `pairs`: duplicate keys collapse (last write
@@ -106,6 +114,10 @@ impl Value {
             Self::List(_) => 4,
             Self::Record(_) => 5,
             Self::Map(_) => 6,
+            // SPIKE: unboxed element refs. Placed above the compound kinds; a mixed
+            // element-vs-scalar ORDER BY is exotic — refine against TS if the fuzzer flags it.
+            Self::Node(_) => 8,
+            Self::Edge(_) => 9,
             // Null sorts LAST — it is the greatest in the total order.
             Self::Null => 7,
         }
@@ -148,6 +160,8 @@ pub fn equals(a: &Value, b: &Value) -> bool {
                     .zip(y.iter())
                     .all(|((k1, v1), (k2, v2))| equals(k1, k2) && equals(v1, v2))
         }
+        // Element refs are equal iff the same kind AND the same dense id.
+        (Value::Node(x), Value::Node(y)) | (Value::Edge(x), Value::Edge(y)) => x == y,
         _ => false,
     }
 }
@@ -256,6 +270,8 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
                 Value::Temporal(_) => return bad("temporal", "number"),
                 Value::Record(_) => return bad("record", "number"),
                 Value::Map(_) => return bad("map", "number"),
+                Value::Node(_) => return bad("node", "number"),
+                Value::Edge(_) => return bad("edge", "number"),
                 Value::Null => unreachable!("null handled above"),
             };
             if target == CastTarget::Integer {
@@ -288,6 +304,8 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
                 // with "," and a record/map renders as JSON — same as `to_string` and
                 // core's `js_str`.
                 Value::List(_) | Value::Record(_) | Value::Map(_) => crate::json::js_str(v),
+                Value::Node(_) => return bad("node", "string"),
+                Value::Edge(_) => return bad("edge", "string"),
                 Value::Null => unreachable!("null handled above"),
             }
             .as_str(),
@@ -324,6 +342,8 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
             Value::Temporal(_) => bad("temporal", "boolean"),
             Value::Record(_) => bad("record", "boolean"),
             Value::Map(_) => bad("map", "boolean"),
+            Value::Node(_) => bad("node", "boolean"),
+            Value::Edge(_) => bad("edge", "boolean"),
             Value::Null => unreachable!("null handled above"),
         },
     }
@@ -405,6 +425,16 @@ pub fn group_key_into(v: &Value, out: &mut Vec<u8>) {
                 group_key_into(v, out);
             }
         }
+        // Element refs group by kind tag + dense id, so DISTINCT over a node stream dedups
+        // by identity (`dedup()` on a heterogeneous stream).
+        Value::Node(id) => {
+            out.push(8);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        Value::Edge(id) => {
+            out.push(9);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
     }
 }
 
@@ -467,6 +497,8 @@ pub fn cmp_total(a: &Value, b: &Value) -> Ordering {
             .map(|((k1, v1), (k2, v2))| cmp_total(k1, k2).then_with(|| cmp_total(v1, v2)))
             .find(|o| *o != Ordering::Equal)
             .unwrap_or_else(|| x.len().cmp(&y.len())),
+        // Same-kind element refs order by dense id (a deterministic tiebreak for sort/dedup).
+        (Value::Node(x), Value::Node(y)) | (Value::Edge(x), Value::Edge(y)) => x.cmp(y),
         _ => a.rank().cmp(&b.rank()),
     }
 }

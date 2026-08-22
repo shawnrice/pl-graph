@@ -47,6 +47,9 @@ fn policy(format: &str) -> (bool, TemporalOnErr) {
 fn value_to_neutral(v: &Value) -> CValue {
     match v {
         Value::Null => CValue::Null,
+        Value::Node(_) | Value::Edge(_) => {
+            unreachable!("element ref is never a stored property value")
+        }
         Value::Bool(b) => CValue::Bool(*b),
         Value::Num(x) => CValue::Num(*x),
         Value::Str(s) => CValue::Str(s.to_string()),

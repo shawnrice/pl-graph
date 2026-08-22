@@ -292,12 +292,40 @@ fn try_run_inner(plan: &Plan, store: &Store) -> Result<Rows, String> {
 /// column IS already `Vec<Value>` (returned as-is, zero work), and a node/edge frontier
 /// renders to its element value via the store. Matches `render_cell` exactly, minus the
 /// clone.
+/// Resolve any UNBOXED element ref (`Value::Node`/`Value::Edge`, from a heterogeneous
+/// branch/inject) to its element map at EGRESS — including refs nested inside a list/map/record
+/// (`inject(v).fold()` → a list of maps). A plain scalar passes through untouched.
+fn resolve_elem(v: Value, store: &Store) -> Value {
+    match v {
+        Value::Node(id) => node_result_value(store, id),
+        Value::Edge(id) => edge_result_value(store, id),
+        Value::List(xs) => Value::List(xs.into_iter().map(|x| resolve_elem(x, store)).collect()),
+        Value::Map(pairs) => Value::Map(std::sync::Arc::new(
+            pairs
+                .iter()
+                .map(|(k, val)| {
+                    (
+                        resolve_elem(k.clone(), store),
+                        resolve_elem(val.clone(), store),
+                    )
+                })
+                .collect(),
+        )),
+        Value::Record(fs) => Value::Record(
+            fs.iter()
+                .map(|(k, val)| (k.clone(), resolve_elem(val.clone(), store)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 fn col_into_values(col: Col, store: &Store) -> Vec<Value> {
     match col {
         Col::Str(data) => data.into_iter().map(Value::Str).collect(),
         Col::Num(data) => data.into_iter().map(Value::Num).collect(),
         Col::Bool(data) => data.into_iter().map(Value::Bool).collect(),
-        Col::Gen(data) => data,
+        Col::Gen(data) => data.into_iter().map(|v| resolve_elem(v, store)).collect(),
         Col::Nodes(ids) => render_nodes(store, &ids),
         Col::Edges(eids) => eids
             .into_iter()
@@ -333,7 +361,7 @@ fn render_col_into(col: Col, store: &Store, out: &mut [Value], c: usize, ncols: 
         }
         Col::Gen(data) => {
             for (i, v) in data.into_iter().enumerate() {
-                out[i * ncols + c] = v;
+                out[i * ncols + c] = resolve_elem(v, store);
             }
         }
         Col::Nodes(ids) => {
@@ -1449,6 +1477,22 @@ fn pattern_value(props: &[(String, Value)], key: &str) -> Value {
 /// so `RETURN n` / `RETURN *` match core byte-for-byte. Everything else materializes
 /// as its plain value. (Edge frontier rendering — `{id, from, to, labels,
 /// properties}` — needs an eid→endpoints accessor and is a separate step.)
+/// Like [`render_cell`] but keeps a graph element UNBOXED — `Value::Node`/`Value::Edge`
+/// carrying the dense id, NOT the rendered element map. Used when a node/edge flows into a
+/// heterogeneous `Col::Gen` (a mixed branch or `inject`) that a downstream step still has to
+/// traverse; egress resolves the ref to its map via [`render_cell`]. This is the un-boxed
+/// alternative to eagerly rendering the map (which lost node identity, so `out()`/`hasLabel()`
+/// on the result yielded nothing).
+fn cell_value(col: &Col, i: usize, _store: &Store) -> Value {
+    match col {
+        Col::Nodes(ids) if ids[i] == u32::MAX => Value::Null,
+        Col::Edges(eids) if eids[i] == u32::MAX => Value::Null,
+        Col::Nodes(ids) => Value::Node(ids[i]),
+        Col::Edges(eids) => Value::Edge(eids[i]),
+        _ => col.value_at(i),
+    }
+}
+
 fn render_cell(col: &Col, i: usize, store: &Store) -> Value {
     match col {
         // `u32::MAX` is the OPTIONAL-MATCH null sentinel → NULL, not an element map.
@@ -1456,7 +1500,14 @@ fn render_cell(col: &Col, i: usize, store: &Store) -> Value {
         Col::Edges(eids) if eids[i] == u32::MAX => Value::Null,
         Col::Nodes(ids) => node_result_value(store, ids[i]),
         Col::Edges(eids) => edge_result_value(store, eids[i]),
-        _ => col.value_at(i),
+        // A Gen cell may carry an UNBOXED element ref (Value::Node/Edge from a heterogeneous
+        // branch/inject) — resolve it to its element map at egress, the same map a Nodes/Edges
+        // cell renders. (SPIKE: top-level only; a ref nested in a list/map is not yet resolved.)
+        _ => match col.value_at(i) {
+            Value::Node(id) => node_result_value(store, id),
+            Value::Edge(id) => edge_result_value(store, id),
+            v => v,
+        },
     }
 }
 
@@ -2768,8 +2819,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 return Ok(concat_batches(&[bl, br], store));
             }
             let row_of = |b: &Batch, i: usize| -> Vec<Value> {
-                let mut row: Vec<Value> =
-                    b.slots.iter().map(|c| render_cell(c, i, store)).collect();
+                let mut row: Vec<Value> = b.slots.iter().map(|c| cell_value(c, i, store)).collect();
                 row.resize(ncols, Value::Null);
                 row
             };
@@ -6252,9 +6302,24 @@ fn expand(
         Ok(w) => w,
         Err(()) => return empty(),
     };
-    let Col::Nodes(src) = batch.slot(from) else {
-        // Only a node frontier can be expanded; anything else yields nothing.
-        return empty();
+    // A node frontier expands directly (the hot path, borrowed). A heterogeneous `Col::Gen`
+    // (a mixed branch / inject) expands only its UNBOXED `Value::Node` cells — a scalar or an
+    // edge cell contributes no vertex-neighbours (matches the pure-TS heterogeneous stream);
+    // `u32::MAX` marks a skip. Any other column type has no node to expand.
+    let src_owned: Vec<u32>;
+    let src: &[u32] = match batch.slot(from) {
+        Col::Nodes(v) => v,
+        Col::Gen(cells) => {
+            src_owned = cells
+                .iter()
+                .map(|c| match c {
+                    Value::Node(id) => *id,
+                    _ => u32::MAX,
+                })
+                .collect();
+            &src_owned
+        }
+        _ => return empty(),
     };
 
     // Collect edge ids only when something needs them — a bound edge slot or
@@ -6265,6 +6330,9 @@ fn expand(
     let mut nbrs = Vec::new();
     let mut eids = Vec::new();
     for (row, &v) in src.iter().enumerate() {
+        if v == u32::MAX {
+            continue; // an optional-null or a non-node Gen cell — no neighbours
+        }
         for_each_nbr(store, v, dir, &want, double_loops, |nbr, eid| {
             keep.push(row);
             nbrs.push(nbr);
@@ -14146,6 +14214,27 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                             .collect(),
                     )
                 }
+                // A heterogeneous Col::Gen (a mixed branch / inject) carries UNBOXED element
+                // refs: test the label per Node/Edge cell; a scalar cell is false (has no label),
+                // matching the pure-TS heterogeneous stream.
+                Col::Gen(cells) => {
+                    let want_e: Vec<u32> =
+                        labels.iter().filter_map(|l| store.etype_id(l)).collect();
+                    Col::Bool(
+                        cells
+                            .iter()
+                            .map(|c| match c {
+                                Value::Node(id) => {
+                                    node_buckets.iter().any(|b| b.binary_search(id).is_ok())
+                                }
+                                Value::Edge(e) => {
+                                    want_e.iter().any(|&t| store.edge_carries_type(*e, t))
+                                }
+                                _ => false,
+                            })
+                            .collect(),
+                    )
+                }
                 other => Col::Bool(vec![false; other.len()]),
             }
         }
@@ -14196,6 +14285,9 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     Col::Gen(
                         (0..other.len())
                             .map(|i| match other.value_at(i) {
+                                // An UNBOXED element ref reads presence off the store.
+                                Value::Node(id) => Value::Bool(store.has_prop(id, key)),
+                                Value::Edge(e) => Value::Bool(store.has_edge_prop(e, key)),
                                 Value::Map(pairs) => match boxed_element_props(&pairs) {
                                     Some(props) => Value::Bool(props.iter().any(
                                         |(k, _)| matches!(k, Value::Str(s) if s.as_ref() == key),
@@ -14616,7 +14708,7 @@ fn concat_cols(cols: &[&Col], store: &Store) -> Col {
     let gen = || {
         Col::Gen(
             cols.iter()
-                .flat_map(|c| (0..c.len()).map(|i| render_cell(c, i, store)))
+                .flat_map(|c| (0..c.len()).map(|i| cell_value(c, i, store)))
                 .collect(),
         )
     };
@@ -17729,10 +17821,15 @@ fn read_property(store: &Store, col: &Col, key: &str) -> Col {
     }
     let Col::Nodes(ids) = col else {
         // A non-element column (e.g. a projected Record): `x.key` reads the record
-        // field; anything else has no property and reads NULL.
+        // field; an UNBOXED element ref (Value::Node/Edge in a heterogeneous Col::Gen)
+        // reads its stored property off the store; anything else has no property → NULL.
         return Col::Gen(
             (0..col.len())
-                .map(|i| boxed_value_prop(&col.value_at(i), key))
+                .map(|i| match col.value_at(i) {
+                    Value::Node(id) => store.prop(id, key),
+                    Value::Edge(e) => store.edge_prop(e, key),
+                    other => boxed_value_prop(&other, key),
+                })
                 .collect(),
         );
     };

@@ -62,6 +62,9 @@ fn align8(v: usize) -> usize {
 fn cell_str(c: &Value, out: &mut String) {
     match c {
         Value::Null => {}
+        Value::Node(_) | Value::Edge(_) => {
+            unreachable!("element ref is never a stored property value")
+        }
         Value::Str(s) => out.push_str(s),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Num(n) => {

@@ -153,6 +153,9 @@ pub fn encode_str_array(out: &mut String, items: &[String]) {
 pub fn encode_value(out: &mut String, v: &Value) {
     match v {
         Value::Null => out.push_str("null"),
+        Value::Node(_) | Value::Edge(_) => {
+            unreachable!("element ref is never a stored property value")
+        }
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Num(x) => {
             if x.is_finite() {

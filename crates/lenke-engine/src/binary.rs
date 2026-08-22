@@ -75,6 +75,9 @@ impl Writer {
     fn value(&mut self, v: &Value) {
         match v {
             Value::Null => self.buf.push(0),
+            Value::Node(_) | Value::Edge(_) => {
+                unreachable!("element ref is never a stored property value")
+            }
             Value::Bool(b) => {
                 self.buf.push(1);
                 self.buf.push(u8::from(*b));

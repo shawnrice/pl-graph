@@ -215,6 +215,10 @@ fn to_gval(v: &EngVal) -> GVal {
                 .collect(),
         ),
         EngVal::Temporal(t) => GVal::Str(format!("{t:?}")),
+        // An unboxed element ref reaching here means it was not resolved to its map at egress —
+        // surface the dense id so a test SEES the leak rather than silently coercing.
+        EngVal::Node(id) => GVal::Node(format!("#dense{id}")),
+        EngVal::Edge(id) => GVal::Edge(format!("#dense{id}")),
     }
 }
 
@@ -10310,5 +10314,50 @@ fn choose_condition_ending_in_an_aggregate_is_always_true() {
             &mut g
         ),
         2
+    );
+}
+
+#[test]
+fn unboxed_element_ref_flows_through_a_heterogeneous_stream() {
+    let mut g = modern();
+    let count = |q: &str, g: &mut EngineGraph| match run_query(q, g).as_slice() {
+        [GVal::Num(n)] => *n as i64,
+        other => panic!("expected one count, got {other:?}"),
+    };
+    // A node/edge that flows into a heterogeneous Col::Gen (inject / a mixed branch) stays an
+    // UNBOXED Value::Node/Edge (dense id preserved), so a downstream traversal AND a downstream
+    // property/label read both work — where the old lossy map-boxing yielded nothing.
+    // traversal off a mixed optional (edges ∪ source vertices):
+    assert_eq!(
+        count("g.V().optional(out('CREATED', 'KNOWS').outE('CREATED', 'KNOWS')).out('CREATED').dedup().count()", &mut g),
+        2
+    );
+    // label filter off an inject-mixed stream (the two literals are skipped, vertices kept):
+    assert_eq!(
+        count(
+            "g.V().inject('a', 'b').skip(2).hasLabel('SOFTWARE').count()",
+            &mut g
+        ),
+        2
+    );
+    // property read off a union-mixed (edges ∪ vertices) stream — vertices contribute names:
+    let names = run_query(
+        "g.V().union(inE('KNOWS', 'CREATED'), out('KNOWS')).values('name')",
+        &mut g,
+    );
+    assert!(names
+        .iter()
+        .any(|v| matches!(v, GVal::Str(s) if s == "vadas" || s == "josh")));
+    // egress still renders a bare unboxed node as its element MAP, never a dense-id marker:
+    let injected = run_query("g.V().inject(0)", &mut g);
+    assert!(
+        injected.iter().any(|v| matches!(v, GVal::Node(_))),
+        "vertices render as element maps"
+    );
+    assert!(
+        injected
+            .iter()
+            .any(|v| matches!(v, GVal::Num(n) if *n == 0.0)),
+        "the injected literal"
     );
 }

@@ -234,6 +234,9 @@ impl Column {
                 nulls: vec![false; n],
             },
             // Records/maps (and null/list) have no typed column form yet — Gen.
+            Value::Node(_) | Value::Edge(_) => {
+                unreachable!("element ref is never a stored property value")
+            }
             Value::Null | Value::List(_) | Value::Record(_) | Value::Map(_) => Self::Gen {
                 data: vec![Value::Null; n],
                 present: vec![false; n],
@@ -847,6 +850,9 @@ impl TypeParser<'_> {
 /// scalar constraint (`Null` and a record/map). Mirrors core's `value_type`.
 fn value_prop_type(v: &Value) -> Option<PropType> {
     Some(match v {
+        Value::Node(_) | Value::Edge(_) => {
+            unreachable!("element ref is never a stored property value")
+        }
         Value::Null | Value::Record(_) | Value::Map(_) => return None,
         Value::Str(_) => PropType::String,
         Value::Num(_) => PropType::Number,

@@ -78,6 +78,15 @@ pub(crate) fn write_value(out: &mut String, v: &Value) {
             }
             out.push('}');
         }
+        // SPIKE: an element ref should be RESOLVED to its element map by render_cell before it
+        // reaches JSON egress; a bare one here means an egress path did not resolve it. Emit a
+        // distinctive marker (not a panic) so the differential fuzzer surfaces the leak.
+        Value::Node(id) => {
+            let _ = write!(out, "\"__UNRESOLVED_NODE_{id}__\"");
+        }
+        Value::Edge(id) => {
+            let _ = write!(out, "\"__UNRESOLVED_EDGE_{id}__\"");
+        }
     }
 }
 
@@ -174,6 +183,9 @@ pub(crate) fn js_str(v: &Value) -> String {
             write_value(&mut s, v);
             s
         }
+        // SPIKE: element refs should be resolved before egress (see write_value).
+        Value::Node(id) => format!("__UNRESOLVED_NODE_{id}__"),
+        Value::Edge(id) => format!("__UNRESOLVED_EDGE_{id}__"),
     }
 }
 
