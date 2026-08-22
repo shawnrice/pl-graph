@@ -71,11 +71,6 @@ fn is_edge_scope_preserving(lname: &str) -> bool {
             | "sample"
             | "coin"
             | "none"
-            // path()/tree() PRESERVE the underlying edge-in-scope: a path built over an edge
-            // frontier still lets a following endpoint (in a reconverged branch) read off the
-            // edge — `union(dedup(), path()).outV()` over an edge input works, matching TS.
-            | "path"
-            | "tree"
             | "simplepath"
             | "cyclicpath"
             | "aggregate"
@@ -1250,6 +1245,9 @@ impl Parser {
         let mut plan = match head.to_ascii_lowercase().as_str() {
             "v" => {
                 self.expect(&Tok::LParen)?;
+                // A vertex source has NO edge in scope, so a following endpoint (inV/outV/…)
+                // faults — set it here (the source isn't run through the step classifier).
+                self.edge_scope = Some(false);
                 // Three head shapes:
                 //   g.V()               — all vertices (Scan).
                 //   g.V('a', 'b', …)    — the vertices with those EXTERNAL ids, a
@@ -2727,9 +2725,11 @@ impl Parser {
                     }
                     // Otherwise (a bare edge frontier — `g.E().outV()`,
                     // `coalesce(outE(...)).inV()` — or an origin-returning combination):
-                    // read the endpoint straight off the edge at the current slot. Only
-                    // valid when the frontier actually holds edges.
-                    _ if self.on_edge => {
+                    // read the endpoint straight off the edge at the current slot. Valid when
+                    // the frontier holds edges (`on_edge`) OR MIGHT (a reconverged branch whose
+                    // edge scope is unknown, `edge_scope != Some(false)` — the type check above
+                    // already faulted a DEFINITE non-edge); EdgeVertex skips the non-edge rows.
+                    _ if self.on_edge || self.edge_scope != Some(false) => {
                         // otherV needs a reference vertex. Off a DEFINITE bare edge source
                         // (`g.E()`, `g.E().hasLabel(...)` — still `current_is_element`) there is
                         // none, so it faults statically (matching pure-TS). Off a reconverged
@@ -2865,6 +2865,11 @@ impl Parser {
             }
             "path" => {
                 self.expect(&Tok::RParen)?;
+                // The frontier becomes a PATH (a list), not an edge — so no edge is definitely in
+                // scope. The early returns below skip the post-step classifier, so clear it here;
+                // a following endpoint in a reconverged branch then treats the arm as
+                // could-have-an-edge (None), not definitely-none (Some(false)).
+                self.edge_scope = None;
                 // After a REDUCING barrier (`count()`/`sum()`/`fold()`/…) TinkerPop resets the
                 // traverser path, so `count().path()` is `[7]` — just the reduced value, not
                 // the pre-barrier history. Lower to a single-element list of the current value.

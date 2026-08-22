@@ -2180,22 +2180,16 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 };
                 if *other {
                     // The reference vertex is the last node in the row's path (where the
-                    // traverser arrived before this edge); otherV is the opposite endpoint. A
-                    // BARE edge source (`g.E().otherV()`) has no reference vertex → fault, like
-                    // TinkerPop/pure-TS.
-                    let Some(reference) = b
+                    // traverser arrived before this edge); otherV is the opposite endpoint. With
+                    // no reference (an edge reached without a prior vertex, via a branch) default
+                    // to the OUT vertex (src), matching pure-TS. A DIRECT bare edge source
+                    // (`g.E().otherV()`) is rejected earlier, at parse.
+                    let reference = b
                         .lineage
                         .as_ref()
-                        .and_then(|l| l.path_at(i).last().map(num_as_u32))
-                    else {
-                        return Err(
-                            "otherV() requires a reference vertex — an edge reached from \
-                                    a vertex, not a bare edge source"
-                                .into(),
-                        );
-                    };
+                        .and_then(|l| l.path_at(i).last().map(num_as_u32));
                     keep.push(i);
-                    nodes.push(if reference == dst { src } else { dst });
+                    nodes.push(if reference == Some(dst) { src } else { dst });
                     continue;
                 }
                 match which {
@@ -15147,19 +15141,12 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
                     continue;
                 };
                 if *other {
-                    let Some(reference) = b
+                    let reference = b
                         .lineage
                         .as_ref()
-                        .and_then(|l| l.path_at(i).last().map(num_as_u32))
-                    else {
-                        return Err(
-                            "otherV() requires a reference vertex — an edge reached from \
-                                    a vertex, not a bare edge source"
-                                .into(),
-                        );
-                    };
+                        .and_then(|l| l.path_at(i).last().map(num_as_u32));
                     keep.push(i);
-                    nodes.push(if reference == dst { src } else { dst });
+                    nodes.push(if reference == Some(dst) { src } else { dst });
                     continue;
                 }
                 match which {
