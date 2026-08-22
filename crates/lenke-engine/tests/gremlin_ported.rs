@@ -2753,6 +2753,20 @@ fn order_over_mixed_types_faults() {
 }
 
 #[test]
+fn order_over_elements_faults_pure_and_mixed() {
+    // A raw graph element has no natural order. A PURE-element `order()` is caught at
+    // parse from the frontier type; a MIXED element+scalar stream (`inject` clears the
+    // element flag) is caught at runtime when the sort key resolves to a vertex/edge.
+    // Both fault — and the TS engine faults the same way (fuzzer parity).
+    assert!(rejects("g.V().order().by(desc)"));
+    assert!(rejects("g.V().both('CREATED', 'KNOWS').inject(1).order().by(desc)"));
+    assert!(rejects("g.V().inject(1).order()"));
+    // A `by('<key>')`/`by(id)` projection yields a comparable scalar and is still fine.
+    assert!(!rejects("g.V().order().by('name')"));
+    assert!(!rejects("g.V().inject(1).order().by('name')"));
+}
+
+#[test]
 fn sum_of_non_numeric_faults() {
     let mut g = modern();
     let t = parse("g.V().values('name').sum()").unwrap();

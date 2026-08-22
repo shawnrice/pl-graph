@@ -4653,10 +4653,34 @@ fn order_page(
     let mut idx: Vec<usize> = (0..n).collect();
     if !keys.is_empty() {
         let key_cols: Vec<Col> = eval_all(keys.iter().map(|k| &k.expr), store, batch)?;
+        // A raw graph element has no natural order (the same rule the parser enforces
+        // for a pure-element `order()`), but an element can still reach here in a MIXED
+        // stream — `both(...).inject(1).order()` clears the element frontier flag at
+        // parse, so the check below is the runtime backstop. A sort KEY that resolves to
+        // a vertex/edge (bare `order()`, `by(desc)`, or `by(<element-valued traversal>)`)
+        // faults; a `by('<key>')`/`by(id)` projection is a comparable scalar and is fine.
+        if key_cols.iter().any(col_has_element) {
+            return Err("order() over graph elements is not supported — elements have no \
+                        natural order; use order().by('<key>')"
+                .into());
+        }
         let key_cols = typed_key_cols(key_cols);
         sort_idx(&mut idx, &key_cols, keys, end);
     }
     Ok(batch.gather(&idx[start..end]))
+}
+
+/// A sort-key column that carries a graph element — a `Nodes`/`Edges` slot or a `Gen`
+/// column holding any `Value::Node`/`Value::Edge`. Elements have no natural order, so
+/// ordering by one faults (see [`order_page`]).
+fn col_has_element(col: &Col) -> bool {
+    match col {
+        Col::Nodes(_) | Col::Edges(_) => true,
+        Col::Gen(vs) => vs
+            .iter()
+            .any(|v| matches!(v, Value::Node(_) | Value::Edge(_))),
+        _ => false,
+    }
 }
 
 /// Fold a homogeneous computed key column (`Col::Gen`) into a typed one so `sort_idx`'s

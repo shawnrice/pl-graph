@@ -1,4 +1,4 @@
-import type { Graph } from '@lenke/core';
+import { type Graph, isElement } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type { By } from '../ast.js';
@@ -189,6 +189,17 @@ const sortByBys = <T>(
     item,
     keys: bys.map((by) => evalBy(by, project(item), graph, ctx)),
   }));
+  // A raw graph element has no natural order. The parse-time check in `checkStep`
+  // rejects a pure-element `order()`, but an element still reaches here in a MIXED
+  // stream (`both(...).inject(1).order()`) whose frontier is no longer "element", or
+  // via `by(<element-valued traversal>)`. Fault at runtime to match the native engine.
+  if (keyed.some((k) => k.keys.some(isElement))) {
+    throw new LenkeError(
+      `order() over graph elements is not supported — elements have no natural order; ` +
+        `use order().by('<key>')`,
+      { code: ErrorCode.Syntax },
+    );
+  }
   keyed.sort((a, b) => {
     for (let i = 0; i < bys.length; i++) {
       const c = compareTotal(a.keys[i], b.keys[i]) * (dirs[i] === 'desc' ? -1 : 1);
