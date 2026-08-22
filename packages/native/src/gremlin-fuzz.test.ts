@@ -68,6 +68,14 @@ import { createFfiEngineBackend } from './backend-ffi-engine.js';
 // conformance suite's `canonJson`; importing it from a *.test.ts pulls in
 // `describe`, which only exists under the test runner).
 const canonJson = (v: unknown): unknown => {
+  // JS `undefined` (e.g. TS `label()` over a path) serializes to `null` in the final JSON, so
+  // it is the SAME value both engines emit — normalize it here so `deepSort` sees `null` and not
+  // a value whose `JSON.stringify` is `undefined` (which breaks its comparator and mis-sorts only
+  // the TS side, reading as a false divergence on `coalesce(...).label().path()`).
+  if (v === undefined) {
+    return null;
+  }
+
   if (v === null || typeof v === 'boolean' || typeof v === 'string') {
     return v;
   }
@@ -225,7 +233,21 @@ const RECONVERGING_BRANCH = /\b(?:coalesce|choose|optional)\(/;
  */
 const deepSort = (v: unknown): unknown => {
   if (Array.isArray(v)) {
-    return [...v].map(deepSort).sort((a, b) => (JSON.stringify(a) < JSON.stringify(b) ? -1 : 1));
+    // A TOTAL order: return 0 for equal keys. The old `a < b ? -1 : 1` returned 1 for equal
+    // elements, violating the sort contract — an inconsistent comparator gives JSC an
+    // implementation-defined result that depends on the INPUT arrangement, so two engines'
+    // IDENTICAL multisets sorted from different starting orders came out differently and read
+    // as a divergence (`coalesce(...).path()` rows `[v, [v], null]` — same content, shuffled).
+    return [...v].map(deepSort).sort((a, b) => {
+      const sa = JSON.stringify(a);
+      const sb = JSON.stringify(b);
+
+      if (sa < sb) {
+        return -1;
+      }
+
+      return sa > sb ? 1 : 0;
+    });
   }
 
   // A map's keys are in FIRST-SEEN order, so when the stream that filled it had
@@ -254,7 +276,12 @@ const canonOrder = (rows: unknown, unordered: boolean): unknown =>
  * shape (how many rows, of what kind) is a contract, not the contents. Sorting
  * cannot recover it: the slice already happened.
  */
-const SLICING_STEP = /\.(?:limit|skip|range|tail)\(/;
+// A positional slice — top-level (`.skip(1)`) OR at the start of a branch arm
+// (`union(skip(1).id(), …)`, no leading dot). A slice over an unspecified order
+// picks an unspecified SUBSET wherever it sits, so an arm-internal slice fed by a
+// multi-type adjacency (`bothE('CREATED','KNOWS').union(skip(1).id(), dedup())`)
+// is just as unspecified as a top-level one — match both spellings.
+const SLICING_STEP = /(?:^|[.(,\s])(?:limit|skip|range|tail)\(/;
 
 /**
  * Whether a positional slice happens BEFORE any `order()` — the case where the
@@ -668,6 +695,16 @@ suite('differential fuzz: gremlin (TS engine vs Rust ENGINE)', () => {
       // each engine and they were DIFFERENT edges — a false divergence, and the
       // reason this suite went red about one run in fifteen.
       if (orderUnspecified && slicedBeforeOrdering(text)) {
+        skippedUnordered += 1;
+
+        continue;
+      }
+
+      // A path-stream `order()` is unspecified (sorting paths-of-elements has no total order),
+      // and a slice around it — `path().path().order().by(desc).limit(1)` — then picks an
+      // unspecified SUBSET, so even the multiset compare `unordered` grants cannot hold (the
+      // dropped rows differ between engines). Skip when a path-order meets any positional slice.
+      if (orderOverPaths(text) && SLICING_STEP.test(text)) {
         skippedUnordered += 1;
 
         continue;

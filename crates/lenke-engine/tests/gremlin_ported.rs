@@ -10121,6 +10121,55 @@ fn optional_arm_barriers_apply_per_element() {
 }
 
 #[test]
+fn optional_reducer_body_makes_a_scalar_frontier() {
+    // `bodyAlwaysProduces` (pure-TS): an optional whose body's LITERAL last step is an aggregate
+    // reducer emits exactly one scalar per element, so the identity fallback is dead and the
+    // frontier is the body's scalar — a following adjacency/edge-hop then STATICALLY faults in
+    // both engines, exactly as `V().count().out()` does. Covers a nested reducer (count().count())
+    // and a barrier-then-reducer (order().count()); the outer wrapper (path()) does not matter.
+    assert!(rejects("g.V().optional(count().count()).out('NOPE')"));
+    assert!(rejects(
+        "g.V().path().optional(order().count()).outE('CREATED')"
+    ));
+    assert!(rejects(
+        "g.V().optional(out('KNOWS').count()).values('name')"
+    ));
+    // But a NON-always-producing body (a bare hop, or a reducer behind a following filter that
+    // is no longer the terminal) keeps the mixed/unknown frontier, so nothing faults statically.
+    assert_eq!(
+        sorted_nums(qs("g.V().optional(count().count()).count()")),
+        vec![6.0]
+    );
+}
+
+#[test]
+fn optional_projection_body_records_into_the_path() {
+    // optional(path())/optional(id()) ≡ path()/id() (fallback dead), so the projected value must
+    // land in the step-history exactly as the bare step would — a following path() then sees it.
+    // optional(path()).path() NESTS the inner path (regression: native dropped it and stayed flat).
+    for row in qs("g.V().id().optional(path()).path()") {
+        let GVal::List(outer) = row else {
+            panic!("expected a path list, got {row:?}");
+        };
+        assert_eq!(outer.len(), 3, "[vertex, id, [vertex, id]]");
+        assert!(matches!(&outer[1], GVal::Str(_)), "the id() output");
+        assert!(
+            matches!(&outer[2], GVal::List(inner) if inner.len() == 2),
+            "the nested optional(path()) output, got {:?}",
+            outer[2]
+        );
+    }
+    // optional(id()).path(): the id element is recorded, so the path is [vertex, id].
+    for row in qs("g.V().optional(id()).path()") {
+        let GVal::List(outer) = row else {
+            panic!("expected a path list, got {row:?}");
+        };
+        assert_eq!(outer.len(), 2, "[vertex, id]");
+        assert!(matches!(&outer[1], GVal::Str(_)), "the id() output");
+    }
+}
+
+#[test]
 fn choose_routes_each_element_to_a_per_element_aggregate() {
     let mut g = modern();
     // has('age') routes the 4 PERSON vertices to count() (→ 1 each) and the 2 SOFTWARE

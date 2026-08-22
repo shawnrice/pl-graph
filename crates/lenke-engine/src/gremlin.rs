@@ -147,6 +147,8 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         current_is_scalar: false,
         edge_scope: None,
         last_arm_edge_scope: None,
+        last_arm_frontier: (false, false, false),
+        last_arm_last_step: String::new(),
         frontier_from_reducer: false,
     };
     p.traversal()
@@ -839,8 +841,16 @@ struct Parser {
     /// The `edge_scope` at the END of the most recent [`parse_sub_body_seeded`] (captured before
     /// the flags restore), so a branch lowering can combine its arms' edge-in-scope.
     last_arm_edge_scope: Option<bool>,
-    /// The output-frontier KIND flags at the END of the most recent [`parse_sub_body_seeded`]
-    /// (captured before the restore), so a branch lowering can combine its arms' frontier type.
+    /// The output-frontier KIND flags `(is_element, is_scalar, is_path)` at the END of the most
+    /// recent [`parse_sub_body_seeded`] (captured before the restore), so a branch whose body
+    /// ALWAYS PRODUCES (`optional`, port of pure-TS `bodyAlwaysProduces`) can take the body's
+    /// ending frontier as the post-branch frontier instead of clearing it to unknown.
+    last_arm_frontier: (bool, bool, bool),
+    /// The lowercase name of the LAST step in the most recent [`parse_sub_body_seeded`] body,
+    /// so `optional` can test `bodyAlwaysProduces` on the literal terminal step (an agg reducer
+    /// `count`/`fold`/`sum`/`min`/`max`/`mean`) exactly as pure-TS does — NOT the propagated
+    /// `frontier_from_reducer`, which survives a following `limit`/`dedup` and would over-fault.
+    last_arm_last_step: String,
     /// A branch's output is a clean element/scalar/path frontier only when EVERY arm agrees;
     /// mixed arms (`coalesce(outE, hasLabel)`) leave an UNKNOWN frontier so a following static
     /// type check (sum-over-element, values-on-scalar) does not fault (matches pure-TS).
@@ -1877,17 +1887,26 @@ impl Parser {
                 // An aggregate-terminal body ALWAYS produces one value per element, so the
                 // identity fallback never fires — lower straight to the per-element
                 // aggregate projection (`optional(count())` → `[1,1,…]`, not the whole-
-                // stream `[6, …source…]`).
-                if let Some(agg) = self.try_per_element_agg(from, slots)? {
-                    self.expect(&Tok::RParen)?;
-                    let p = plan.project(vec![("optional".to_string(), agg)]);
-                    self.current = 0;
-                    self.slots = 1;
-                    self.edge_hop = None;
-                    self.edge_scope = Some(false); // an aggregate body yields a scalar
-                    self.current_is_scalar = true; // matches TS bodyAlwaysProduces → a scalar
-                    self.current_is_element = false;
-                    return Ok(p);
+                // stream `[6, …source…]`). NOT over a PATH frontier: the fast path builds the
+                // aggregate without running the body's leading hop through `step()`, so it would
+                // skip the path-fault (`path().optional(both('KNOWS').count())` must reject the
+                // adjacency on a path); route those to the general body below, which faults.
+                if !self.current_is_path {
+                    if let Some(agg) = self.try_per_element_agg(from, slots)? {
+                        self.expect(&Tok::RParen)?;
+                        let p = plan.project(vec![("optional".to_string(), agg)]);
+                        self.current = 0;
+                        self.slots = 1;
+                        self.edge_hop = None;
+                        self.edge_scope = Some(false); // an aggregate body yields a scalar
+                        self.current_is_scalar = true; // matches TS bodyAlwaysProduces → a scalar
+                        self.current_is_element = false;
+                        // A reducer RESETS the traverser path, so a following `path()` is the
+                        // reduced value (`optional(count()).order().range(0,2).path()` → `[[1],…]`,
+                        // not the pre-reduce vertex history).
+                        self.frontier_from_reducer = true;
+                        return Ok(p);
+                    }
                 }
                 // A body that ALWAYS produces exactly one output per element — a single
                 // `id()`/`label()`/`path()` projection (no hop or filter to drop a row) —
@@ -1904,10 +1923,12 @@ impl Parser {
                             p += 1;
                         }
                     }
-                    let is_always_scalar = matches!(self.toks.get(p), Some(Tok::Ident(s)) if {
-                        let l = s.to_ascii_lowercase();
-                        l == "id" || l == "label" || l == "path"
-                    }) && self.toks.get(p + 1) == Some(&Tok::LParen)
+                    let inner_name = match self.toks.get(p) {
+                        Some(Tok::Ident(s)) => s.to_ascii_lowercase(),
+                        _ => String::new(),
+                    };
+                    let is_always_scalar = matches!(inner_name.as_str(), "id" | "label" | "path")
+                        && self.toks.get(p + 1) == Some(&Tok::LParen)
                         && self.toks.get(p + 2) == Some(&Tok::RParen)
                         && self.toks.get(p + 3) == Some(&Tok::RParen); // arm-terminal `)`
                     if is_always_scalar {
@@ -1918,7 +1939,11 @@ impl Parser {
                         }
                         let body = self.step(plan)?;
                         self.expect(&Tok::RParen)?;
-                        return Ok(body);
+                        // The body IS the frontier (fallback dead), so its projected value must be
+                        // recorded into the step-history exactly as the bare step would be — else a
+                        // following `path()` misses it (`optional(path()).path()` failed to nest the
+                        // inner path; `optional(id()).path()` dropped the id element).
+                        return Ok(self.maybe_path_record(body, &inner_name));
                     }
                 }
                 // General case: run the body PER ELEMENT (a single incoming traverser at a
@@ -1929,12 +1954,42 @@ impl Parser {
                 // old whole-stream EXISTS-guarded branch got wrong.
                 let (body, oc, _os) = self.parse_sub_body_seeded(Plan::Row, from, slots)?;
                 let body_edge_scope = self.last_arm_edge_scope;
+                let body_frontier = self.last_arm_frontier;
+                // `bodyAlwaysProduces` (port of pure-TS): a body whose LITERAL last step is an
+                // aggregate reducer (count/fold/sum/min/max/mean) emits exactly one value per
+                // element, so the identity fallback is dead and `optional(<body>) ≡ <body>` — the
+                // frontier is the body's ending frontier (a scalar → a following out()/values()
+                // statically faults, matching TS). Checked on the literal terminal, NOT the
+                // propagated `frontier_from_reducer` (which survives a following limit/dedup).
+                let body_always_produces = matches!(
+                    self.last_arm_last_step.as_str(),
+                    "count" | "fold" | "sum" | "min" | "max" | "mean"
+                );
                 self.expect(&Tok::RParen)?;
                 self.current = 0;
                 self.slots = 1;
                 self.edge_hop = None; // the reconverged frontier is not a just-hopped edge
-                                      // The output is the body's frontier OR the source (fallback) — an edge is in
-                                      // scope only where BOTH have one.
+                if body_always_produces {
+                    // Take the body's ending frontier — the fallback never fires.
+                    self.edge_scope = body_edge_scope;
+                    self.current_is_element = body_frontier.0;
+                    self.current_is_scalar = body_frontier.1;
+                    self.current_is_path = body_frontier.2;
+                    self.on_edge = self.edge_scope == Some(true);
+                    // The reducer terminal RESETS the traverser path, so a following path() is
+                    // the reduced value (consistent with the aggregate fast-path above and
+                    // `count().path()`); parse_sub_body_seeded restored the flag to the branch
+                    // input's, so set it back here for the reducer output.
+                    self.frontier_from_reducer = true;
+                    return Ok(plan.per_element_branch(
+                        crate::ir::PerElemKind::Optional,
+                        None,
+                        vec![body.reconverge(oc)],
+                        from,
+                    ));
+                }
+                // The output is the body's frontier OR the source (fallback) — an edge is in
+                // scope only where BOTH have one.
                 self.edge_scope = combine_edge_scope(&[incoming_edge_scope, body_edge_scope]);
                 // Post-branch VALUE + ADJACENCY frontier is UNKNOWN (element/scalar/path cleared)
                 // so a following sum/values/adjacency reaches the runtime check; only edge_scope
@@ -1961,7 +2016,19 @@ impl Parser {
                 // that keeps only rows with at least one present, sidestepping the
                 // Exists-over-a-projection provenance limitation.
                 let from = self.current;
-                if let Some(keys) = self.try_all_values_bodies() {
+                // The all-`values` fast-path (a scalar Case over PropertyExists) skips the
+                // per-arm element-type guard, so take it ONLY over a DEFINITE element frontier.
+                // Over a scalar/path input (`count().coalesce(values,values)`,
+                // `path().coalesce(values,values)`) it wrongly succeeded where pure-TS faults on
+                // the arm's `values()`; routing those to the general per-element path below runs
+                // each arm through `step()`, which faults values-on-scalar / values-on-path. An
+                // UNKNOWN frontier (post-branch) also falls through → the arm reaches the runtime.
+                let fast_keys = if self.current_is_element {
+                    self.try_all_values_bodies()
+                } else {
+                    None
+                };
+                if let Some(keys) = fast_keys {
                     let present = |k: &str| Expr::PropertyExists {
                         slot: from,
                         key: k.to_string(),
@@ -1997,6 +2064,14 @@ impl Parser {
                     self.current = 0;
                     self.slots = 1;
                     self.edge_scope = Some(false); // an all-values coalesce yields a scalar
+                                                   // Post-branch frontier is UNKNOWN (like the general coalesce below), NOT the
+                                                   // stale incoming element — else `outE().coalesce(values, values).both()` read
+                                                   // the pre-coalesce edge frontier and statically faulted, where pure-TS clears
+                                                   // to unknown and lets both() reach the runtime (→ [] / count 0).
+                    self.current_is_element = false;
+                    self.current_is_scalar = false;
+                    self.current_is_path = false;
+                    self.on_edge = false;
                     return Ok(p);
                 }
                 // General: run each arm PER ELEMENT (TinkerPop per-traverser coalesce) — the
@@ -5888,6 +5963,12 @@ impl Parser {
         let saved_is_path = self.current_is_path;
         let saved_is_map = self.current_is_map;
         let saved_edge_scope = self.edge_scope;
+        // Each arm starts from the branch-input frontier, so a reducer in one arm must NOT leak
+        // its path-reset into the NEXT arm's `path()` lowering: `union(count(), path())` left
+        // `frontier_from_reducer` set after the count() arm, so the path() arm rendered just its
+        // reduced value `[dst]` instead of the full `[src, dst]` — order-dependently (path() first
+        // was fine). Restore to the branch-input value at exit (below) so the next arm is clean.
+        let saved_from_reducer = self.frontier_from_reducer;
         self.current = from;
         self.slots = width;
         // Optional leading `__.` (an anonymous traversal). The body is then a `.`-
@@ -5905,22 +5986,32 @@ impl Parser {
             Some(Tok::Ident(s)) => s.to_ascii_lowercase(),
             _ => String::new(),
         };
+        let mut last_step = String::new();
         if matches!(self.peek(), Some(Tok::Ident(_))) {
             let name = step_name_of(self);
             body = self.step(body)?;
             body = self.maybe_path_record(body, &name);
+            last_step = name;
             while self.peek() == Some(&Tok::Dot) {
                 self.bump();
                 let name = step_name_of(self);
                 body = self.step(body)?;
                 body = self.maybe_path_record(body, &name);
+                last_step = name;
             }
         }
         let out_current = self.current;
         let out_slots = self.slots;
-        // Capture the arm's OUTPUT edge-in-scope + frontier KIND before restoring, so a branch
-        // lowering can combine its arms.
+        // Capture the arm's OUTPUT edge-in-scope + frontier KIND + terminal step before restoring,
+        // so a branch lowering can combine its arms (and `optional` can take an always-producing
+        // body's ending frontier).
         self.last_arm_edge_scope = self.edge_scope;
+        self.last_arm_frontier = (
+            self.current_is_element,
+            self.current_is_scalar,
+            self.current_is_path,
+        );
+        self.last_arm_last_step = last_step;
         self.current = saved_current;
         self.slots = saved_slots;
         self.edge_hop = saved_edge;
@@ -5932,6 +6023,7 @@ impl Parser {
         self.current_is_path = saved_is_path;
         self.current_is_map = saved_is_map;
         self.edge_scope = saved_edge_scope;
+        self.frontier_from_reducer = saved_from_reducer;
         Ok((body, out_current, out_slots))
     }
 

@@ -2616,43 +2616,57 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // build the wide intermediate batch. Falls back to the general
             // aggregate for every shape it does not recognize. (The fused paths
             // never evaluate arbitrary expressions, so they cannot fault.)
-            let mut out = if let Some(b) = try_scan_count(input, keys, aggs, store)
-                .or_else(|| try_filtered_count(input, keys, aggs, store))
-                .or_else(|| {
-                    (keys.is_empty()
-                        && aggs.len() == 1
-                        && aggs[0].func == AggFn::Count
-                        && aggs[0].arg.is_none()
-                        && !aggs[0].distinct)
-                        .then(|| try_fused_hop_num_count(input, store))
-                        .flatten()
-                        .map(|c| scalar_num(c as f64))
+            // A raw `order()` over a (possibly-element) frontier feeding the count carries a
+            // runtime type-check the fast paths would elide — bail to general exec so it runs.
+            let shortcuts_ok = !plan_has_raw_element_order(input);
+            let mut out = if let Some(b) = shortcuts_ok
+                .then(|| {
+                    try_scan_count(input, keys, aggs, store)
+                        .or_else(|| try_filtered_count(input, keys, aggs, store))
+                        .or_else(|| {
+                            (keys.is_empty()
+                                && aggs.len() == 1
+                                && aggs[0].func == AggFn::Count
+                                && aggs[0].arg.is_none()
+                                && !aggs[0].distinct)
+                                .then(|| try_fused_hop_num_count(input, store))
+                                .flatten()
+                                .map(|c| scalar_num(c as f64))
+                        })
+                        .or_else(|| try_fused_hop_mask_agg(input, keys, aggs, store))
+                        .or_else(|| try_edge_filtered_count(input, keys, aggs, store))
+                        .or_else(|| try_varlen_count(input, keys, aggs, store))
+                        .or_else(|| try_edge_cross_count(input, keys, aggs, store))
+                        .or_else(|| try_frontier_count(input, keys, aggs, store))
+                        .or_else(|| try_varlen_distinct_count(input, keys, aggs, store))
+                        .or_else(|| try_varlen_distinctby_count(input, keys, aggs, store))
+                        .or_else(|| try_varlen_agg(input, keys, aggs, store))
+                        .or_else(|| try_frontier_prop_agg(input, keys, aggs, store))
+                        .or_else(|| try_scan_num_agg(input, keys, aggs, store))
+                        .or_else(|| try_filtered_scan_num_agg(input, keys, aggs, store))
+                        .or_else(|| try_scan_multi_agg(input, keys, aggs, store))
+                        .or_else(|| try_scan_distinct_count(input, keys, aggs, store))
+                        .or_else(|| try_frontier_distinct_count(input, keys, aggs, store))
+                        .or_else(|| try_3hop_product_count(input, keys, aggs, store))
+                        .or_else(|| try_fused_count(input, keys, aggs, store))
+                        .or_else(|| try_node_grouped_count(input, keys, aggs, store))
+                        .or_else(|| try_scan_dict_count(input, keys, aggs, store))
+                        .or_else(|| try_frontier_dict_count(input, keys, aggs, store, track))
+                        .or_else(|| try_scan_group_agg(input, keys, aggs, store))
                 })
-                .or_else(|| try_fused_hop_mask_agg(input, keys, aggs, store))
-                .or_else(|| try_edge_filtered_count(input, keys, aggs, store))
-                .or_else(|| try_varlen_count(input, keys, aggs, store))
-                .or_else(|| try_edge_cross_count(input, keys, aggs, store))
-                .or_else(|| try_frontier_count(input, keys, aggs, store))
-                .or_else(|| try_varlen_distinct_count(input, keys, aggs, store))
-                .or_else(|| try_varlen_distinctby_count(input, keys, aggs, store))
-                .or_else(|| try_varlen_agg(input, keys, aggs, store))
-                .or_else(|| try_frontier_prop_agg(input, keys, aggs, store))
-                .or_else(|| try_scan_num_agg(input, keys, aggs, store))
-                .or_else(|| try_filtered_scan_num_agg(input, keys, aggs, store))
-                .or_else(|| try_scan_multi_agg(input, keys, aggs, store))
-                .or_else(|| try_scan_distinct_count(input, keys, aggs, store))
-                .or_else(|| try_frontier_distinct_count(input, keys, aggs, store))
-                .or_else(|| try_3hop_product_count(input, keys, aggs, store))
-                .or_else(|| try_fused_count(input, keys, aggs, store))
-                .or_else(|| try_node_grouped_count(input, keys, aggs, store))
-                .or_else(|| try_scan_dict_count(input, keys, aggs, store))
-                .or_else(|| try_frontier_dict_count(input, keys, aggs, store, track))
-                .or_else(|| try_scan_group_agg(input, keys, aggs, store))
+                .flatten()
             {
                 b
-            } else if let Some(b) = try_frontier_group_fold(input, keys, aggs, store) {
+            } else if let Some(b) = shortcuts_ok
+                .then(|| try_frontier_group_fold(input, keys, aggs, store))
+                .flatten()
+            {
                 b
-            } else if let Some(b) = try_frontier_aggregate(input, keys, aggs, store)? {
+            } else if let Some(b) = if shortcuts_ok {
+                try_frontier_aggregate(input, keys, aggs, store)?
+            } else {
+                None
+            } {
                 b
             } else {
                 aggregate(&pull(input, store, track)?, store, keys, aggs)?
@@ -7414,6 +7428,43 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
 }
 
 /// The number of `Expand` hops in a pure Scan/Expand chain (0 for a bare seed).
+/// A raw `order()` / `order().by(desc)` — a bare self-slot sort key — somewhere on the linear
+/// spine feeding a count. It sorts the current element itself, which faults over graph elements
+/// at RUNTIME (see [`order_page`]); a build-time fault only fires when the frontier is a KNOWN
+/// element, and a post-branch frontier is unknown, so this shape reaches the runtime check.
+/// The count fast-paths peel `order()` away (a sort cannot change a count), which would ALSO
+/// swallow that fault and silently return a count where pure-TS rejects the query. When one is
+/// present, bail to general execution so the order runs and rejects an element frontier. A keyed
+/// `by('k')`/`by(id)` sort projects a comparable scalar and is fine — its key is not a bare
+/// `Slot`, so it is not flagged here.
+fn plan_has_raw_element_order(p: &Plan) -> bool {
+    match p {
+        Plan::OrderPage { input, keys, .. } => {
+            keys.iter().any(|k| matches!(k.expr, Expr::Slot(_)))
+                || plan_has_raw_element_order(input)
+        }
+        // The single-input wrappers the count fast-paths peel through — follow the spine.
+        Plan::Expand { input, .. }
+        | Plan::OptionalExpand { input, .. }
+        | Plan::EdgeVertex { input, .. }
+        | Plan::VarLength { input, .. }
+        | Plan::Filter { input, .. }
+        | Plan::Distinct { input }
+        | Plan::DistinctBy { input, .. }
+        | Plan::Sample { input, .. }
+        | Plan::Enumerate { input, .. }
+        | Plan::Tail { input, .. }
+        | Plan::Project { input, .. }
+        | Plan::Reconverge { input, .. }
+        | Plan::SortLocal { input, .. }
+        | Plan::PathRecord { input, .. }
+        | Plan::NullPadIfEmpty { input, .. }
+        | Plan::Branch { input, .. }
+        | Plan::PerElementBranch { input, .. } => plan_has_raw_element_order(input),
+        _ => false,
+    }
+}
+
 fn count_hops(plan: &Plan) -> usize {
     match plan {
         Plan::Sample { input, .. }
