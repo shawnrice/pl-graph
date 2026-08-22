@@ -4660,9 +4660,11 @@ fn order_page(
         // a vertex/edge (bare `order()`, `by(desc)`, or `by(<element-valued traversal>)`)
         // faults; a `by('<key>')`/`by(id)` projection is a comparable scalar and is fine.
         if key_cols.iter().any(col_has_element) {
-            return Err("order() over graph elements is not supported — elements have no \
+            return Err(
+                "order() over graph elements is not supported — elements have no \
                         natural order; use order().by('<key>')"
-                .into());
+                    .into(),
+            );
         }
         let key_cols = typed_key_cols(key_cols);
         sort_idx(&mut idx, &key_cols, keys, end);

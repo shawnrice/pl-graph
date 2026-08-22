@@ -189,6 +189,7 @@ const sortByBys = <T>(
     item,
     keys: bys.map((by) => evalBy(by, project(item), graph, ctx)),
   }));
+
   // A raw graph element has no natural order. The parse-time check in `checkStep`
   // rejects a pure-element `order()`, but an element still reaches here in a MIXED
   // stream (`both(...).inject(1).order()`) whose frontier is no longer "element", or
@@ -200,6 +201,7 @@ const sortByBys = <T>(
       { code: ErrorCode.Syntax },
     );
   }
+
   keyed.sort((a, b) => {
     for (let i = 0; i < bys.length; i++) {
       const c = compareTotal(a.keys[i], b.keys[i]) * (dirs[i] === 'desc' ? -1 : 1);

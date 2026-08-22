@@ -1132,7 +1132,11 @@ fn path_of_path_nests_the_prior_path() {
         let GVal::List(nested) = &outer[2] else {
             panic!("third element is the nested path, got {:?}", outer[2]);
         };
-        assert_eq!(nested.len(), 2, "the nested path is the original 2-element path");
+        assert_eq!(
+            nested.len(),
+            2,
+            "the nested path is the original 2-element path"
+        );
     }
 }
 
@@ -1148,7 +1152,11 @@ fn path_inside_a_union_arm_records_the_arm_hop() {
     let GVal::List(p) = &rows[0] else {
         panic!("expected a path list, got {:?}", rows[0]);
     };
-    assert_eq!(p.len(), 2, "the arm's out() hop is recorded: [source, neighbour]");
+    assert_eq!(
+        p.len(),
+        2,
+        "the arm's out() hop is recorded: [source, neighbour]"
+    );
     assert!(matches!(p[0], GVal::Node(_)));
     assert!(matches!(p[1], GVal::Node(_)));
 }
@@ -2797,7 +2805,9 @@ fn order_over_elements_faults_pure_and_mixed() {
     // element flag) is caught at runtime when the sort key resolves to a vertex/edge.
     // Both fault — and the TS engine faults the same way (fuzzer parity).
     assert!(rejects("g.V().order().by(desc)"));
-    assert!(rejects("g.V().both('CREATED', 'KNOWS').inject(1).order().by(desc)"));
+    assert!(rejects(
+        "g.V().both('CREATED', 'KNOWS').inject(1).order().by(desc)"
+    ));
     assert!(rejects("g.V().inject(1).order()"));
     // A `by('<key>')`/`by(id)` projection yields a comparable scalar and is still fine.
     assert!(!rejects("g.V().order().by('name')"));

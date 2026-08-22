@@ -3267,8 +3267,7 @@ impl Parser {
                 // there directly rather than falling into the vertex-hop branch.
                 if self.current_is_path {
                     let bys = self.parse_path_bys()?;
-                    let p =
-                        plan.project(vec![("path".to_string(), Expr::GremlinFullPath { bys })]);
+                    let p = plan.project(vec![("path".to_string(), Expr::GremlinFullPath { bys })]);
                     self.current = 0;
                     self.slots = 1;
                     self.current_is_element = false;
