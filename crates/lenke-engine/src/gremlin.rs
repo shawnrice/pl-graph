@@ -124,96 +124,6 @@ fn combine_arm_frontier(arms: &[ArmFrontier]) -> (bool, bool, bool, bool) {
     (is_element, is_scalar, is_path, all_edge)
 }
 
-/// A coalesce/branch ARM made ONLY of per-element-identity or per-element-empty stream
-/// barriers (order/limit/range/skip/dedup) over leading FILTERS — no hop, projection,
-/// aggregate, or nested branch. Returns `(filter_only_body, always_fires)`: in a PER-ELEMENT
-/// branch each barrier over a single traverser reduces to identity (`range(0,hi>0)`,
-/// `limit(n>=1)`, `skip(0)`, `dedup`, bare `order`) or empties it (`limit(0)`, `skip(n>=1)`,
-/// `range(lo>0,·)`, `range(x,x)`). Native runs the arm WHOLE-STREAM, so `coalesce(hasLabel(
-/// 'X'), range(0,1))` sliced the batch to one row instead of yielding every element. Stripping
-/// the identity barriers (and dropping a never-firing arm) restores TinkerPop's per-element
-/// semantics. `None` when the arm is not a pure barrier(+filter) chain (it keeps its normal
-/// whole-stream lowering).
-/// A `limit(0)` (or an empty `range(x,x)`) anywhere in a coalesce/branch arm empties the
-/// single traverser regardless of any hops around it, so the arm NEVER fires per element —
-/// `coalesce(limit(0).inE('X'), dedup())` falls entirely through to the `dedup()` arm. Walk
-/// the linear operator chain looking for such a barrier. (`limit(n>=1)`/`skip(n)` depend on
-/// the per-hop stream size and are handled per-arm by `strip_barrier_arm`, not here.)
-fn arm_always_empty(p: &Plan) -> bool {
-    // Walk bottom-up (Row is the base) tracking whether a hop has grown the per-element stream
-    // beyond the single seed traverser. `limit(0)`/empty-range empties ANY stream; a `skip(n>0)`
-    // empties the SIZE-1 stream that exists before the first hop — `skip(1).inV()` yields nothing
-    // per element, `out().skip(1)` may not. Returns (empty, hopped).
-    fn walk(p: &Plan) -> (bool, bool) {
-        match p {
-            Plan::Row => (false, false),
-            Plan::OrderPage {
-                input, skip, limit, ..
-            } => {
-                let (below_empty, hopped) = walk(input);
-                if below_empty {
-                    return (true, hopped);
-                }
-                let empties = *limit == Some(0) || (!hopped && skip.unwrap_or(0) > 0);
-                (empties, hopped)
-            }
-            Plan::Expand { input, .. }
-            | Plan::EdgeVertex { input, .. }
-            | Plan::VarLength { input, .. }
-            | Plan::OptionalExpand { input, .. } => (walk(input).0, true),
-            Plan::Filter { input, .. }
-            | Plan::Distinct { input }
-            | Plan::DistinctBy { input, .. }
-            | Plan::Project { input, .. } => walk(input),
-            _ => (false, false),
-        }
-    }
-    walk(p).0
-}
-
-fn strip_barrier_arm(body: Plan) -> Option<(Plan, bool, Vec<Expr>)> {
-    let mut fires = true;
-    let mut preds: Vec<Expr> = Vec::new();
-    let mut cur = body;
-    loop {
-        match cur {
-            Plan::OrderPage {
-                input, skip, limit, ..
-            } => {
-                // A single traverser: skip>0 drops it, limit(0) drops it; else identity.
-                if skip.unwrap_or(0) > 0 || limit == Some(0) {
-                    fires = false;
-                }
-                cur = *input;
-            }
-            Plan::Distinct { input } | Plan::DistinctBy { input, .. } => cur = *input,
-            Plan::Filter { input, pred } => {
-                preds.push(pred);
-                cur = *input;
-            }
-            Plan::Row => {
-                // `preds` is outermost-first: the LAST is the seed guard (the caller seeds
-                // `Row.filter(guard)`), the rest are the arm's OWN filters. Those are the arm's
-                // firing condition — a barrier-LED arm (`dedup().has('lang')`) otherwise
-                // defaults `this` to Lit(true), wrongly claiming it always fires and killing a
-                // later arm. Return them so the caller can rebuild `prior`.
-                let arm_filters = if preds.is_empty() {
-                    Vec::new()
-                } else {
-                    preds[..preds.len() - 1].to_vec()
-                };
-                let mut b = Plan::Row;
-                for pred in preds.into_iter().rev() {
-                    b = b.filter(pred);
-                }
-                return Some((b, fires, arm_filters));
-            }
-            // A hop / projection / aggregate / nested branch: not a pure barrier arm.
-            _ => return None,
-        }
-    }
-}
-
 pub fn parse(query: &str) -> Result<Plan, String> {
     let toks = lex(query)?;
     // A traversal that reads a full `path()`/`tree()` records each value-producing step's
@@ -2551,164 +2461,42 @@ impl Parser {
             }
             "choose" => {
                 // choose(<cond>, <then>[, <else>]): route each element by whether <cond>
-                // produces output. A filter-leading cond (`has`/`where`/…) IS the guard;
-                // a navigating cond (`out`/`outE`/…) becomes an EXISTS over its full
-                // sub-traversal. Then/else are full sub-traversals reconverging like union
-                // (both arms a single VALUE stays a fused per-row Case projection). An
-                // absent else is implicit identity — the source element passes through.
+                // produces output — PER ELEMENT (TinkerPop). cond/then/else are plain
+                // sub-traversals; the routing runs at exec (Plan::PerElementBranch), so a
+                // barrier/aggregate inside any of them applies per traverser and the cond's
+                // truth is UNIFORMLY "produces >=1 output": a filter cond yields the element
+                // iff it passes, a navigating cond iff the hop exists, an aggregate cond
+                // (`count()`) always. An absent else passes the source element through.
                 let from = self.current;
                 let slots = self.slots;
                 let incoming_edge_scope = self.edge_scope; // an absent else is the source
-                                                           // Seed the arms with the outer edge hop so a leading `otherV()`/`inV()`
-                                                           // off `V().outE()` resolves against its origin (see parse_sub_body_seeded).
+                let incoming_front = ArmFrontier {
+                    is_element: self.current_is_element,
+                    is_scalar: self.current_is_scalar,
+                    is_path: self.current_is_path,
+                    on_edge: self.on_edge,
+                };
+                // The cond: a sub-traversal whose truth is "produces output". Seed the outer
+                // edge hop so a leading otherV()/inV() resolves against its origin.
                 self.edge_hop = prev_edge_hop;
-                // The cond is a per-row PREDICATE (`has`/`where`/`values('k').is(…)`/
-                // `outE().count().is(…)` — everything `child_filter_expr` parses) OR a
-                // bare NAVIGATING traversal (`out('K')`, `outE('K')`) whose truth is
-                // "produces output" = a correlated EXISTS. Try the predicate first;
-                // restore and take the EXISTS path only when it is not a predicate.
-                let save = self.pos;
-                // A cond whose LAST step is a nullary aggregate (`count()`, `has(…).count()`)
-                // ALWAYS emits a value, so its truth is unconditionally true → the then-arm for
-                // every element. Detect it before child_filter_expr (which would parse a bare
-                // `count()` as a wrong value predicate) by scanning to the top-level `,`.
-                let cond_agg_comma = {
-                    let mut p = self.pos;
-                    let mut depth = 0i32;
-                    loop {
-                        match self.toks.get(p) {
-                            Some(Tok::LParen) => depth += 1,
-                            Some(Tok::RParen) => {
-                                if depth == 0 {
-                                    break None;
-                                }
-                                depth -= 1;
-                            }
-                            Some(Tok::Comma) if depth == 0 => break Some(p),
-                            None => break None,
-                            _ => {}
-                        }
-                        p += 1;
-                    }
-                    .filter(|&c| {
-                        c >= 3
-                            && self.toks.get(c - 1) == Some(&Tok::RParen)
-                            && self.toks.get(c - 2) == Some(&Tok::LParen)
-                            && matches!(self.toks.get(c - 3), Some(Tok::Ident(s)) if {
-                                let l = s.to_ascii_lowercase();
-                                matches!(l.as_str(), "count" | "fold" | "sum" | "min" | "max" | "mean")
-                            })
-                    })
-                };
-                if let Some(comma) = cond_agg_comma {
-                    self.pos = comma; // consume the always-true cond
-                }
-                // A LEADING per-element barrier in the cond (`limit(2).outE(…)`, `skip(1).out(…)`)
-                // is a no-op on the single traverser (limit(2) on [t] = [t]) or empties it
-                // (limit(0)/skip(n>0)); native's EXISTS over the whole body would apply it
-                // WHOLE-STREAM (first N rows). Consume it, tracking whether it empties, so the
-                // EXISTS runs over the REST — matching TinkerPop/pure-TS's per-element cond.
-                let mut cond_barrier_empty = false;
-                if cond_agg_comma.is_none() {
-                    while matches!(self.peek(), Some(Tok::Ident(s)) if {
-                        let l = s.to_ascii_lowercase();
-                        (l == "limit" || l == "skip" || l == "range")
-                            && self.toks.get(self.pos + 1) == Some(&Tok::LParen)
-                    }) {
-                        let b = self.ident()?.to_ascii_lowercase();
-                        self.expect(&Tok::LParen)?;
-                        match b.as_str() {
-                            "limit" => {
-                                if self.usize_arg()? == 0 {
-                                    cond_barrier_empty = true;
-                                }
-                            }
-                            "skip" => {
-                                if self.usize_arg()? > 0 {
-                                    cond_barrier_empty = true;
-                                }
-                            }
-                            _ => {
-                                let lo = self.usize_arg()?;
-                                self.expect(&Tok::Comma)?;
-                                let hi = self.usize_arg()?;
-                                if !(lo == 0 && hi > 0) {
-                                    cond_barrier_empty = true;
-                                }
-                            }
-                        }
-                        self.expect(&Tok::RParen)?;
-                        if self.peek() == Some(&Tok::Dot) {
-                            self.bump(); // more cond follows the barrier
-                        } else {
-                            break; // the barrier WAS the whole cond
-                        }
-                    }
-                }
-                // A per-element-empty leading barrier makes the cond dead — skip its remainder
-                // (an unparsed hop/filter) to the top-level comma before the then-arm.
-                if cond_barrier_empty && self.peek() != Some(&Tok::Comma) {
-                    let mut depth = 0i32;
-                    while let Some(t) = self.peek() {
-                        match t {
-                            Tok::LParen => depth += 1,
-                            Tok::RParen if depth == 0 => break,
-                            Tok::RParen => depth -= 1,
-                            Tok::Comma if depth == 0 => break,
-                            _ => {}
-                        }
-                        self.bump();
-                    }
-                }
-                let (guard, cond_is_filter): (Expr, bool) = if cond_agg_comma.is_some() {
-                    (Expr::Lit(Value::Bool(true)), false)
-                } else if cond_barrier_empty {
-                    (Expr::Lit(Value::Bool(false)), false) // a per-element-empty barrier: never fires
-                } else if self.peek() == Some(&Tok::Comma) {
-                    (Expr::Lit(Value::Bool(true)), false) // the cond was only kept barriers → always fires
-                } else {
-                    match self.child_filter_expr() {
-                        // A complete predicate cond is followed by the `,` before the then-arm.
-                        // If the cursor is still at `.` (`has('age').count()`, `outV().has(…)`),
-                        // child_filter_expr consumed only a PREFIX — the cond is a sub-traversal
-                        // whose truth is "produces output", so fall through to the EXISTS path.
-                        Ok(pred) if self.peek() == Some(&Tok::Comma) => (pred, true),
-                        _ => {
-                            self.pos = save;
-                            // Reserve slot `slots` for the provenance column the EXISTS eval
-                            // inserts (parse at width `slots + 1`) so a multi-hop cond's
-                            // intermediate slots stay aligned.
-                            let (cond_body, _oc, _os) =
-                                self.parse_sub_body_seeded(Plan::Row, from, slots + 1)?;
-                            // A cond that ends in an AGGREGATE (`count()`, `has(…).count()`) ALWAYS
-                            // emits a value, so its truth is unconditionally true → the then-arm for
-                            // every element (matches TinkerPop/TS). EXISTS over an Aggregate body is
-                            // also wrong here: the aggregate collapses to one row, losing the
-                            // per-outer provenance, so it fired for only one element.
-                            if matches!(cond_body, Plan::Aggregate { .. }) {
-                                (Expr::Lit(Value::Bool(true)), false)
-                            } else {
-                                (
-                                    Expr::Exists {
-                                        body: Box::new(cond_body),
-                                        outer_width: slots,
-                                    },
-                                    false,
-                                )
-                            }
-                        }
-                    }
-                };
+                let (cond_body, _cc, _cs) = self.parse_sub_body_seeded(Plan::Row, from, slots)?;
                 self.expect(&Tok::Comma)?;
-                // A `drop()` then-arm (no else): delete the elements the guard keeps —
-                // a terminal write, so nothing reconverges.
+                // A `drop()` then-arm (no else): a WRITE, which the per-element read path cannot
+                // run. Lower it to a TOP-LEVEL Update over the guarded frontier (the elements
+                // whose cond produces output) — `is_write` then sees it and run_update deletes.
                 if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("drop"))
                     && self.toks.get(self.pos + 1) == Some(&Tok::LParen)
+                    && self.toks.get(self.pos + 2) == Some(&Tok::RParen)
+                    && self.toks.get(self.pos + 3) == Some(&Tok::RParen)
                 {
                     self.bump(); // drop
                     self.expect(&Tok::LParen)?;
                     self.expect(&Tok::RParen)?;
                     self.expect(&Tok::RParen)?; // close choose(...)
+                    let guard = Expr::Exists {
+                        body: Box::new(cond_body),
+                        outer_width: slots,
+                    };
                     return Ok(Plan::Update {
                         input: Box::new(plan.filter(guard)),
                         ops: vec![crate::ir::SetOp::Delete {
@@ -2717,99 +2505,58 @@ impl Parser {
                         }],
                     });
                 }
-                // Fused Case projection: both arms a single VALUE (only when the guard is
-                // a plain filter predicate — a Case branch tests a row predicate, not a
-                // subquery). Restore the cursor if it is NOT a both-value choose.
-                if cond_is_filter {
-                    let save = self.pos;
-                    if let Some(then_val) = self.parse_single_value_body(from)? {
-                        if self.peek() == Some(&Tok::Comma) {
-                            self.bump();
-                            if let Some(else_val) = self.parse_single_value_body(from)? {
-                                if self.peek() == Some(&Tok::RParen) {
-                                    self.bump();
-                                    let p = plan.project(vec![(
-                                        "choose".to_string(),
-                                        Expr::Case {
-                                            branches: vec![(guard.clone(), then_val)],
-                                            otherwise: Some(Box::new(else_val)),
-                                        },
-                                    )]);
-                                    self.current = 0;
-                                    self.slots = 1;
-                                    self.edge_scope = Some(false); // both arms are scalars
-                                    return Ok(p);
-                                }
-                            }
-                        }
-                    }
-                    self.pos = save; // not a both-value choose → general reconverge path
-                }
-                // General: THEN guarded by the cond, ELSE by its negation (or, if the else
-                // arm is absent, implicit identity — the source element). Both reconverge.
-                // An aggregate-terminal arm (`count()`/`fold()`/…) reduces PER ELEMENT under
-                // choose (unlike union's whole-stream), so lower it to a correlated per-row
-                // aggregate projection rather than a whole-stream reducing body.
-                // A pure-barrier arm (order/limit/range/skip/dedup over filters) is per-element
-                // identity or empty — strip it, exactly as for coalesce, so `choose(cond,
-                // range(0,2), limit(1))` yields every routed element, not a whole-stream slice.
-                let never = || {
-                    Plan::Row
-                        .filter(Expr::Lit(Value::Bool(false)))
-                        .reconverge(from)
+                // The then arm.
+                self.edge_hop = prev_edge_hop;
+                let (then_b, then_oc, _os) = self.parse_sub_body_seeded(Plan::Row, from, slots)?;
+                let then_es = self.last_arm_edge_scope;
+                let then_front = ArmFrontier {
+                    is_element: self.last_arm_is_element,
+                    is_scalar: self.last_arm_is_scalar,
+                    is_path: self.last_arm_is_path,
+                    on_edge: self.last_arm_on_edge,
                 };
-                let strip_choose_arm = |b: Plan, oc: usize| {
-                    if arm_always_empty(&b) {
-                        return never();
-                    }
-                    match strip_barrier_arm(b.clone()) {
-                        Some((stripped, true, _)) => stripped.reconverge(from),
-                        // Never fires per element → the routed element yields nothing.
-                        Some((_, false, _)) => never(),
-                        None => b.reconverge(oc),
-                    }
-                };
-                let mut then_es = Some(false); // an aggregate then-arm yields a scalar
-                let then_body = if let Some(agg) = self.try_per_element_agg(from, slots)? {
-                    Plan::Row
-                        .filter(guard.clone())
-                        .project(vec![("choose".to_string(), agg)])
-                        .reconverge(0)
-                } else {
-                    let (b, oc, _os) =
-                        self.parse_sub_body_seeded(Plan::Row.filter(guard.clone()), from, slots)?;
-                    then_es = self.last_arm_edge_scope;
-                    strip_choose_arm(b, oc)
-                };
-                let mut else_es = incoming_edge_scope; // an absent else is the source element
-                let else_arm = if self.peek() == Some(&Tok::Comma) {
+                let mut arms = vec![then_b.reconverge(then_oc)];
+                let mut arm_fronts = vec![then_front];
+                let mut arm_edge_scopes = vec![then_es];
+                let has_else = self.peek() == Some(&Tok::Comma);
+                if has_else {
                     self.bump();
-                    if let Some(agg) = self.try_per_element_agg(from, slots)? {
-                        else_es = Some(false);
-                        Plan::Row
-                            .filter(Expr::Not(Box::new(guard)))
-                            .project(vec![("choose".to_string(), agg)])
-                            .reconverge(0)
-                    } else {
-                        let (else_body, else_oc, _os) = self.parse_sub_body_seeded(
-                            Plan::Row.filter(Expr::Not(Box::new(guard))),
-                            from,
-                            slots,
-                        )?;
-                        else_es = self.last_arm_edge_scope;
-                        strip_choose_arm(else_body, else_oc)
-                    }
+                    self.edge_hop = prev_edge_hop;
+                    let (else_b, else_oc, _os) =
+                        self.parse_sub_body_seeded(Plan::Row, from, slots)?;
+                    arm_edge_scopes.push(self.last_arm_edge_scope);
+                    arm_fronts.push(ArmFrontier {
+                        is_element: self.last_arm_is_element,
+                        is_scalar: self.last_arm_is_scalar,
+                        is_path: self.last_arm_is_path,
+                        on_edge: self.last_arm_on_edge,
+                    });
+                    arms.push(else_b.reconverge(else_oc));
                 } else {
-                    Plan::Row
-                        .filter(Expr::Not(Box::new(guard)))
-                        .reconverge(from)
-                };
+                    // The implicit else is the SOURCE element — combine with the incoming
+                    // frontier for the output-type inference below.
+                    arm_edge_scopes.push(incoming_edge_scope);
+                    arm_fronts.push(incoming_front);
+                }
                 self.expect(&Tok::RParen)?;
                 self.current = 0;
                 self.slots = 1;
                 self.edge_hop = None; // the reconverged frontier is not a just-hopped edge
-                self.edge_scope = combine_edge_scope(&[then_es, else_es]);
-                plan.branch(vec![then_body, else_arm])
+                self.edge_scope = combine_edge_scope(&arm_edge_scopes);
+                // Post-branch VALUE + ADJACENCY frontier is unknown (see coalesce); only
+                // edge_scope (endpoints), an all-path frontier, and on_edge for an all-edge
+                // branch (endpoint read) propagate.
+                let (_e, _s, is_path, all_edge) = combine_arm_frontier(&arm_fronts);
+                self.current_is_element = false;
+                self.current_is_scalar = false;
+                self.current_is_path = is_path;
+                self.on_edge = all_edge;
+                return Ok(plan.per_element_branch(
+                    crate::ir::PerElemKind::Choose { has_else },
+                    Some(cond_body),
+                    arms,
+                    from,
+                ));
             }
             "and" | "or" => {
                 // and(f1, f2, …) / or(f1, f2, …): each child is an element filter
