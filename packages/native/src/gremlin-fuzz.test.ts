@@ -360,6 +360,24 @@ const hasTopLevelOrder = (text: string): boolean => {
   return false;
 };
 
+// `order()` over a stream of PATHS (a path()/tree() before the order) has no cross-engine
+// contract: a path contains graph elements, and elements have no natural order, so native
+// (orders by element id) and the TS engine (stable / input order) legitimately disagree while
+// TinkerPop specifies its own third order. The MULTISET of paths is identical, so compare it
+// unordered — same policy as an unspecified adjacency / reconverging-branch order.
+const orderOverPaths = (text: string): boolean => {
+  const p = Math.min(
+    ...['path()', 'tree()'].map((s) => {
+      const i = text.indexOf(s);
+
+      return i < 0 ? Infinity : i;
+    }),
+  );
+  const o = text.indexOf('order(');
+
+  return o >= 0 && p < o;
+};
+
 const etypes = (r: () => number): string[] =>
   pick(r, [
     ['KNOWS'],
@@ -633,7 +651,9 @@ suite('differential fuzz: gremlin (TS engine vs Rust ENGINE)', () => {
       // Either an unspecified adjacency order (multi-type) OR a per-element reconverging
       // branch (coalesce/choose/optional) leaves the result order unspecified.
       const orderUnspecified = multiType || RECONVERGING_BRANCH.test(text);
-      const unordered = orderUnspecified && !hasTopLevelOrder(text);
+      // A path-stream order() is unspecified even WITH a top-level order() (the order() IS the
+      // unspecified step), so it forces `unordered` on its own.
+      const unordered = (orderUnspecified && !hasTopLevelOrder(text)) || orderOverPaths(text);
 
       // A positional slice of an unspecified order picks an unspecified SUBSET,
       // and every step after it inherits that — not just the order but which
