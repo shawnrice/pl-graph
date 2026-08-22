@@ -566,6 +566,10 @@ pub enum Plan {
         input: Box<Plan>,
         edge_slot: usize,
         which: Dir,
+        /// `otherV()` off a bare edge frontier (a reconverged branch of edges): the endpoint
+        /// the traverser did NOT arrive from. Resolved per row from the lineage's reference
+        /// vertex (the last node in the path); `which` is ignored. Requires lineage.
+        other: bool,
     },
     /// The correlated current row — the leaf of an `EXISTS { … }` body. It is NOT
     /// a stand-alone source: it yields whatever batch the enclosing `Expr::Exists`

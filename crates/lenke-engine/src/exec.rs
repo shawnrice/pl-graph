@@ -1945,9 +1945,10 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::CallProcedure { .. }
         | Plan::TxControl { .. }
         | Plan::InsertFrom { .. } => false,
+        // otherV off a bare edge reads the lineage reference vertex.
+        Plan::EdgeVertex { input, other, .. } => *other || needs_lineage(input),
         Plan::Sample { input, .. }
         | Plan::Enumerate { input, .. }
-        | Plan::EdgeVertex { input, .. }
         | Plan::Expand { input, .. }
         | Plan::OptionalExpand { input, .. }
         | Plan::VarLength { input, .. }
@@ -2156,10 +2157,12 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             input,
             edge_slot,
             which,
+            other,
         } => {
             // Edge frontier → endpoint vertex. Out=src (outV), In=dst (inV), Both=both
-            // (fans out to two rows/edge). The endpoint lands in a new appended slot;
-            // every other slot is carried through (duplicated for Both).
+            // (fans out to two rows/edge). `other`=otherV: the endpoint the traverser did NOT
+            // arrive from, read from the lineage's reference vertex. The endpoint lands in a
+            // new appended slot; every other slot is carried through (duplicated for Both).
             let b = pull(input, store, track)?;
             let n = b.rows();
             let mut keep: Vec<usize> = Vec::new();
@@ -2175,6 +2178,26 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 let Some((src, dst)) = store.edge_endpoints(eid) else {
                     continue;
                 };
+                if *other {
+                    // The reference vertex is the last node in the row's path (where the
+                    // traverser arrived before this edge); otherV is the opposite endpoint. A
+                    // BARE edge source (`g.E().otherV()`) has no reference vertex → fault, like
+                    // TinkerPop/pure-TS.
+                    let Some(reference) = b
+                        .lineage
+                        .as_ref()
+                        .and_then(|l| l.path_at(i).last().map(num_as_u32))
+                    else {
+                        return Err(
+                            "otherV() requires a reference vertex — an edge reached from \
+                                    a vertex, not a bare edge source"
+                                .into(),
+                        );
+                    };
+                    keep.push(i);
+                    nodes.push(if reference == dst { src } else { dst });
+                    continue;
+                }
                 match which {
                     Dir::Out => {
                         keep.push(i);
@@ -3441,13 +3464,20 @@ fn streaming_chain(plan: &Plan, store: &Store) -> Option<(Plan, Vec<u32>)> {
             input,
             edge_slot,
             which,
+            other,
         } => {
+            // otherV needs the lineage reference vertex; the streaming fast path is
+            // lineage-free, so it cannot take it.
+            if *other {
+                return None;
+            }
             let (body, ids) = streaming_chain(input, store)?;
             Some((
                 Plan::EdgeVertex {
                     input: Box::new(body),
                     edge_slot: *edge_slot,
                     which: *which,
+                    other: false,
                 },
                 ids,
             ))
@@ -15076,6 +15106,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             input,
             edge_slot,
             which,
+            other,
         } => {
             let b = pull_body(input, store, seed)?;
             let mut keep: Vec<usize> = Vec::new();
@@ -15091,6 +15122,22 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
                 let Some((src, dst)) = store.edge_endpoints(eid) else {
                     continue;
                 };
+                if *other {
+                    let Some(reference) = b
+                        .lineage
+                        .as_ref()
+                        .and_then(|l| l.path_at(i).last().map(num_as_u32))
+                    else {
+                        return Err(
+                            "otherV() requires a reference vertex — an edge reached from \
+                                    a vertex, not a bare edge source"
+                                .into(),
+                        );
+                    };
+                    keep.push(i);
+                    nodes.push(if reference == dst { src } else { dst });
+                    continue;
+                }
                 match which {
                     Dir::Out => {
                         keep.push(i);

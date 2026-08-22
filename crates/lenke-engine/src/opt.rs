@@ -370,6 +370,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             input,
             edge_slot,
             which,
+            other,
         } => {
             let (i, c) = rewrite(*input, idx);
             (
@@ -377,6 +378,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                     input: Box::new(i),
                     edge_slot,
                     which,
+                    other,
                 },
                 c,
             )

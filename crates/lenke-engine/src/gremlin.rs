@@ -1293,11 +1293,13 @@ impl Parser {
                     }
                     self.expect(&Tok::RParen)?;
                     self.on_edge = true;
+                    self.edge_scope = Some(true);
                     Plan::EdgeSeed { ext_ids }
                 } else {
                     self.expect(&Tok::RParen)?;
                     // An edge source makes the path start on an edge, not a node.
                     self.on_edge = true;
+                    self.edge_scope = Some(true);
                     Plan::EdgeScan
                 }
             }
@@ -2728,16 +2730,22 @@ impl Parser {
                     // read the endpoint straight off the edge at the current slot. Only
                     // valid when the frontier actually holds edges.
                     _ if self.on_edge => {
+                        // otherV needs a reference vertex. Off a DEFINITE bare edge source
+                        // (`g.E()`, `g.E().hasLabel(...)` — still `current_is_element`) there is
+                        // none, so it faults statically (matching pure-TS). Off a reconverged
+                        // BRANCH of edges (`current_is_element` cleared) it resolves the far
+                        // endpoint from the lineage reference vertex at runtime.
+                        if lname == "otherv" && self.current_is_element {
+                            return Err("otherV() off a bare edge frontier is not supported — \
+                                        it has no reference vertex"
+                                .into());
+                        }
                         self.on_edge = false;
+                        let other = lname == "otherv";
                         let which = match lname.as_str() {
                             "outv" => Dir::Out,
                             "inv" => Dir::In,
-                            "bothv" => Dir::Both,
-                            _ => {
-                                return Err(
-                                    "otherV() off a bare edge frontier is not supported".into()
-                                )
-                            }
+                            _ => Dir::Both, // bothv, or otherv (ignored when `other`)
                         };
                         let edge_slot = self.current;
                         let landed = self.slots;
@@ -2747,6 +2755,7 @@ impl Parser {
                             input: Box::new(plan),
                             edge_slot,
                             which,
+                            other,
                         }
                     }
                     // A vertex move with no edge frontier and no preceding edge hop.
@@ -9294,7 +9303,8 @@ mod tests {
             "got {:?}",
             c.rows[0][0]
         );
-        // A bare edge frontier has no origin → otherV faults, as in TinkerPop.
+        // A bare edge frontier (or a vertex) has no reference vertex → otherV faults at PARSE,
+        // as in TinkerPop. (A reconverged BRANCH of edges resolves it — covered by the fuzzer.)
         for q in [
             "g.E().otherV()",
             "g.E().optional(otherV()).count()",
