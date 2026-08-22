@@ -1677,7 +1677,7 @@ fn merge_max(a: Option<usize>, b: Option<usize>) -> Option<usize> {
 
 /// The number of slots a plan's output rows carry — used to know which slots
 /// exist below an operator for pushdown legality.
-fn width(plan: &Plan) -> usize {
+pub(crate) fn width(plan: &Plan) -> usize {
     match plan {
         Plan::Scan { .. }
         | Plan::NodeSeed { .. }

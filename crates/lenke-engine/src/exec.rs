@@ -2665,11 +2665,12 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         } if *limit == Some(0) => {
             // LIMIT 0 keeps no rows, so the input's projection is never evaluated —
             // a faulting expression (`RETURN 1/0 AS x LIMIT 0`) must yield the empty
-            // result, not the fault. Short-circuit without pulling the input. One
-            // empty slot keeps the unnamed-output path (`batch.slot(0)`) valid; an
-            // empty result carries no column identity anyway.
-            let _ = (input, keys, skip);
-            Batch::of(vec![Col::Nodes(vec![])])
+            // result, not the fault. Short-circuit without pulling the input, but keep the
+            // input's WIDTH (0 rows, N empty slots): a mid-chain `out().range(1,1).out()`
+            // has a following step read a later slot, which a width-1 batch would panic on.
+            let _ = (keys, skip);
+            let w = crate::opt::width(input).max(1);
+            Batch::of((0..w).map(|_| Col::Nodes(vec![])).collect())
         }
         Plan::OrderPage {
             input,
