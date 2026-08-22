@@ -633,5 +633,8 @@ suite('differential fuzz: TS gql engine vs Rust core', () => {
       ? `FUZZ_SEED=${SEED} bun test <this file> to reproduce:\n\n${divergences.join('\n\n')}`
       : 'no divergences';
     expect(report).toBe('no divergences');
-  });
+    // 20 000 queries × two engines is well under a second locally but exceeds Bun's default
+    // 5 s test timeout on the slower CI runners (~5.5–6 s) — give this heavy differential fuzz
+    // a generous ceiling so it is not a wall-clock flake rather than trimming its coverage.
+  }, 30_000);
 });
