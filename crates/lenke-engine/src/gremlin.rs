@@ -1887,11 +1887,14 @@ impl Parser {
                 // An aggregate-terminal body ALWAYS produces one value per element, so the
                 // identity fallback never fires — lower straight to the per-element
                 // aggregate projection (`optional(count())` → `[1,1,…]`, not the whole-
-                // stream `[6, …source…]`). NOT over a PATH frontier: the fast path builds the
-                // aggregate without running the body's leading hop through `step()`, so it would
-                // skip the path-fault (`path().optional(both('KNOWS').count())` must reject the
-                // adjacency on a path); route those to the general body below, which faults.
-                if !self.current_is_path {
+                // stream `[6, …source…]`). NOT over a PATH or SCALAR frontier: the fast path
+                // builds the aggregate without running the body's leading step through `step()`,
+                // so it would skip the frontier fault — a hop on a path (`path().optional(
+                // both('KNOWS').count())`) or a `values()`/hop on a scalar (`id().optional(
+                // values('age').count())`) must be rejected. Route those to the general body
+                // below, which parses each step through `step()` and faults (a bare `count()`
+                // over a scalar does NOT fault there, so `id().optional(count())` still works).
+                if !self.current_is_path && !self.current_is_scalar {
                     if let Some(agg) = self.try_per_element_agg(from, slots)? {
                         self.expect(&Tok::RParen)?;
                         let p = plan.project(vec![("optional".to_string(), agg)]);
