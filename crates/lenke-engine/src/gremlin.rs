@@ -2741,6 +2741,12 @@ impl Parser {
                                 .into());
                         }
                         self.on_edge = false;
+                        // This endpoint reads OFF the edge (not the interleaved landed vertex an
+                        // outE/inE pre-recorded), so the node-lineage GremlinPath renders no
+                        // longer matches — e.g. `outE().outV()` returns to the SOURCE, not the
+                        // recorded dst. Drop the interleaved-edge-path fast path so a following
+                        // path() uses the per-step history (GremlinFullPath), which is correct.
+                        self.edge_path_ok = false;
                         let other = lname == "otherv";
                         let which = match lname.as_str() {
                             "outv" => Dir::Out,
