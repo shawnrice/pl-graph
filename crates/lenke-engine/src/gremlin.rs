@@ -6207,6 +6207,13 @@ impl Parser {
         let saved_repeat = self.pending_repeat.take();
         let saved_path_ok = self.path_ok;
         let saved_on_edge = self.on_edge;
+        // An arm starts fresh from the BRANCH frontier, so its `path()` answerability is the
+        // branch input's — NOT the branch step's own post-taint value. The classifier taints
+        // `path_ok=false` for the branch step (union/coalesce/… are not path-preserving) before
+        // this runs, which would push a pure-vertex-hop arm's `path()` onto the (unrecorded)
+        // step-history instead of the node-lineage the arm's hops actually extend. Restore the
+        // pre-taint value so `union(out().path())` reads `[src, nbr]`, not `[src]`.
+        self.path_ok = self.path_ok_pre_step;
         // Each branch arm starts from the frontier AT the branch (the input), not from the
         // previous arm's output — save/restore the frontier-kind flags so the element-type
         // guard classifies every arm's first step against the branch input (mirrors the

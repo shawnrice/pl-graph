@@ -1137,6 +1137,23 @@ fn path_of_path_nests_the_prior_path() {
 }
 
 #[test]
+fn path_inside_a_union_arm_records_the_arm_hop() {
+    // `union(out().path())`: the arm is a pure vertex hop, so its `path()` must read the
+    // node-lineage the hop extends — `[source, neighbour]`, not just the seed `[source]`.
+    // The branch step taints `path_ok` before its arms parse; the arm restores the
+    // pre-taint value so the vertex-hop path stays answerable (native == TS, fuzzer parity).
+    let rows = qs("g.V('1').union(out('CREATED').path())");
+    // marko created lop — one arm path [marko, lop].
+    assert_eq!(rows.len(), 1);
+    let GVal::List(p) = &rows[0] else {
+        panic!("expected a path list, got {:?}", rows[0]);
+    };
+    assert_eq!(p.len(), 2, "the arm's out() hop is recorded: [source, neighbour]");
+    assert!(matches!(p[0], GVal::Node(_)));
+    assert!(matches!(p[1], GVal::Node(_)));
+}
+
+#[test]
 fn simple_path_excludes_cycle() {
     let r = g()
         .V()
