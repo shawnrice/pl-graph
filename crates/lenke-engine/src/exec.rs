@@ -15280,7 +15280,20 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
         // sub-frontier; run the general aggregate over the pulled body.
         Plan::Aggregate { input, keys, aggs } => {
             let b = pull_body(input, store, seed)?;
-            aggregate(&b, store, keys, aggs)?
+            let mut out = aggregate(&b, store, keys, aggs)?;
+            // A GLOBAL reducer resets the traverser path (see the main Aggregate arm): seed a
+            // fresh step-history [agg value] so a following path() reads the reduced value
+            // (`union(count(), …).path()` → [count]).
+            if seed.lineage.is_some() && keys.is_empty() && aggs.len() == 1 && !out.slots.is_empty()
+            {
+                let col = out.slot(out.slots.len() - 1);
+                let vals: Vec<Value> = (0..out.rows()).map(|i| col.value_at(i)).collect();
+                out.lineage = Some(crate::batch::Lineage::seed_steps(
+                    &vals,
+                    crate::batch::STEP_SCALAR,
+                ));
+            }
+            out
         }
         // A per-cell list sort inside a branch body.
         Plan::SortLocal {
