@@ -2963,9 +2963,24 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // node identity, so a downstream `values('name')` sees a number and yields
             // nothing. The general path below renders such a node as its element map
             // (`render_cell`), matching the TS engine's heterogeneous stream.
+            // UNION ALL preserves row order (no dedup), so a `path()` over an `inject`-mixed
+            // stream survives: concatenate each arm's step-history, seeding a per-row single
+            // element for an arm that has none (the injected literals' path is `[value]`).
+            let arm_lin = |b: &Batch| -> crate::batch::Lineage {
+                b.lineage.clone().unwrap_or_else(|| {
+                    let vals: Vec<Value> = (0..b.rows()).map(|i| b.slot(0).value_at(i)).collect();
+                    crate::batch::Lineage::seed_steps(&vals, crate::batch::STEP_SCALAR)
+                })
+            };
+            let union_all_lineage = (matches!(op, CombineOp::Union) && *all && track)
+                .then(|| crate::batch::Lineage::concat(&[&arm_lin(&bl), &arm_lin(&br)]));
             let variants_agree = (0..ncols).all(|j| same_col_variant(bl.slot(j), br.slot(j)));
             if matches!(op, CombineOp::Union) && *all && br.slots.len() == ncols && variants_agree {
-                return Ok(concat_batches(&[bl, br], store));
+                let mut out = concat_batches(&[bl, br], store);
+                if let Some(l) = union_all_lineage {
+                    out.lineage = Some(l);
+                }
+                return Ok(out);
             }
             let row_of = |b: &Batch, i: usize| -> Vec<Value> {
                 let mut row: Vec<Value> = b.slots.iter().map(|c| cell_value(c, i, store)).collect();
@@ -3020,21 +3035,10 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 }
             }
             let mut out = Batch::of(cols.into_iter().map(Col::Gen).collect());
-            // UNION ALL preserves row order (no dedup), so a `path()` over an `inject`-mixed
-            // stream survives: concatenate each arm's step-history, seeding a per-row single
-            // element for an arm that has none (the injected literals' path is `[value]`).
-            if matches!(op, CombineOp::Union) && *all && track {
-                let arm_lin = |b: &Batch| -> crate::batch::Lineage {
-                    b.lineage.clone().unwrap_or_else(|| {
-                        let vals: Vec<Value> =
-                            (0..b.rows()).map(|i| b.slot(0).value_at(i)).collect();
-                        crate::batch::Lineage::seed_steps(&vals, crate::batch::STEP_SCALAR)
-                    })
-                };
-                out.lineage = Some(crate::batch::Lineage::concat(&[
-                    &arm_lin(&bl),
-                    &arm_lin(&br),
-                ]));
+            // Same UNION ALL step-history concat as the fast path above (computed before the
+            // arms were consumed).
+            if let Some(l) = union_all_lineage {
+                out.lineage = Some(l);
             }
             out
         }
