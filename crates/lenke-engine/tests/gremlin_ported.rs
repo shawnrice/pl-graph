@@ -10412,16 +10412,34 @@ fn choose_condition_with_a_leading_barrier_is_per_element() {
     // A leading per-element barrier in a choose() condition (`limit(2).outE(…)`) is a no-op on
     // the single traverser (limit(2) on [t] = [t]), so the cond is just "does outE exist" — NOT
     // native's old whole-stream limit (first 2 rows). A per-element-empty barrier (limit(0)/
-    // skip(n>0)) makes the cond never fire → the else-arm. Matches TinkerPop + pure-TS.
-    // Both persons with an outgoing KNOWS route to the count() then-arm → [0, 0].
+    // skip(n>0)) makes the cond never fire → the else-arm.
+    // The then/else count() arms are PER-ELEMENT (native ≡ pure-TS): every one of the six
+    // vertices routes to then or else and counts its own has()-survivors → six 0s. (TinkerPop
+    // reduces each arm over its whole routed group → [0, 0]; the fuzzer checks native ≡ TS.)
     let r = run_query("g.V().choose(limit(2).outE('KNOWS'), has('weight', lt('lop')).count(), has('age', lt(-1)).count()).fold()", &mut g);
     if let [GVal::List(items)] = r.as_slice() {
         assert_eq!(
             items,
-            &vec![GVal::Num(0.0), GVal::Num(0.0)],
-            "two KNOWS-source vertices → then=count()=0 each"
+            &vec![GVal::Num(0.0); 6],
+            "per-element count(), one 0 per vertex"
         );
     } else {
         panic!("expected one fold list, got {r:?}");
     }
+}
+
+#[test]
+fn choose_then_arm_with_a_leading_filter_is_per_element() {
+    let mut g = modern();
+    // A then/else arm that is `<filter>.count()`/`.fold()` (`has('weight', lt('lop')).count()`)
+    // reduces PER ELEMENT (native ≡ pure-TS): try_per_element_agg folds the leading filter into
+    // the correlated body, so each routed element counts its own survivors instead of a single
+    // whole-stream count for the arm. `choose(outE('KNOWS'), has('weight',…).count(), fold())`
+    // over the two KNOWS-source… on modern() only marko has outgoing KNOWS.
+    let count_rows = run_query(
+        "g.V().choose(outE('KNOWS'), has('weight', lt('lop')).count(), constant('x')).count()",
+        &mut g,
+    );
+    // 6 elements → marko: count()=0 (one row), the other 5: constant('x') (one row each) = 6 rows.
+    assert_eq!(count_rows, vec![GVal::Num(6.0)]);
 }

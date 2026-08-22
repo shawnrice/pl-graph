@@ -6341,6 +6341,37 @@ impl Parser {
                 self.bump();
             }
         }
+        // A BARE leading FILTER before the reducer (`has('k', …).count()`,
+        // `hasLabel('L').fold()`) keeps or drops the single self-row per element, so it folds
+        // into the correlated body: count()=1/0, fold()=[self]/[]. (Bare case only; a filter
+        // after a hop is on the neighbour and stays in the general path.)
+        if hop_dir.is_none() && !bare_empty {
+            let saved_cur = self.current;
+            self.current = from; // the filter reads the self element
+            while matches!(self.peek(), Some(Tok::Ident(s)) if {
+                let l = s.to_ascii_lowercase();
+                matches!(
+                    l.as_str(),
+                    "has" | "hasnot" | "haslabel" | "hasid" | "haskey" | "hasvalue" | "where"
+                        | "and" | "or" | "not" | "is"
+                )
+            }) {
+                match self.child_filter_expr() {
+                    Ok(pred) => body = body.filter(pred),
+                    Err(_) => {
+                        self.current = saved_cur;
+                        self.pos = save;
+                        return Ok(None);
+                    }
+                }
+                if self.peek() == Some(&Tok::Dot) {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+            self.current = saved_cur;
+        }
         // Optional single-key `values('k')` before the reducer.
         let mut val_key: Option<String> = None;
         if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("values")) {
