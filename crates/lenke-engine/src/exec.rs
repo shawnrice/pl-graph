@@ -13529,6 +13529,9 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                         Value::Num(eid) if matches!(arg, Col::Edges(_)) => store
                             .edge_ext_id(eid as u32)
                             .map_or(Value::Null, Value::Str),
+                        // A branch/mixed frontier carries elements UNBOXED in a Gen column.
+                        Value::Node(id) => store.node_ext_id(id).map_or(Value::Null, Value::Str),
+                        Value::Edge(e) => store.edge_ext_id(e).map_or(Value::Null, Value::Str),
                         _ => Value::Null,
                     })
                     .collect();
@@ -13543,6 +13546,9 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     .map(|i| match arg.value_at(i) {
                         Value::Num(eid) if matches!(arg, Col::Edges(_)) => store
                             .edge_type_name(eid as u32)
+                            .map_or(Value::Null, |t| Value::Str(t.into())),
+                        Value::Edge(e) => store
+                            .edge_type_name(e)
                             .map_or(Value::Null, |t| Value::Str(t.into())),
                         _ => Value::Null,
                     })
@@ -13619,6 +13625,13 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                         }
                         Value::Num(eid) if matches!(arg, Col::Edges(_)) => store
                             .edge_type_name(eid as u32)
+                            .map_or(Value::Null, |t| Value::Str(t.into())),
+                        // A branch/mixed frontier carries elements UNBOXED in a Gen column.
+                        Value::Node(id) => store
+                            .min_label_name(id)
+                            .map_or(Value::Null, |nm| Value::Str(nm.into())),
+                        Value::Edge(e) => store
+                            .edge_type_name(e)
                             .map_or(Value::Null, |t| Value::Str(t.into())),
                         _ => Value::Null,
                     });
