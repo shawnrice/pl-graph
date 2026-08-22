@@ -434,6 +434,18 @@ pub enum CombineOp {
     Intersect,
 }
 
+/// The per-element branch flavour (see [`Plan::PerElementBranch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PerElemKind {
+    /// `coalesce`: the first arm producing ≥1 output for the element.
+    Coalesce,
+    /// `optional`: `arms[0]`'s output, else the source element unchanged.
+    Optional,
+    /// `choose`: `cond` truth routes to `arms[0]` (then) else `arms[1]` (else, when
+    /// `has_else`) else the source element.
+    Choose { has_else: bool },
+}
+
 /// One set-op-tail arm of an inline `CALL` body (see `Plan::CallInline::parts`). `op`
 /// is how this arm combines with the accumulated result to its left; `all` is the
 /// `UNION ALL` flag (ignored for EXCEPT/INTERSECT, which always dedup). `body` is the
@@ -856,6 +868,29 @@ pub enum Plan {
     /// (the parser scopes each to a single hop, so every branch appends its element
     /// at the same slot and the concatenated column keeps its node/edge type).
     Branch { input: Box<Plan>, bodies: Vec<Plan> },
+    /// PER-ELEMENT branch — the columnar form of TinkerPop's per-traverser
+    /// `coalesce`/`optional`/`choose`. Unlike `Branch` (union: each arm runs over the
+    /// WHOLE incoming stream), this runs every arm on a SINGLE incoming traverser at a
+    /// time, so a barrier/reducer inside an arm (`limit(3)`, `skip(1)`, `count()`,
+    /// `dedup()`) applies PER ELEMENT — `coalesce(out, limit(3).label())` limits each
+    /// element's arm, not the whole batch. Arms are plain `Plan::Row`-rooted sub-plans
+    /// reconverged to width-1 (NO exclusion guards — the routing is decided here at exec):
+    /// - `Coalesce`: the first arm producing ≥1 output for that element.
+    /// - `Optional`: `arms[0]`'s output, else the source element unchanged.
+    /// - `Choose{has_else}`: run `cond` on the element; if it produces output take
+    ///   `arms[0]` (then), else `arms[1]` (else) when `has_else`, else pass the source.
+    ///
+    /// Outputs concatenate in per-element order (matching TinkerPop's interleave).
+    PerElementBranch {
+        input: Box<Plan>,
+        kind: PerElemKind,
+        /// `choose` only: the condition sub-plan; its truth is "produces ≥1 output".
+        cond: Option<Box<Plan>>,
+        arms: Vec<Plan>,
+        /// The slot holding the SOURCE element in the input (for the pass-through
+        /// fallback of `Optional` / else-less `Choose`).
+        source_slot: usize,
+    },
     /// Collapse the input to ONE column — the element/value at `slot`, cloned so a
     /// `Nodes`/`Edges` frontier keeps its type — while PRESERVING the lineage sidecar
     /// (unlike `Project`, which drops it). Every arm of a `union`/`coalesce`/`choose`
@@ -1450,6 +1485,27 @@ impl Plan {
         Self::Reconverge {
             input: Box::new(self),
             slot,
+        }
+    }
+
+    /// Build a per-element branch (coalesce/optional/choose) over `self` (see
+    /// [`Plan::PerElementBranch`]). `cond` is the choose condition (None otherwise);
+    /// `arms` are the reconverged arm sub-plans; `source_slot` holds the pass-through
+    /// source element.
+    #[must_use]
+    pub fn per_element_branch(
+        self,
+        kind: PerElemKind,
+        cond: Option<Plan>,
+        arms: Vec<Plan>,
+        source_slot: usize,
+    ) -> Self {
+        Self::PerElementBranch {
+            input: Box::new(self),
+            kind,
+            cond: cond.map(Box::new),
+            arms,
+            source_slot,
         }
     }
 

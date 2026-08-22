@@ -1971,6 +1971,13 @@ fn needs_lineage(plan: &Plan) -> bool {
         }
         Plan::Unwind { input, list, .. } => reads_path(list) || needs_lineage(input),
         Plan::Branch { input, bodies } => needs_lineage(input) || bodies.iter().any(needs_lineage),
+        Plan::PerElementBranch {
+            input, cond, arms, ..
+        } => {
+            needs_lineage(input)
+                || cond.as_deref().is_some_and(needs_lineage)
+                || arms.iter().any(needs_lineage)
+        }
         Plan::Reconverge { input, .. } => needs_lineage(input),
         Plan::IntervalExpand {
             input, qlo, qhi, ..
@@ -2720,6 +2727,81 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .map(|b| pull_body(b, store, &inb))
                 .collect::<Result<_, _>>()?;
             concat_batches(&subs, store)
+        }
+        Plan::PerElementBranch {
+            input,
+            kind,
+            cond,
+            arms,
+            source_slot,
+        } => {
+            // TinkerPop coalesce/optional/choose are PER-TRAVERSER: each arm runs on ONE
+            // incoming element, so a barrier/reducer inside an arm reduces that element's
+            // sub-stream, not the whole batch. Run each input row through the arms on a
+            // 1-row sub-batch and concatenate the per-row outputs in row order (the
+            // interleave TinkerPop/the TS engine produce).
+            let inb = pull(input, store, track)?;
+            // An EMPTY frontier: the per-row loop below runs zero times, and
+            // `concat_batches(&[])` is a 0-slot batch — a downstream slot read would then
+            // index a column that isn't there. Reproduce the arms' natural width-1 EMPTY
+            // shape (typed column, zero rows) by running them over the empty input, so a
+            // following `has(...)`/`values(...)` short-circuits to [] instead of faulting.
+            if inb.rows() == 0 {
+                let subs: Vec<Batch> = arms
+                    .iter()
+                    .map(|b| pull_body(b, store, &inb))
+                    .collect::<Result<_, _>>()?;
+                return Ok(concat_batches(&subs, store));
+            }
+            // The source element as a width-1 batch (the pass-through fallback), preserving
+            // the row's lineage so a following path() still answers.
+            let source_of = |sub: &Batch| -> Batch {
+                let col = sub
+                    .slots
+                    .get(*source_slot)
+                    .cloned()
+                    .unwrap_or_else(|| Col::Gen(vec![Value::Null; sub.rows()]));
+                let mut out = Batch::of(vec![col]);
+                out.lineage = sub.lineage.clone();
+                out
+            };
+            let mut outs: Vec<Batch> = Vec::with_capacity(inb.rows());
+            for i in 0..inb.rows() {
+                let sub = inb.gather(&[i]);
+                let row_out = match kind {
+                    crate::ir::PerElemKind::Coalesce => {
+                        let mut chosen: Option<Batch> = None;
+                        for arm in arms {
+                            let r = pull_body(arm, store, &sub)?;
+                            if r.rows() > 0 {
+                                chosen = Some(r);
+                                break;
+                            }
+                        }
+                        chosen.unwrap_or_else(|| sub.gather(&[]))
+                    }
+                    crate::ir::PerElemKind::Optional => {
+                        let r = pull_body(&arms[0], store, &sub)?;
+                        if r.rows() > 0 {
+                            r
+                        } else {
+                            source_of(&sub)
+                        }
+                    }
+                    crate::ir::PerElemKind::Choose { has_else } => {
+                        let c = pull_body(cond.as_ref().expect("choose has a cond"), store, &sub)?;
+                        if c.rows() > 0 {
+                            pull_body(&arms[0], store, &sub)?
+                        } else if *has_else {
+                            pull_body(&arms[1], store, &sub)?
+                        } else {
+                            source_of(&sub)
+                        }
+                    }
+                };
+                outs.push(row_out);
+            }
+            concat_batches(&outs, store)
         }
         Plan::Reconverge { input, slot } => {
             // Collapse to the single element/value column at `slot` (cloned, so a

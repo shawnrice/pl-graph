@@ -938,6 +938,26 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 c,
             )
         }
+        // Like Branch: rewrite the input; the correlated cond/arms are left as-is.
+        Plan::PerElementBranch {
+            input,
+            kind,
+            cond,
+            arms,
+            source_slot,
+        } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::PerElementBranch {
+                    input: Box::new(i),
+                    kind,
+                    cond,
+                    arms,
+                    source_slot,
+                },
+                c,
+            )
+        }
         Plan::Reconverge { input, slot } => {
             let (i, c) = rewrite(*input, idx);
             (i.reconverge(slot), c)
@@ -1695,6 +1715,8 @@ fn width(plan: &Plan) -> usize {
         // `width(input) + 1`. Over-counting it let filter-pushdown move a predicate that reads
         // the branch's frontier slot below an Expand that produces it (out-of-range at run).
         Plan::Branch { bodies, .. } => bodies.first().map_or(1, width),
+        // Every arm reconverges to a single frontier column, so the output is width-1.
+        Plan::PerElementBranch { .. } => 1,
         Plan::Reconverge { .. } => 1,
         // A bound-edge OPTIONAL MATCH appends the edge column too.
         Plan::OptionalExpand {
@@ -2190,6 +2212,13 @@ mod tests {
             | Plan::SortLocal { input, .. } => plan_contains_filter(input),
             Plan::Join { left, right, .. } | Plan::Union { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)
+            }
+            Plan::PerElementBranch {
+                input, cond, arms, ..
+            } => {
+                plan_contains_filter(input)
+                    || cond.as_deref().is_some_and(plan_contains_filter)
+                    || arms.iter().any(plan_contains_filter)
             }
             Plan::InsertReturn { tail, .. } => plan_contains_filter(tail),
             Plan::UpdateReturn { input, tail, .. } => {

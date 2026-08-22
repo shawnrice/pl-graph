@@ -10047,6 +10047,32 @@ fn optional_bare_count_is_one_per_element() {
 }
 
 #[test]
+fn optional_arm_barriers_apply_per_element() {
+    // A barrier inside an optional arm runs on ONE traverser at a time (TinkerPop
+    // per-traverser semantics), NOT the whole batch. Verified against TinkerPop on the
+    // canonical Modern graph (createModern).
+    let n = |q: &str| -> f64 {
+        match qs(q).as_slice() {
+            [GVal::Num(x)] => *x,
+            other => panic!("{q}: expected one number, got {other:?}"),
+        }
+    };
+    // skip(2) empties each single-element arm → optional falls back to the source: 6.
+    assert_eq!(n("g.V().optional(skip(2).out('CREATED')).count()"), 6.0);
+    // limit(2) per element caps each vertex's out-fan to 2, else the source passes through.
+    assert_eq!(
+        n("g.V().optional(limit(2).out('KNOWS', 'CREATED')).count()"),
+        9.0
+    );
+    // values('age') replaces the 4 person vertices (ages) and the 2 software vertices fall
+    // back to themselves; a following values('age') then yields nothing for either → {}.
+    assert!(matches!(
+        qs("g.V().optional(values('age')).values('age').groupCount()").as_slice(),
+        [GVal::Map(m)] if m.is_empty()
+    ));
+}
+
+#[test]
 fn choose_routes_each_element_to_a_per_element_aggregate() {
     let mut g = modern();
     // has('age') routes the 4 PERSON vertices to count() (→ 1 each) and the 2 SOFTWARE

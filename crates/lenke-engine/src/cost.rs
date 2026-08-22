@@ -251,6 +251,9 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
         Plan::Branch { input, bodies } => {
             estimate(input, store).scale(bodies.len().max(1) as f64, false)
         }
+        // Per-element branch: coalesce/optional pick ~one arm's worth per element, choose
+        // routes to one — so roughly the input cardinality (a crude cap for routing).
+        Plan::PerElementBranch { input, .. } => estimate(input, store),
         // Collapses columns, not rows — same cardinality as its input.
         Plan::Reconverge { input, .. } => estimate(input, store),
         Plan::Join { left, right, .. } => {

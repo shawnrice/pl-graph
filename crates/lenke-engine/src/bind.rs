@@ -244,6 +244,17 @@ fn bind_plan(plan: &mut Plan, params: &HashMap<&str, &Value>) -> Result<(), Stri
                 bind_plan(b, params)?;
             }
         }
+        Plan::PerElementBranch {
+            input, cond, arms, ..
+        } => {
+            bind_plan(input, params)?;
+            if let Some(c) = cond {
+                bind_plan(c, params)?;
+            }
+            for a in arms {
+                bind_plan(a, params)?;
+            }
+        }
         Plan::Reconverge { input, .. } => bind_plan(input, params)?,
     }
     Ok(())

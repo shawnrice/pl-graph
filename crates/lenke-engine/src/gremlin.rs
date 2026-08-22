@@ -2031,35 +2031,27 @@ impl Parser {
                         return Ok(body);
                     }
                 }
-                // The fallback fires where the body produced NOTHING — a correlated
-                // EXISTS over the body. The general EXISTS eval inserts a provenance
-                // column at slot `slots`, which would shift a multi-hop body's
-                // intermediate slots; parse a SECOND copy of the body with that slot
-                // RESERVED (width `slots + 1`) so its hop sources stay aligned. Restore
-                // the cursor and re-parse for the actual output arm.
-                let guard = {
-                    let save = self.pos;
-                    let (gbody, _oc, _os) =
-                        self.parse_sub_body_seeded(Plan::Row, from, slots + 1)?;
-                    self.pos = save;
-                    Expr::Exists {
-                        body: Box::new(gbody),
-                        outer_width: slots,
-                    }
-                };
+                // General case: run the body PER ELEMENT (a single incoming traverser at a
+                // time), emitting its output where it produces and the source element where
+                // it does not — TinkerPop's per-traverser `optional`. Running per element is
+                // what makes a barrier inside the body (`limit(2)`, `skip(1)`, `dedup()`)
+                // apply to THAT element's sub-stream rather than the whole batch, which the
+                // old whole-stream EXISTS-guarded branch got wrong.
                 let (body, oc, _os) = self.parse_sub_body_seeded(Plan::Row, from, slots)?;
                 let body_edge_scope = self.last_arm_edge_scope;
                 self.expect(&Tok::RParen)?;
-                let fallback = Plan::Row
-                    .filter(Expr::Not(Box::new(guard)))
-                    .reconverge(from);
                 self.current = 0;
                 self.slots = 1;
                 self.edge_hop = None; // the reconverged frontier is not a just-hopped edge
                                       // The output is the body's frontier OR the source (fallback) — an edge is in
                                       // scope only where BOTH have one.
                 self.edge_scope = combine_edge_scope(&[incoming_edge_scope, body_edge_scope]);
-                plan.branch(vec![body.reconverge(oc), fallback])
+                plan.per_element_branch(
+                    crate::ir::PerElemKind::Optional,
+                    None,
+                    vec![body.reconverge(oc)],
+                    from,
+                )
             }
             "coalesce" => {
                 // coalesce(<hop>, <hop>, …): per element, the FIRST branch that
