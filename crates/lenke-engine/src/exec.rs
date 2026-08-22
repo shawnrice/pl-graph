@@ -2187,9 +2187,16 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                     let reference = b
                         .lineage
                         .as_ref()
-                        .and_then(|l| l.path_at(i).last().map(num_as_u32));
+                        .and_then(|l| otherv_reference(l.path_at(i), src, dst));
                     keep.push(i);
-                    nodes.push(if reference == Some(dst) { src } else { dst });
+                    // Arrived from dst -> otherV is src; arrived from src (or NO reference: a
+                    // bare edge reached via a branch) -> otherV is dst's opposite, i.e. src is
+                    // the default OUT vertex, matching pure-TS.
+                    nodes.push(match reference {
+                        Some(r) if r == dst => src,
+                        Some(_) => dst,
+                        None => src,
+                    });
                     continue;
                 }
                 match which {
@@ -4826,6 +4833,19 @@ fn order_page(
 /// A sort-key column that carries a graph element — a `Nodes`/`Edges` slot or a `Gen`
 /// column holding any `Value::Node`/`Value::Edge`. Elements have no natural order, so
 /// ordering by one faults (see [`order_page`]).
+/// The `otherV` reference vertex for an edge `(src, dst)` given the row's node path: the vertex
+/// the traverser ARRIVED from, i.e. the node just before the edge. When the path's last node is
+/// the edge's own landed endpoint (an `outE`/`inE` recorded it), the arrival is the node before
+/// it; otherwise the last node is the arrival. `None` for an edge with no prior vertex.
+fn otherv_reference(nodes: &[Value], src: u32, dst: u32) -> Option<u32> {
+    match nodes.last().map(num_as_u32) {
+        Some(last) if (last == src || last == dst) && nodes.len() >= 2 => {
+            Some(num_as_u32(&nodes[nodes.len() - 2]))
+        }
+        other => other,
+    }
+}
+
 fn col_has_element(col: &Col) -> bool {
     match col {
         Col::Nodes(_) | Col::Edges(_) => true,
@@ -15144,9 +15164,16 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
                     let reference = b
                         .lineage
                         .as_ref()
-                        .and_then(|l| l.path_at(i).last().map(num_as_u32));
+                        .and_then(|l| otherv_reference(l.path_at(i), src, dst));
                     keep.push(i);
-                    nodes.push(if reference == Some(dst) { src } else { dst });
+                    // Arrived from dst -> otherV is src; arrived from src (or NO reference: a
+                    // bare edge reached via a branch) -> otherV is dst's opposite, i.e. src is
+                    // the default OUT vertex, matching pure-TS.
+                    nodes.push(match reference {
+                        Some(r) if r == dst => src,
+                        Some(_) => dst,
+                        None => src,
+                    });
                     continue;
                 }
                 match which {
