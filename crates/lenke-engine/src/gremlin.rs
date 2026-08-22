@@ -1926,10 +1926,10 @@ impl Parser {
                 self.edge_scope = combine_edge_scope(&arm_edge_scopes);
                 // Post-branch VALUE + ADJACENCY frontier is unknown (see coalesce); only
                 // edge_scope (endpoints) and an all-path frontier propagate.
-                let (_e, _s, is_path, all_edge) = combine_arm_frontier(&arm_fronts);
+                let (_e, _s, _p, all_edge) = combine_arm_frontier(&arm_fronts);
                 self.current_is_element = false;
                 self.current_is_scalar = false;
-                self.current_is_path = is_path;
+                self.current_is_path = false;
                 self.on_edge = all_edge;
                 plan.branch(bodies)
             }
@@ -2026,11 +2026,10 @@ impl Parser {
                 self.edge_scope = combine_edge_scope(&[incoming_edge_scope, body_edge_scope]);
                 // Post-branch VALUE + ADJACENCY frontier is unknown (see coalesce); only
                 // edge_scope (endpoints) and an all-path frontier (body AND source) propagate.
-                let (_e, _s, is_path, all_edge) =
-                    combine_arm_frontier(&[incoming_front, body_front]);
+                let (_e, _s, _p, all_edge) = combine_arm_frontier(&[incoming_front, body_front]);
                 self.current_is_element = false;
                 self.current_is_scalar = false;
-                self.current_is_path = is_path;
+                self.current_is_path = false;
                 self.on_edge = all_edge;
                 plan.per_element_branch(
                     crate::ir::PerElemKind::Optional,
@@ -2132,10 +2131,10 @@ impl Parser {
                 // than a static fault) — clear element/scalar/on_edge. Only `edge_scope` is
                 // propagated, for the ENDPOINT fault (`coalesce(count(), inE()).outV()`), and a
                 // path frontier when EVERY arm is a path (for a following path()).
-                let (_is_elem, _is_scalar, is_path, all_edge) = combine_arm_frontier(&arm_fronts);
+                let (_is_elem, _is_scalar, _is_path, all_edge) = combine_arm_frontier(&arm_fronts);
                 self.current_is_element = false;
                 self.current_is_scalar = false;
-                self.current_is_path = is_path;
+                self.current_is_path = false;
                 // `on_edge` stays true for an all-edge branch so a following endpoint reads off
                 // the reconverged edge; adjacency stays lenient via `current_is_element` (false).
                 self.on_edge = all_edge;
@@ -2551,10 +2550,10 @@ impl Parser {
                 // Post-branch VALUE + ADJACENCY frontier is unknown (see coalesce); only
                 // edge_scope (endpoints), an all-path frontier, and on_edge for an all-edge
                 // branch (endpoint read) propagate.
-                let (_e, _s, is_path, all_edge) = combine_arm_frontier(&arm_fronts);
+                let (_e, _s, _p, all_edge) = combine_arm_frontier(&arm_fronts);
                 self.current_is_element = false;
                 self.current_is_scalar = false;
-                self.current_is_path = is_path;
+                self.current_is_path = false;
                 self.on_edge = all_edge;
                 return Ok(plan.per_element_branch(
                     crate::ir::PerElemKind::Choose { has_else },

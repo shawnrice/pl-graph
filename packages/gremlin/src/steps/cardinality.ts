@@ -1,4 +1,20 @@
+import { ErrorCode, LenkeError } from '@lenke/errors';
+
 import { appendStep, scopeTokenOf, type StepFn } from './framework.js';
+
+// range(start, end) with end < start (end >= 0) is an invalid window. TinkerPop throws
+// IllegalArgumentException at BUILD time (before any element flows, so even an unreached
+// choose/coalesce arm faults) and the native engine rejects it at parse — validate here at
+// construction to match, rather than only at runtime dispatch (which an unreached arm skips).
+const checkRangeWindow = (start: number, end: number): void => {
+  if (end >= 0 && end < start) {
+    throw new LenkeError(
+      `range(${start}, ${end}) is not a valid window — the high bound must be ` +
+        `greater than or equal to the low bound`,
+      { code: ErrorCode.InvalidValue },
+    );
+  }
+};
 
 // Each takes an optional first `Scope` argument. With `Scope.local`, the
 // operation slices each traverser's iterable value (typical use: after
@@ -43,8 +59,12 @@ export function range(start: number, end: number): StepFn;
 export function range(scope: symbol, start: number, end: number): StepFn;
 export function range(a: number | symbol, b: number, c?: number): StepFn {
   if (typeof a === 'symbol') {
+    checkRangeWindow(b, c!);
+
     return appendStep({ kind: 'range', start: b, end: c!, scope: scopeTokenOf(a) });
   }
+
+  checkRangeWindow(a, b);
 
   return appendStep({ kind: 'range', start: a, end: b });
 }
