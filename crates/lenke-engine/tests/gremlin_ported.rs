@@ -1116,6 +1116,27 @@ fn path_by_name_two_hops() {
 }
 
 #[test]
+fn path_of_path_nests_the_prior_path() {
+    // TinkerPop: `path().path()` records the FIRST path's output as a new history
+    // element, so the second yields `path[v1, v2, path[v1, v2]]`. `V('1').out('KNOWS')`
+    // reaches vadas + josh, so two such nested paths (native == TS, fuzzer parity).
+    let rows = qs("g.V('1').out('KNOWS').path().path()");
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        let GVal::List(outer) = row else {
+            panic!("expected a path list, got {row:?}");
+        };
+        assert_eq!(outer.len(), 3, "2 hop elements + the nested prior path");
+        assert!(matches!(outer[0], GVal::Node(_)));
+        assert!(matches!(outer[1], GVal::Node(_)));
+        let GVal::List(nested) = &outer[2] else {
+            panic!("third element is the nested path, got {:?}", outer[2]);
+        };
+        assert_eq!(nested.len(), 2, "the nested path is the original 2-element path");
+    }
+}
+
+#[test]
 fn simple_path_excludes_cycle() {
     let r = g()
         .V()

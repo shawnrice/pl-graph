@@ -1457,7 +1457,11 @@ impl Parser {
                     "out" | "in" | "both" | "inv" | "outv" | "otherv" | "bothv" => {
                         Some(crate::batch::STEP_NODE)
                     }
-                    "values" | "value" | "id" | "label" | "key" => Some(crate::batch::STEP_SCALAR),
+                    // A `path()` output is itself a path element (so `path().path()` nests it);
+                    // it records as a raw scalar — the produced list, rendered verbatim.
+                    "values" | "value" | "id" | "label" | "key" | "path" => {
+                        Some(crate::batch::STEP_SCALAR)
+                    }
                     _ => None,
                 };
                 if let Some(tag) = tag {
@@ -3254,6 +3258,23 @@ impl Parser {
             }
             "path" => {
                 self.expect(&Tok::RParen)?;
+                // `path().path()`: TinkerPop records the FIRST path's output as a new history
+                // element, so the second yields `path[…prior history…, path[…]]`. The prior
+                // `path()` already appended its own output to the step-history (the "path"
+                // arm of the `PathRecord` loop, `STEP_SCALAR`), so the full per-step render
+                // picks it up — but ONLY the full-history render sees it (the node-lineage /
+                // GremlinPath renders below read a different sidecar). Route path-of-path
+                // there directly rather than falling into the vertex-hop branch.
+                if self.current_is_path {
+                    let bys = self.parse_path_bys()?;
+                    let p =
+                        plan.project(vec![("path".to_string(), Expr::GremlinFullPath { bys })]);
+                    self.current = 0;
+                    self.slots = 1;
+                    self.current_is_element = false;
+                    self.current_is_path = true;
+                    return Ok(p);
+                }
                 // An interleaved node/edge path (`outE().inV()…`) renders through GremlinPath
                 // (lineage `values` zipped with `edges`); a pure vertex-hop chain (incl. a
                 // `repeat(<hop>)` walk) stays on the nodes-only `Expr::Path`. Both keep their
