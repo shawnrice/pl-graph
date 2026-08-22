@@ -2044,10 +2044,13 @@ impl Parser {
                 // faults, an edge+path branch stays Some(true) and works. Adjacency stays
                 // lenient via `current_is_element` (cleared).
                 self.on_edge = self.edge_scope == Some(true);
+                // A path() after the branch uses the per-step history (GremlinFullPath), NOT the
+                // interleaved node/edge GremlinPath: the branch output can be mixed (some rows
+                // end on an edge, some on a vertex), and GremlinPath's single static
+                // `ends_on_edge` would wrongly append the landed endpoint for the edge rows.
+                self.edge_path_ok = false;
                 if any_edge {
                     self.path_has_edges = true;
-                } else {
-                    self.edge_path_ok = false;
                 }
                 return Ok(plan.per_element_branch(
                     crate::ir::PerElemKind::Coalesce,
