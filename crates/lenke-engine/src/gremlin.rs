@@ -1390,31 +1390,7 @@ impl Parser {
                 _ => String::new(),
             };
             plan = self.step(plan)?;
-            // Record this step's frontier into the Gremlin path history when it PRODUCES a
-            // new path element (a vertex/edge move or a value projection). Filters/barriers
-            // leave the value unchanged and add nothing to the path. The tag is decided by the
-            // step name — robust against the frontier-flag bookkeeping.
-            if self.building_full_path {
-                let tag = match step_name.as_str() {
-                    "oute" | "ine" | "bothe" => Some(crate::batch::STEP_EDGE),
-                    "out" | "in" | "both" | "inv" | "outv" | "otherv" | "bothv" => {
-                        Some(crate::batch::STEP_NODE)
-                    }
-                    // A `path()` output is itself a path element (so `path().path()` nests it);
-                    // it records as a raw scalar — the produced list, rendered verbatim.
-                    "values" | "value" | "id" | "label" | "key" | "path" => {
-                        Some(crate::batch::STEP_SCALAR)
-                    }
-                    _ => None,
-                };
-                if let Some(tag) = tag {
-                    plan = Plan::PathRecord {
-                        input: Box::new(plan),
-                        value: Expr::Slot(self.current),
-                        tag,
-                    };
-                }
-            }
+            plan = self.maybe_path_record(plan, &step_name);
         }
         plan = self.flush_repeat(plan)?;
         if self.pos != self.toks.len() {
@@ -5903,6 +5879,34 @@ impl Parser {
     /// element at slot `from` (row width `width`). Returns the sub-plan and the slot /
     /// width the body LANDS at, so the caller can set the post-branch frontier. The
     /// parser's current/slots/edge-hop/repeat state is saved and restored around it.
+    /// Record a value-producing step's frontier into the Gremlin step-history when a full
+    /// `path()`/`tree()` is read (`building_full_path`) — a vertex/edge move or a value
+    /// projection. Filters/barriers add nothing. Used by both the top-level chain AND a branch
+    /// arm's chain, so a `path()` after/inside a branch sees the arm's hops.
+    fn maybe_path_record(&self, plan: Plan, step_name: &str) -> Plan {
+        if !self.building_full_path {
+            return plan;
+        }
+        let tag = match step_name {
+            "oute" | "ine" | "bothe" => Some(crate::batch::STEP_EDGE),
+            "out" | "in" | "both" | "inv" | "outv" | "otherv" | "bothv" => {
+                Some(crate::batch::STEP_NODE)
+            }
+            // A `path()` output is itself a path element (so `path().path()` nests it);
+            // it records as a raw scalar — the produced list, rendered verbatim.
+            "values" | "value" | "id" | "label" | "key" | "path" => Some(crate::batch::STEP_SCALAR),
+            _ => None,
+        };
+        match tag {
+            Some(tag) => Plan::PathRecord {
+                input: Box::new(plan),
+                value: Expr::Slot(self.current),
+                tag,
+            },
+            None => plan,
+        }
+    }
+
     fn parse_sub_body(
         &mut self,
         from: usize,
@@ -5956,11 +5960,22 @@ impl Parser {
             self.expect(&Tok::Dot)?;
         }
         let mut body = seed;
+        // Parse the arm's step chain, recording each value-producing step into the step-history
+        // when a full path()/tree() is read — so a path() after/inside a branch sees the arm's
+        // hops (`union(dedup().bothE(...), …).path()`), not just the seed.
+        let step_name_of = |p: &Self| match p.peek() {
+            Some(Tok::Ident(s)) => s.to_ascii_lowercase(),
+            _ => String::new(),
+        };
         if matches!(self.peek(), Some(Tok::Ident(_))) {
+            let name = step_name_of(self);
             body = self.step(body)?;
+            body = self.maybe_path_record(body, &name);
             while self.peek() == Some(&Tok::Dot) {
                 self.bump();
+                let name = step_name_of(self);
                 body = self.step(body)?;
+                body = self.maybe_path_record(body, &name);
             }
         }
         let out_current = self.current;

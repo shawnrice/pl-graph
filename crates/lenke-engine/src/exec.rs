@@ -14998,6 +14998,20 @@ fn combine_call_groups(
 fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> {
     Ok(match plan {
         Plan::Row => seed.clone(),
+        // A `path()`-through-branch records each arm step into the seed's step-history, so a
+        // path() reads the arm's hops — the streaming twin of the main `PathRecord` arm.
+        Plan::PathRecord { input, value, tag } => {
+            let mut batch = pull_body(input, store, seed)?;
+            let in_range = !matches!(value, Expr::Slot(n) if *n >= batch.slots.len());
+            if in_range {
+                if let Some(lin) = batch.lineage.take() {
+                    let col = eval(value, store, &batch)?;
+                    let vals: Vec<Value> = (0..batch.rows()).map(|i| col.value_at(i)).collect();
+                    batch.lineage = Some(lin.push_step(&vals, *tag));
+                }
+            }
+            batch
+        }
         // A correlated fresh Scan (a CALL set-op arm that starts from `(x:Label)` rather
         // than a scope variable): cross-join every seed row with every matching node,
         // appending the node at the next slot. Ignores its position as a "leaf" — the
