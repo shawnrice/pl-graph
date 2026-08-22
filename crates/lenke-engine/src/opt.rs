@@ -717,6 +717,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             keys,
             skip,
             limit,
+            fault_on_element,
         } => {
             let (i, c) = rewrite(*input, idx);
             // Fuse a pure PAGE over a pure SORT into one OrderPage. Gremlin lowers
@@ -734,15 +735,19 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                     keys: inner_keys,
                     skip: None,
                     limit: None,
+                    fault_on_element: inner_fault,
                 } = i
                 {
                     if !inner_keys.is_empty() {
                         return (
+                            // The merged node carries the KEYED (inner) sort, so keep its
+                            // element-fault policy — the outer page had no keys.
                             Plan::OrderPage {
                                 input: inner,
                                 keys: inner_keys,
                                 skip,
                                 limit,
+                                fault_on_element: inner_fault,
                             },
                             true, // merged two nodes into one — a real change
                         );
@@ -755,10 +760,12 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                                 keys: inner_keys,
                                 skip: None,
                                 limit: None,
+                                fault_on_element: inner_fault,
                             }),
                             keys,
                             skip,
                             limit,
+                            fault_on_element,
                         },
                         c,
                     );
@@ -770,6 +777,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                     keys,
                     skip,
                     limit,
+                    fault_on_element,
                 },
                 c,
             )

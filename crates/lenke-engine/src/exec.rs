@@ -2692,6 +2692,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             keys,
             skip,
             limit,
+            ..
         } if *limit == Some(0) => {
             // LIMIT 0 keeps no rows, so the input's projection is never evaluated —
             // a faulting expression (`RETURN 1/0 AS x LIMIT 0`) must yield the empty
@@ -2707,6 +2708,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             keys,
             skip,
             limit,
+            fault_on_element,
         } => {
             // A keyless page (LIMIT/SKIP without ORDER BY) keeps the first
             // `skip+limit` rows in scan order — so cap the input at that many rows
@@ -2752,7 +2754,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 _ => None,
             };
             if let Some(b) = capped {
-                order_page(&b, store, keys, *skip, *limit)?
+                order_page(&b, store, keys, *skip, *limit, *fault_on_element)?
             } else if let Some(b) = try_scan_top_k(input, keys, *skip, *limit, store, track) {
                 // Streaming bounded top-K over a bare scan — no full frontier/idx array.
                 b
@@ -2761,7 +2763,14 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 // Sorted top-K over a projection: project only the surviving rows.
                 b
             } else {
-                order_page(&pull(input, store, track)?, store, keys, *skip, *limit)?
+                order_page(
+                    &pull(input, store, track)?,
+                    store,
+                    keys,
+                    *skip,
+                    *limit,
+                    *fault_on_element,
+                )?
             }
         }
         Plan::Tail { input, n } => {
@@ -4834,6 +4843,7 @@ fn order_page(
     keys: &[crate::ir::SortKey],
     skip: Option<usize>,
     limit: Option<usize>,
+    fault_on_element: bool,
 ) -> Result<Batch, String> {
     let n = batch.rows();
     let start = skip.unwrap_or(0).min(n);
@@ -4844,23 +4854,61 @@ fn order_page(
     let mut idx: Vec<usize> = (0..n).collect();
     if !keys.is_empty() {
         let key_cols: Vec<Col> = eval_all(keys.iter().map(|k| &k.expr), store, batch)?;
-        // A raw graph element has no natural order (the same rule the parser enforces
-        // for a pure-element `order()`), but an element can still reach here in a MIXED
-        // stream — `both(...).inject(1).order()` clears the element frontier flag at
-        // parse, so the check below is the runtime backstop. A sort KEY that resolves to
-        // a vertex/edge (bare `order()`, `by(desc)`, or `by(<element-valued traversal>)`)
-        // faults; a `by('<key>')`/`by(id)` projection is a comparable scalar and is fine.
-        if key_cols.iter().any(col_has_element) {
-            return Err(
-                "order() over graph elements is not supported — elements have no \
-                        natural order; use order().by('<key>')"
-                    .into(),
-            );
-        }
+        // A sort KEY that resolves to a graph element (a vertex/edge) has no natural order.
+        // Gremlin `order()` FAULTS (TinkerPop throws) — the runtime backstop for a MIXED/branch
+        // frontier the parser could not classify (`both(...).inject(1).order()`). GQL `ORDER BY
+        // <element>` instead sorts by the element's EXTERNAL ID (like Cypher / the pure-TS
+        // `@lenke/gql`), so `CALL algo() YIELD node … ORDER BY node` orders by id, not faults.
+        let key_cols = if key_cols.iter().any(col_has_element) {
+            if fault_on_element {
+                return Err(
+                    "order() over graph elements is not supported — elements have no \
+                            natural order; use order().by('<key>')"
+                        .into(),
+                );
+            }
+            key_cols
+                .into_iter()
+                .map(|c| element_col_to_ext_id(c, store))
+                .collect()
+        } else {
+            key_cols
+        };
         let key_cols = typed_key_cols(key_cols);
         sort_idx(&mut idx, &key_cols, keys, end);
     }
     Ok(batch.gather(&idx[start..end]))
+}
+
+/// Replace each graph-element cell in a sort-key column with its EXTERNAL ID (a string),
+/// so a GQL `ORDER BY <element>` sorts by id — matching the pure-TS engine, which orders
+/// nodes/edges by their id lexicographically. A missing external id falls back to the dense
+/// id as a number (defensive; live elements always have one). Non-element columns pass through.
+fn element_col_to_ext_id(col: Col, store: &Store) -> Col {
+    let node_key = |id: u32| {
+        store
+            .node_ext_id(id)
+            .map_or(Value::Num(f64::from(id)), Value::Str)
+    };
+    let edge_key = |eid: u32| {
+        store
+            .edge_ext_id(eid)
+            .map_or(Value::Num(f64::from(eid)), Value::Str)
+    };
+    match col {
+        Col::Nodes(ids) => Col::Gen(ids.iter().map(|&id| node_key(id)).collect()),
+        Col::Edges(eids) => Col::Gen(eids.iter().map(|&eid| edge_key(eid)).collect()),
+        Col::Gen(vs) => Col::Gen(
+            vs.into_iter()
+                .map(|v| match v {
+                    Value::Node(id) => node_key(id),
+                    Value::Edge(eid) => edge_key(eid),
+                    other => other,
+                })
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// A sort-key column that carries a graph element — a `Nodes`/`Edges` slot or a `Gen`
@@ -15408,9 +15456,10 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             keys,
             skip,
             limit,
+            fault_on_element,
         } => {
             let b = pull_body(input, store, seed)?;
-            order_page(&b, store, keys, *skip, *limit)?
+            order_page(&b, store, keys, *skip, *limit, *fault_on_element)?
         }
         Plan::Distinct { input } => distinct_batch(pull_body(input, store, seed)?),
         // Gremlin `dedup()` / `dedup('a',…)` inside a branch arm — first-seen per distinct

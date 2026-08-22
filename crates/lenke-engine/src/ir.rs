@@ -864,6 +864,11 @@ pub enum Plan {
         keys: Vec<SortKey>,
         skip: Option<usize>,
         limit: Option<usize>,
+        /// Gremlin `order()` over raw graph ELEMENTS faults (a vertex/edge has no natural
+        /// order — TinkerPop throws). GQL `ORDER BY <element>` instead sorts by the element's
+        /// external id (like Cypher; the pure-TS `@lenke/gql` does this). So this flag is `true`
+        /// for a Gremlin-built page and `false` for a GQL-built one; the exec sort reads it.
+        fault_on_element: bool,
     },
     /// Gremlin `union(t1, t2, …)`: for each input row, run every `body` (a
     /// `Plan::Row`-rooted sub-plan continuing from the current slot) and CONCATENATE
@@ -1459,12 +1464,31 @@ impl Plan {
     }
 
     #[must_use]
+    /// A GQL page: `ORDER BY <element>` sorts by external id (never faults).
     pub fn order_page(self, keys: Vec<SortKey>, skip: Option<usize>, limit: Option<usize>) -> Self {
         Self::OrderPage {
             input: Box::new(self),
             keys,
             skip,
             limit,
+            fault_on_element: false,
+        }
+    }
+
+    /// A Gremlin page: `order()` over raw graph elements faults (no natural order).
+    #[must_use]
+    pub fn order_page_strict(
+        self,
+        keys: Vec<SortKey>,
+        skip: Option<usize>,
+        limit: Option<usize>,
+    ) -> Self {
+        Self::OrderPage {
+            input: Box::new(self),
+            keys,
+            skip,
+            limit,
+            fault_on_element: true,
         }
     }
 

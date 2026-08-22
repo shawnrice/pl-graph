@@ -3596,11 +3596,13 @@ impl Parser {
                             keys,
                             skip: None,
                             limit: None,
+                            fault_on_element,
                         } => Plan::OrderPage {
                             input,
                             keys,
                             skip: None,
                             limit: Some(n),
+                            fault_on_element,
                         },
                         other => other.order_page(vec![], None, Some(n)),
                     }
@@ -3791,7 +3793,9 @@ impl Parser {
                                 .into(),
                         );
                     }
-                    plan.order_page(keys, None, None)
+                    // Gremlin: `order()` over raw elements faults (the runtime backstop for a
+                    // mixed/branch frontier the build-time check above cannot classify).
+                    plan.order_page_strict(keys, None, None)
                 }
             }
             "as" => {
