@@ -5011,11 +5011,13 @@ impl Parser {
             _ => self.edge_scope = None,
         }
         // A reducing barrier RESETS the traverser path (TinkerPop): a following `path()` yields
-        // just its reduced value. Tracked here so `path()` can special-case it.
+        // just its reduced value. A frontier-PRESERVING barrier after it (limit/skip/dedup/order)
+        // keeps the reset, so `count().limit(2).path()` is still `[count]`.
         self.frontier_from_reducer = matches!(
             lname.as_str(),
             "count" | "sum" | "min" | "max" | "mean" | "fold"
-        );
+        ) || (self.frontier_from_reducer
+            && is_edge_scope_preserving(lname.as_str()));
         Ok(plan)
     }
 
