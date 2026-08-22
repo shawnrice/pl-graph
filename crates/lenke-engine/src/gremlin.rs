@@ -71,6 +71,11 @@ fn is_edge_scope_preserving(lname: &str) -> bool {
             | "sample"
             | "coin"
             | "none"
+            // path()/tree() PRESERVE the underlying edge-in-scope: a path built over an edge
+            // frontier still lets a following endpoint (in a reconverged branch) read off the
+            // edge — `union(dedup(), path()).outV()` over an edge input works, matching TS.
+            | "path"
+            | "tree"
             | "simplepath"
             | "cyclicpath"
             | "aggregate"
@@ -1906,7 +1911,8 @@ impl Parser {
                 self.current_is_element = false;
                 self.current_is_scalar = false;
                 self.current_is_path = false;
-                self.on_edge = all_edge;
+                self.on_edge = self.edge_scope == Some(true);
+                let _ = all_edge;
                 plan.branch(bodies)
             }
             "optional" => {
@@ -2530,7 +2536,8 @@ impl Parser {
                 self.current_is_element = false;
                 self.current_is_scalar = false;
                 self.current_is_path = false;
-                self.on_edge = all_edge;
+                self.on_edge = self.edge_scope == Some(true);
+                let _ = all_edge;
                 return Ok(plan.per_element_branch(
                     crate::ir::PerElemKind::Choose { has_else },
                     Some(cond_body),

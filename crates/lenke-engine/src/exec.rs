@@ -2167,6 +2167,9 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             for i in 0..n {
                 let eid = match b.slot(*edge_slot).value_at(i) {
                     Value::Num(x) if x >= 0.0 => x as u32,
+                    // A branch/mixed frontier carries edges UNBOXED; a non-edge cell (a
+                    // vertex/scalar from another arm) has no endpoint, so skip it.
+                    Value::Edge(e) => e,
                     _ => continue,
                 };
                 let Some((src, dst)) = store.edge_endpoints(eid) else {
@@ -15063,6 +15066,9 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             for i in 0..b.rows() {
                 let eid = match b.slot(*edge_slot).value_at(i) {
                     Value::Num(x) if x >= 0.0 => x as u32,
+                    // A branch/mixed frontier carries edges UNBOXED; a non-edge cell (a
+                    // vertex/scalar from another arm) has no endpoint, so skip it.
+                    Value::Edge(e) => e,
                     _ => continue,
                 };
                 let Some((src, dst)) = store.edge_endpoints(eid) else {
