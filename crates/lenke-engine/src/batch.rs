@@ -134,6 +134,21 @@ impl Lineage {
         }
     }
 
+    /// Seed a single-element step-history per row from arbitrary VALUES with the given tag
+    /// (`inject(v)` → each `v`'s path is `[v]`). The node/edge path stays empty.
+    #[must_use]
+    pub fn seed_steps(vals: &[Value], tag: u8) -> Self {
+        Self {
+            values: Vec::new(),
+            offsets: vec![0; vals.len() + 1],
+            edges: Vec::new(),
+            edge_offsets: vec![0; vals.len() + 1],
+            steps: vals.to_vec(),
+            step_tag: vec![tag; vals.len()],
+            step_off: (0..=vals.len()).collect(),
+        }
+    }
+
     /// Seed one single-EDGE step-history per edge — the `E()` source (`E().path()` yields
     /// `[e]`). The node/edge path stays empty (GQL does not read an edge-sourced lineage).
     #[must_use]

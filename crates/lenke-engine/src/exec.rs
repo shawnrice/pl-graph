@@ -2956,7 +2956,24 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                     cols[j].push(v);
                 }
             }
-            Batch::of(cols.into_iter().map(Col::Gen).collect())
+            let mut out = Batch::of(cols.into_iter().map(Col::Gen).collect());
+            // UNION ALL preserves row order (no dedup), so a `path()` over an `inject`-mixed
+            // stream survives: concatenate each arm's step-history, seeding a per-row single
+            // element for an arm that has none (the injected literals' path is `[value]`).
+            if matches!(op, CombineOp::Union) && *all && track {
+                let arm_lin = |b: &Batch| -> crate::batch::Lineage {
+                    b.lineage.clone().unwrap_or_else(|| {
+                        let vals: Vec<Value> =
+                            (0..b.rows()).map(|i| b.slot(0).value_at(i)).collect();
+                        crate::batch::Lineage::seed_steps(&vals, crate::batch::STEP_SCALAR)
+                    })
+                };
+                out.lineage = Some(crate::batch::Lineage::concat(&[
+                    &arm_lin(&bl),
+                    &arm_lin(&br),
+                ]));
+            }
+            out
         }
         Plan::Distinct { input } => {
             // Fused `DISTINCT n.k` over a bare Scan: read the storage column and
