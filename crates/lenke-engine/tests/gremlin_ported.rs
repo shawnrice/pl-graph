@@ -10047,6 +10047,22 @@ fn optional_bare_count_is_one_per_element() {
 }
 
 #[test]
+fn path_after_a_reducing_barrier_is_the_reduced_value() {
+    // TinkerPop resets the path at a reducing barrier, so count().path() is [count], not the
+    // pre-barrier vertex history. fold().path() nests the folded list.
+    assert_eq!(
+        qs("g.V().count().path()"),
+        vec![GVal::List(vec![GVal::Num(6.0)])]
+    );
+    let folded = qs("g.V().fold().path()");
+    let GVal::List(outer) = &folded[0] else {
+        panic!("expected a path list, got {:?}", folded[0]);
+    };
+    assert_eq!(outer.len(), 1, "the path is [the folded list]");
+    assert!(matches!(&outer[0], GVal::List(inner) if inner.len() == 6));
+}
+
+#[test]
 fn sum_over_elements_faults_at_runtime_but_empty_branch_is_null() {
     // A numeric reducer over actual vertices/edges faults (a vertex/edge is not a number,
     // like TinkerPop's ClassCastException) — now at RUNTIME, not parse.

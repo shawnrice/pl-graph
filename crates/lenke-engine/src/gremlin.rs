@@ -188,6 +188,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         last_arm_is_scalar: false,
         last_arm_is_path: false,
         last_arm_on_edge: false,
+        frontier_from_reducer: false,
     };
     p.traversal()
 }
@@ -888,6 +889,10 @@ struct Parser {
     last_arm_is_scalar: bool,
     last_arm_is_path: bool,
     last_arm_on_edge: bool,
+    /// The previous step was a REDUCING barrier (`count`/`sum`/`min`/`max`/`mean`/`fold`).
+    /// TinkerPop resets the path at a reducing barrier, so a following `path()` yields just
+    /// `[reduced value]` (`count().path()` → `[7]`), not the pre-barrier traverser history.
+    frontier_from_reducer: bool,
     /// True when the traversal reads a full `path()`/`tree()` — the lowering then emits a
     /// `Plan::PathRecord` after each value-producing step (see [`parse`]).
     building_full_path: bool,
@@ -2951,6 +2956,23 @@ impl Parser {
             }
             "path" => {
                 self.expect(&Tok::RParen)?;
+                // After a REDUCING barrier (`count()`/`sum()`/`fold()`/…) TinkerPop resets the
+                // traverser path, so `count().path()` is `[7]` — just the reduced value, not
+                // the pre-barrier history. Lower to a single-element list of the current value.
+                if self.frontier_from_reducer {
+                    let _ = self.parse_path_bys()?; // a .by() on a scalar path is a no-op
+                    let p = plan.project(vec![(
+                        "path".to_string(),
+                        Expr::List {
+                            items: vec![Expr::Slot(self.current)],
+                        },
+                    )]);
+                    self.current = 0;
+                    self.slots = 1;
+                    self.current_is_element = false;
+                    self.current_is_path = true;
+                    return Ok(p);
+                }
                 // `path().path()`: TinkerPop records the FIRST path's output as a new history
                 // element, so the second yields `path[…prior history…, path[…]]`. The prior
                 // `path()` already appended its own output to the step-history (the "path"
@@ -5079,6 +5101,12 @@ impl Parser {
             other if is_edge_scope_preserving(other) => {}
             _ => self.edge_scope = None,
         }
+        // A reducing barrier RESETS the traverser path (TinkerPop): a following `path()` yields
+        // just its reduced value. Tracked here so `path()` can special-case it.
+        self.frontier_from_reducer = matches!(
+            lname.as_str(),
+            "count" | "sum" | "min" | "max" | "mean" | "fold"
+        );
         Ok(plan)
     }
 
