@@ -6146,6 +6146,40 @@ fn p4_otherv_ids() {
 }
 
 #[test]
+#[ignore = "KNOWN BUG (gremlin-fuzz seeds 2977/3934): otherV() after a per-element branch \
+            whose arm re-hops (outV().inE()), sourced from E() SCAN, resolves against the \
+            edge's src default instead of the arm's outV arrival. E(<ids>) SEED and the \
+            non-branch form are both correct. Root cause: E() EdgeScan seeds an edge-only \
+            lineage (empty node path); the branch arm's node-lineage that otherV reads then \
+            records the wrong node. Deferred — a deep, byte-identity-sensitive lineage fix. \
+            Remove #[ignore] when fixed."]
+fn otherv_after_branch_rehop_over_edge_scan() {
+    // Two CREATED edges: 9 (v1->v3) and 14 (v6->v1). v1 therefore has an incoming CREATED
+    // edge (14). For each scanned edge: outV()->its source, then inE('CREATED') on that
+    // source. Only edge 9's source (v1) has an incoming CREATED (edge 14), so the sole
+    // surviving traverser is at edge 14, ARRIVED via v1 — so otherV() is the OTHER endpoint,
+    // v6 (peter). native currently returns marko (v1); pure-TS returns peter (v6).
+    let ndjson = "\
+{\"type\":\"node\",\"id\":\"1\",\"labels\":[\"PERSON\"],\"properties\":{\"name\":\"marko\"}}
+{\"type\":\"node\",\"id\":\"3\",\"labels\":[\"SOFTWARE\"],\"properties\":{\"name\":\"lop\"}}
+{\"type\":\"node\",\"id\":\"6\",\"labels\":[\"PERSON\"],\"properties\":{\"name\":\"peter\"}}
+{\"type\":\"edge\",\"id\":\"9\",\"from\":\"1\",\"to\":\"3\",\"labels\":[\"CREATED\"],\"properties\":{}}
+{\"type\":\"edge\",\"id\":\"14\",\"from\":\"6\",\"to\":\"1\",\"labels\":[\"CREATED\"],\"properties\":{}}
+";
+    let mut store = lenke_engine::ndjson::from_ndjson(ndjson).expect("fixture");
+    let r = run_query(
+        "g.E().coalesce(outV().inE('CREATED')).otherV().values('name')",
+        &mut store,
+    );
+    assert_eq!(
+        ordered(r),
+        vec!["peter"],
+        "otherV() should resolve against the arm's outV arrival (v1), giving the other \
+         endpoint v6 (peter) — not the edge src default (v1, marko)"
+    );
+}
+
+#[test]
 fn p4_mut_repeat_addv_times() {
     // Deferred Gremlin form (the engine rejects it — an explicit "not yet supported"
     // step or an addV/addE position the parser does not accept). Re-asserted as a
