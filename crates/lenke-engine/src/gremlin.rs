@@ -2653,8 +2653,69 @@ impl Parser {
                 if let Some(comma) = cond_agg_comma {
                     self.pos = comma; // consume the always-true cond
                 }
+                // A LEADING per-element barrier in the cond (`limit(2).outE(…)`, `skip(1).out(…)`)
+                // is a no-op on the single traverser (limit(2) on [t] = [t]) or empties it
+                // (limit(0)/skip(n>0)); native's EXISTS over the whole body would apply it
+                // WHOLE-STREAM (first N rows). Consume it, tracking whether it empties, so the
+                // EXISTS runs over the REST — matching TinkerPop/pure-TS's per-element cond.
+                let mut cond_barrier_empty = false;
+                if cond_agg_comma.is_none() {
+                    while matches!(self.peek(), Some(Tok::Ident(s)) if {
+                        let l = s.to_ascii_lowercase();
+                        (l == "limit" || l == "skip" || l == "range")
+                            && self.toks.get(self.pos + 1) == Some(&Tok::LParen)
+                    }) {
+                        let b = self.ident()?.to_ascii_lowercase();
+                        self.expect(&Tok::LParen)?;
+                        match b.as_str() {
+                            "limit" => {
+                                if self.usize_arg()? == 0 {
+                                    cond_barrier_empty = true;
+                                }
+                            }
+                            "skip" => {
+                                if self.usize_arg()? > 0 {
+                                    cond_barrier_empty = true;
+                                }
+                            }
+                            _ => {
+                                let lo = self.usize_arg()?;
+                                self.expect(&Tok::Comma)?;
+                                let hi = self.usize_arg()?;
+                                if !(lo == 0 && hi > 0) {
+                                    cond_barrier_empty = true;
+                                }
+                            }
+                        }
+                        self.expect(&Tok::RParen)?;
+                        if self.peek() == Some(&Tok::Dot) {
+                            self.bump(); // more cond follows the barrier
+                        } else {
+                            break; // the barrier WAS the whole cond
+                        }
+                    }
+                }
+                // A per-element-empty leading barrier makes the cond dead — skip its remainder
+                // (an unparsed hop/filter) to the top-level comma before the then-arm.
+                if cond_barrier_empty && self.peek() != Some(&Tok::Comma) {
+                    let mut depth = 0i32;
+                    while let Some(t) = self.peek() {
+                        match t {
+                            Tok::LParen => depth += 1,
+                            Tok::RParen if depth == 0 => break,
+                            Tok::RParen => depth -= 1,
+                            Tok::Comma if depth == 0 => break,
+                            _ => {}
+                        }
+                        self.bump();
+                    }
+                }
                 let (guard, cond_is_filter): (Expr, bool) = if cond_agg_comma.is_some() {
                     (Expr::Lit(Value::Bool(true)), false)
+                } else if cond_barrier_empty {
+                    (Expr::Lit(Value::Bool(false)), false) // a per-element-empty barrier: never fires
+                } else if self.peek() == Some(&Tok::Comma) {
+                    (Expr::Lit(Value::Bool(true)), false) // the cond was only kept barriers → always fires
                 } else {
                     match self.child_filter_expr() {
                         // A complete predicate cond is followed by the `,` before the then-arm.

@@ -10405,3 +10405,23 @@ fn per_element_aggregate_arm_with_a_leading_barrier() {
         "values() on the scalar optional(skip(1).count()) must fault"
     );
 }
+
+#[test]
+fn choose_condition_with_a_leading_barrier_is_per_element() {
+    let mut g = modern();
+    // A leading per-element barrier in a choose() condition (`limit(2).outE(…)`) is a no-op on
+    // the single traverser (limit(2) on [t] = [t]), so the cond is just "does outE exist" — NOT
+    // native's old whole-stream limit (first 2 rows). A per-element-empty barrier (limit(0)/
+    // skip(n>0)) makes the cond never fire → the else-arm. Matches TinkerPop + pure-TS.
+    // Both persons with an outgoing KNOWS route to the count() then-arm → [0, 0].
+    let r = run_query("g.V().choose(limit(2).outE('KNOWS'), has('weight', lt('lop')).count(), has('age', lt(-1)).count()).fold()", &mut g);
+    if let [GVal::List(items)] = r.as_slice() {
+        assert_eq!(
+            items,
+            &vec![GVal::Num(0.0), GVal::Num(0.0)],
+            "two KNOWS-source vertices → then=count()=0 each"
+        );
+    } else {
+        panic!("expected one fold list, got {r:?}");
+    }
+}
