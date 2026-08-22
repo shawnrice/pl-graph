@@ -10060,6 +10060,22 @@ fn path_after_a_reducing_barrier_is_the_reduced_value() {
     };
     assert_eq!(outer.len(), 1, "the path is [the folded list]");
     assert!(matches!(&outer[0], GVal::List(inner) if inner.len() == 6));
+    // The reducer RESETS the step-history to [count], so path-of-path nests [count, [count]]
+    // (even across a preserving barrier), not the pre-barrier vertex history.
+    assert_eq!(
+        qs("g.V().count().path().path()"),
+        vec![GVal::List(vec![
+            GVal::Num(6.0),
+            GVal::List(vec![GVal::Num(6.0)]),
+        ])]
+    );
+    assert_eq!(
+        qs("g.V().count().path().limit(1).path()"),
+        vec![GVal::List(vec![
+            GVal::Num(6.0),
+            GVal::List(vec![GVal::Num(6.0)]),
+        ])]
+    );
 }
 
 #[test]

@@ -2878,6 +2878,10 @@ impl Parser {
                     self.slots = 1;
                     self.current_is_element = false;
                     self.current_is_path = true;
+                    // The frontier is now a PATH, not the reducer's scalar — clear the reducer
+                    // flag (this early return skips the post-step classifier) so a following
+                    // `path()` takes the path-of-path branch, not another barrier reset.
+                    self.frontier_from_reducer = false;
                     return Ok(p);
                 }
                 // `path().path()`: TinkerPop records the FIRST path's output as a new history

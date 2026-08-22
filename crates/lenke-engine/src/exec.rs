@@ -2616,7 +2616,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // build the wide intermediate batch. Falls back to the general
             // aggregate for every shape it does not recognize. (The fused paths
             // never evaluate arbitrary expressions, so they cannot fault.)
-            if let Some(b) = try_scan_count(input, keys, aggs, store)
+            let mut out = if let Some(b) = try_scan_count(input, keys, aggs, store)
                 .or_else(|| try_filtered_count(input, keys, aggs, store))
                 .or_else(|| {
                     (keys.is_empty()
@@ -2656,7 +2656,22 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 b
             } else {
                 aggregate(&pull(input, store, track)?, store, keys, aggs)?
+            };
+            // A GLOBAL reducer (`count()`/`sum()`/`fold()`/… — no group keys, one agg) collapses
+            // the stream to a single value; TinkerPop RESETS the traverser path to [that value],
+            // so a following `path()` reads it (`count().path()` → [7], and `count().path().path()`
+            // nests [7, [7]]). Seed a fresh per-row step-history from the agg column when a path()
+            // is read (`track`) — the fast paths above return no lineage. The node/edge path stays
+            // empty (a reduced value is not a graph element).
+            if track && keys.is_empty() && aggs.len() == 1 && !out.slots.is_empty() {
+                let col = out.slot(out.slots.len() - 1);
+                let vals: Vec<Value> = (0..out.rows()).map(|i| col.value_at(i)).collect();
+                out.lineage = Some(crate::batch::Lineage::seed_steps(
+                    &vals,
+                    crate::batch::STEP_SCALAR,
+                ));
             }
+            out
         }
         Plan::OrderPage {
             input,
