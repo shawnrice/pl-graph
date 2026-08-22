@@ -206,6 +206,15 @@ const preds = [eq, gt, gte, lt, lte];
 // a false divergence, and one that needs no second type name to appear.
 const MULTI_TYPE_STEP = /\b(?:out|in|both)E?\('[^']*'(?:,\s*'[^']*')+\)|\bbothE?\(/;
 
+// coalesce/choose/optional RECONVERGE their arms per-element in TinkerPop and pure-TS (each
+// source element's result is contiguous, in input order — a consequence of traverser-at-a-time
+// streaming), while native's columnar Plan::Branch concatenates ARM-BY-ARM (all of arm 1, then
+// arm 2). Identical multiset, deterministic-but-different order. TinkerPop guarantees output
+// order ONLY through order(), so this is the same "order is unspecified" case as multi-type
+// adjacency above — compare the shape as a multiset. (union() is arm-by-arm in BOTH engines, so
+// it is NOT here; a top-level order() still forces the strict ordered compare.)
+const RECONVERGING_BRANCH = /\b(?:coalesce|choose|optional)\(/;
+
 /**
  * Sort a result list when its order is unspecified; otherwise leave it.
  *
@@ -621,7 +630,10 @@ suite('differential fuzz: gremlin (TS engine vs Rust ENGINE)', () => {
       // IS the contract is WHICH elements come back and HOW MANY, so compare
       // those shapes as a multiset. A duplicated multi-type edge still shows up.
       const multiType = MULTI_TYPE_STEP.test(text);
-      const unordered = multiType && !hasTopLevelOrder(text);
+      // Either an unspecified adjacency order (multi-type) OR a per-element reconverging
+      // branch (coalesce/choose/optional) leaves the result order unspecified.
+      const orderUnspecified = multiType || RECONVERGING_BRANCH.test(text);
+      const unordered = orderUnspecified && !hasTopLevelOrder(text);
 
       // A positional slice of an unspecified order picks an unspecified SUBSET,
       // and every step after it inherits that — not just the order but which
@@ -635,7 +647,7 @@ suite('differential fuzz: gremlin (TS engine vs Rust ENGINE)', () => {
       // `outE('CREATED','KNOWS').skip(2).order().by(desc)` returned one edge from
       // each engine and they were DIFFERENT edges — a false divergence, and the
       // reason this suite went red about one run in fifteen.
-      if (multiType && slicedBeforeOrdering(text)) {
+      if (orderUnspecified && slicedBeforeOrdering(text)) {
         skippedUnordered += 1;
 
         continue;
