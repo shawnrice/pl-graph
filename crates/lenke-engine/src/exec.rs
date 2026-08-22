@@ -2826,6 +2826,21 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                         }
                     }
                 };
+                // A reducer arm (`count()`/`fold()`) collapses its sub-stream and drops the
+                // lineage; TinkerPop resets the path to the reduced value, so seed a per-row
+                // single-element step-history from the arm's output when a path() is read and the
+                // arm produced none. Without it, `coalesce(values('name').count(), …).path()`
+                // loses ALL lineage in the concat (all-or-nothing) and path() is [null].
+                let mut row_out = row_out;
+                if track && row_out.lineage.is_none() && !row_out.slots.is_empty() {
+                    let vals: Vec<Value> = (0..row_out.rows())
+                        .map(|i| row_out.slot(0).value_at(i))
+                        .collect();
+                    row_out.lineage = Some(crate::batch::Lineage::seed_steps(
+                        &vals,
+                        crate::batch::STEP_SCALAR,
+                    ));
+                }
                 outs.push(row_out);
             }
             concat_batches(&outs, store)
