@@ -10361,3 +10361,47 @@ fn unboxed_element_ref_flows_through_a_heterogeneous_stream() {
         "the injected literal"
     );
 }
+
+#[test]
+fn per_element_aggregate_arm_with_a_leading_barrier() {
+    let mut g = modern();
+    // A leading barrier before the aggregate reduces the SINGLE self-row per element:
+    // skip(1) empties it → count()=0, limit(0)→fold()=[], while a kept row is the bare agg.
+    // (skip(1).count() ran whole-stream before, giving one number instead of a 0 per element.)
+    let names = |q: &str, g: &mut EngineGraph| run_query(q, g);
+    let r = names(
+        "g.V().coalesce(outE('CREATED'), skip(1).count()).fold()",
+        &mut g,
+    );
+    // The single fold list holds the created edges AND a 0 for each vertex with none.
+    if let [GVal::List(items)] = r.as_slice() {
+        assert!(
+            items
+                .iter()
+                .filter(|v| matches!(v, GVal::Num(n) if **v == GVal::Num(0.0) && *n==0.0))
+                .count()
+                >= 1,
+            "a per-element 0 for a no-created vertex"
+        );
+        assert!(
+            items.iter().any(|v| matches!(v, GVal::Edge(_))),
+            "created edges present"
+        );
+    } else {
+        panic!("expected one fold list, got {r:?}");
+    }
+    // optional(skip(1).count()) always produces a scalar (count of empty = 0), so a following
+    // values() faults — matching TinkerPop (ClassCastException) and pure-TS.
+    assert!(
+        lenke_engine::gremlin::parse(
+            "g.V().bothE('KNOWS').optional(skip(1).count()).values('age')"
+        )
+        .and_then(|_| exec_query(
+            "g.V().bothE('KNOWS').optional(skip(1).count()).values('age')",
+            &mut g
+        )
+        .map(|_| ()))
+        .is_err(),
+        "values() on the scalar optional(skip(1).count()) must fault"
+    );
+}

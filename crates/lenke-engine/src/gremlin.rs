@@ -6241,6 +6241,45 @@ impl Parser {
         } else {
             (Plan::Row, from)
         };
+        // A BARE leading barrier (skip/limit/range, no hop) empties or keeps the single self-row
+        // per element: `skip(1).count()` → 0, `limit(0).fold()` → [], `range(0,1).count()` → 1.
+        // (Only the bare case — after a hop a barrier slices the NEIGHBOUR set, handled elsewhere.)
+        let mut bare_empty = false;
+        if hop_dir.is_none() {
+            while matches!(self.peek(), Some(Tok::Ident(s)) if {
+                let l = s.to_ascii_lowercase();
+                (l == "skip" || l == "limit" || l == "range") && self.toks.get(self.pos + 1) == Some(&Tok::LParen)
+            }) {
+                let b = self.ident()?.to_ascii_lowercase();
+                self.expect(&Tok::LParen)?;
+                match b.as_str() {
+                    "skip" => {
+                        if self.usize_arg()? > 0 {
+                            bare_empty = true; // skip(n>0) drops the single self-row
+                        }
+                    }
+                    "limit" => {
+                        if self.usize_arg()? == 0 {
+                            bare_empty = true; // limit(0) drops it
+                        }
+                    }
+                    _ => {
+                        // range(lo, hi): the size-1 self-row survives iff lo==0 and hi>lo.
+                        let lo = self.usize_arg()?;
+                        self.expect(&Tok::Comma)?;
+                        let hi = self.usize_arg()?;
+                        if !(lo == 0 && hi > 0) {
+                            bare_empty = true;
+                        }
+                    }
+                }
+                if self.expect(&Tok::RParen).is_err() || self.peek() != Some(&Tok::Dot) {
+                    self.pos = save;
+                    return Ok(None);
+                }
+                self.bump();
+            }
+        }
         // Optional single-key `values('k')` before the reducer.
         let mut val_key: Option<String> = None;
         if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("values")) {
@@ -6291,6 +6330,15 @@ impl Parser {
         if !matches!(self.peek(), Some(&Tok::Comma) | Some(&Tok::RParen)) {
             self.pos = save;
             return Ok(None);
+        }
+        // A leading barrier emptied the self-row, so the reducer runs over NOTHING per element:
+        // count → 0, fold → [], sum/min/max/mean → NULL (Gremlin's empty-aggregate).
+        if bare_empty {
+            return Ok(Some(match reducer.as_str() {
+                "count" => Expr::Lit(Value::Num(0.0)),
+                "fold" => Expr::Lit(Value::List(Vec::new())),
+                _ => Expr::Lit(Value::Null),
+            }));
         }
         let expr = match reducer.as_str() {
             "count" => {
