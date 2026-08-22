@@ -4920,27 +4920,31 @@ fn aggregate(
         // would SILENTLY SUM THE IDS; TinkerPop throws ClassCastException and pure-TS faults,
         // so fault here to match (`g.V().union(out(), …).sum()`). Collect/fold over elements
         // is fine (it builds a list of element maps), so only the numeric reducers fault.
+        // A graph ELEMENT (a vertex/edge, carried unboxed in a Gen column) is neither numeric
+        // nor comparable, so it faults for EVERY numeric reducer (min/max included).
         let elem_col = match arg_col.as_ref() {
             Some(Col::Nodes(v)) => !v.is_empty(),
             Some(Col::Edges(v)) => !v.is_empty(),
-            // A mixed branch frontier carries elements UNBOXED in a Gen column.
             Some(Col::Gen(vs)) => vs
                 .iter()
                 .any(|v| matches!(v, Value::Node(_) | Value::Edge(_))),
             _ => false,
         };
-        if matches!(
+        // A path/list is not a NUMBER, so `sum`/`mean` fault (`union(path(), …).sum()`), but it
+        // IS ordered (a list has a total order), so `min`/`max` over lists is fine (GQL
+        // `min(m.tags)`) — only the strictly-numeric reducers reject it.
+        let list_col = matches!(arg_col.as_ref(), Some(Col::Gen(vs))
+            if vs.iter().any(|v| matches!(v, Value::List(_))));
+        let numeric_only = matches!(
             agg.func,
-            AggFn::Sum
-                | AggFn::Avg
-                | AggFn::Min
-                | AggFn::Max
-                | AggFn::StddevPop
-                | AggFn::StddevSamp
-                | AggFn::PercentileCont
-                | AggFn::PercentileDisc
-        ) && elem_col
-        {
+            AggFn::Sum | AggFn::Avg | AggFn::StddevPop | AggFn::StddevSamp
+        );
+        let numeric_reducer = numeric_only
+            || matches!(
+                agg.func,
+                AggFn::Min | AggFn::Max | AggFn::PercentileCont | AggFn::PercentileDisc
+            );
+        if (numeric_reducer && elem_col) || (numeric_only && list_col) {
             return Err(format!(
                 "{}() over graph elements is not supported — a vertex/edge is not a number; \
                  project with values('<key>') first",
