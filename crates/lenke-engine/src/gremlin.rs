@@ -97,16 +97,31 @@ fn combine_edge_scope(arms: &[Option<bool>]) -> Option<bool> {
     }
 }
 
-fn body_is_exists_safe(plan: &Plan) -> bool {
-    match plan {
-        Plan::Row => true,
-        Plan::Expand { input, .. }
-        | Plan::EdgeVertex { input, .. }
-        | Plan::Filter { input, .. }
-        | Plan::VarLength { input, .. }
-        | Plan::OptionalExpand { input, .. } => body_is_exists_safe(input),
-        _ => false,
+/// One branch arm's OUTPUT frontier kind, captured after parsing the arm.
+#[derive(Clone, Copy)]
+struct ArmFrontier {
+    is_element: bool,
+    is_scalar: bool,
+    is_path: bool,
+    on_edge: bool,
+}
+
+/// The COMBINED frontier of a branch, as `(is_element, is_scalar, is_path, on_edge)`. The
+/// output is a clean element/scalar/path frontier only when EVERY arm agrees (and, for
+/// elements, agrees on edge-vs-vertex): a mixed branch (`coalesce(outE, hasLabel)` — edges and
+/// vertices) is UNKNOWN, so a following static type check does not fault (matches pure-TS's
+/// build-time Frontier combine). An empty arm list is unknown.
+fn combine_arm_frontier(arms: &[ArmFrontier]) -> (bool, bool, bool, bool) {
+    if arms.is_empty() {
+        return (false, false, false, false);
     }
+    let all_element = arms.iter().all(|a| a.is_element);
+    let all_edge = all_element && arms.iter().all(|a| a.on_edge);
+    let all_vertex = all_element && arms.iter().all(|a| !a.on_edge);
+    let is_element = all_edge || all_vertex;
+    let is_scalar = arms.iter().all(|a| a.is_scalar);
+    let is_path = arms.iter().all(|a| a.is_path);
+    (is_element, is_scalar, is_path, all_edge)
 }
 
 /// A coalesce/branch ARM made ONLY of per-element-identity or per-element-empty stream
@@ -259,6 +274,10 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         current_is_scalar: false,
         edge_scope: None,
         last_arm_edge_scope: None,
+        last_arm_is_element: false,
+        last_arm_is_scalar: false,
+        last_arm_is_path: false,
+        last_arm_on_edge: false,
     };
     p.traversal()
 }
@@ -950,6 +969,15 @@ struct Parser {
     /// The `edge_scope` at the END of the most recent [`parse_sub_body_seeded`] (captured before
     /// the flags restore), so a branch lowering can combine its arms' edge-in-scope.
     last_arm_edge_scope: Option<bool>,
+    /// The output-frontier KIND flags at the END of the most recent [`parse_sub_body_seeded`]
+    /// (captured before the restore), so a branch lowering can combine its arms' frontier type.
+    /// A branch's output is a clean element/scalar/path frontier only when EVERY arm agrees;
+    /// mixed arms (`coalesce(outE, hasLabel)`) leave an UNKNOWN frontier so a following static
+    /// type check (sum-over-element, values-on-scalar) does not fault (matches pure-TS).
+    last_arm_is_element: bool,
+    last_arm_is_scalar: bool,
+    last_arm_is_path: bool,
+    last_arm_on_edge: bool,
     /// True when the traversal reads a full `path()`/`tree()` — the lowering then emits a
     /// `Plan::PathRecord` after each value-producing step (see [`parse`]).
     building_full_path: bool,
@@ -1629,6 +1657,11 @@ impl Parser {
         // `!element && !scalar && !map && !path`) never faults — a missed fault is safe, a
         // false one breaks a valid query.
         {
+            // A DEFINITE edge frontier for ADJACENCY (out/outE on an edge faults). After a
+            // branch `current_is_element` is cleared to "unknown", so this is false there even
+            // for an all-edge branch — matching pure-TS, which runs `bothE` after
+            // `optional(...)` over edges and yields [] rather than faulting. `on_edge` alone
+            // still stays true for the ENDPOINT read off a reconverged edge.
             let on_edge_frontier = self.current_is_element && self.on_edge;
             let on_scalar_frontier = self.current_is_scalar;
             match lname.as_str() {
@@ -1945,6 +1978,7 @@ impl Parser {
                 self.edge_hop = prev_edge_hop;
                 let mut bodies = Vec::new();
                 let mut arm_edge_scopes: Vec<Option<bool>> = Vec::new();
+                let mut arm_fronts: Vec<ArmFrontier> = Vec::new();
                 loop {
                     // union() runs each arm over the WHOLE incoming stream (the branch body
                     // is seeded with the full batch, not per element), so a reducing barrier
@@ -1958,6 +1992,12 @@ impl Parser {
                     // Lineage-preserving, so path()-through-union still works.
                     bodies.push(body.reconverge(oc));
                     arm_edge_scopes.push(self.last_arm_edge_scope);
+                    arm_fronts.push(ArmFrontier {
+                        is_element: self.last_arm_is_element,
+                        is_scalar: self.last_arm_is_scalar,
+                        is_path: self.last_arm_is_path,
+                        on_edge: self.last_arm_on_edge,
+                    });
                     if self.peek() == Some(&Tok::Comma) {
                         self.bump();
                     } else {
@@ -1969,6 +2009,13 @@ impl Parser {
                 self.slots = 1;
                 self.edge_hop = None; // the reconverged frontier is not a just-hopped edge
                 self.edge_scope = combine_edge_scope(&arm_edge_scopes);
+                // Post-branch VALUE + ADJACENCY frontier is unknown (see coalesce); only
+                // edge_scope (endpoints) and an all-path frontier propagate.
+                let (_e, _s, is_path, all_edge) = combine_arm_frontier(&arm_fronts);
+                self.current_is_element = false;
+                self.current_is_scalar = false;
+                self.current_is_path = is_path;
+                self.on_edge = all_edge;
                 plan.branch(bodies)
             }
             "optional" => {
@@ -1981,8 +2028,12 @@ impl Parser {
                 let from = self.current;
                 let slots = self.slots;
                 let incoming_edge_scope = self.edge_scope; // the fallback keeps the source
-                                                           // Seed the arm with the outer edge hop (see parse_sub_body_seeded) so a
-                                                           // leading `otherV()`/`inV()` off `V().outE()` resolves against its origin.
+                let incoming_is_element = self.current_is_element;
+                let incoming_is_scalar = self.current_is_scalar;
+                let incoming_is_path = self.current_is_path;
+                let incoming_on_edge = self.on_edge;
+                // Seed the arm with the outer edge hop (see parse_sub_body_seeded) so a
+                // leading `otherV()`/`inV()` off `V().outE()` resolves against its origin.
                 self.edge_hop = prev_edge_hop;
                 // An aggregate-terminal body ALWAYS produces one value per element, so the
                 // identity fallback never fires — lower straight to the per-element
@@ -2037,8 +2088,20 @@ impl Parser {
                 // what makes a barrier inside the body (`limit(2)`, `skip(1)`, `dedup()`)
                 // apply to THAT element's sub-stream rather than the whole batch, which the
                 // old whole-stream EXISTS-guarded branch got wrong.
+                let incoming_front = ArmFrontier {
+                    is_element: incoming_is_element,
+                    is_scalar: incoming_is_scalar,
+                    is_path: incoming_is_path,
+                    on_edge: incoming_on_edge,
+                };
                 let (body, oc, _os) = self.parse_sub_body_seeded(Plan::Row, from, slots)?;
                 let body_edge_scope = self.last_arm_edge_scope;
+                let body_front = ArmFrontier {
+                    is_element: self.last_arm_is_element,
+                    is_scalar: self.last_arm_is_scalar,
+                    is_path: self.last_arm_is_path,
+                    on_edge: self.last_arm_on_edge,
+                };
                 self.expect(&Tok::RParen)?;
                 self.current = 0;
                 self.slots = 1;
@@ -2046,6 +2109,14 @@ impl Parser {
                                       // The output is the body's frontier OR the source (fallback) — an edge is in
                                       // scope only where BOTH have one.
                 self.edge_scope = combine_edge_scope(&[incoming_edge_scope, body_edge_scope]);
+                // Post-branch VALUE + ADJACENCY frontier is unknown (see coalesce); only
+                // edge_scope (endpoints) and an all-path frontier (body AND source) propagate.
+                let (_e, _s, is_path, all_edge) =
+                    combine_arm_frontier(&[incoming_front, body_front]);
+                self.current_is_element = false;
+                self.current_is_scalar = false;
+                self.current_is_path = is_path;
+                self.on_edge = all_edge;
                 plan.per_element_branch(
                     crate::ir::PerElemKind::Optional,
                     None,
@@ -2102,163 +2173,33 @@ impl Parser {
                     self.edge_scope = Some(false); // an all-values coalesce yields a scalar
                     return Ok(p);
                 }
-                // General: each body is a sub-traversal reconverging to one output slot.
-                // A body CONTRIBUTES when its leading hop exists (`out('CREATED')…`), or
-                // ALWAYS when it has no leading hop (`constant(v)`, a bare value). Body k
-                // fires only where every earlier body did NOT — an exclusion guard on the
-                // seed `Row`, then the body's own steps (a hop chain, a projection, …).
+                // General: run each arm PER ELEMENT (TinkerPop per-traverser coalesce) — the
+                // FIRST arm producing ≥1 output for that element wins. Each arm is a plain
+                // sub-traversal reconverged to one output slot; the "first non-empty" routing
+                // is decided at exec (Plan::PerElementBranch), so no exclusion-guard chain and
+                // no whole-stream EXISTS approximation is needed — and a barrier inside an arm
+                // (`limit(3)`, `skip(1)`, `count()`, `dedup()`) applies to THAT element's arm.
                 let slots = self.slots;
                 // Seed the arms with the outer edge hop so a leading `otherV()`/`inV()`
                 // off `V().outE()` resolves against its origin (see parse_sub_body_seeded).
                 self.edge_hop = prev_edge_hop;
                 let mut bodies = Vec::new();
-                let mut prior: Option<Expr> = None; // OR of the earlier branches' existence
                 let mut any_edge = false; // an edge-hop body → coalesce yields an edge frontier
                 let mut arm_edge_scopes: Vec<Option<bool>> = Vec::new();
+                let mut arm_fronts: Vec<ArmFrontier> = Vec::new();
                 loop {
-                    // An aggregate-terminal arm (`[<hop>.][values('k').](count|fold|sum|
-                    // min|max|mean)()`) produces EXACTLY ONE value per incoming element, so
-                    // per TinkerPop it fires wherever no earlier arm did. Lower it to a
-                    // correlated per-outer-row aggregate PROJECTION (count of the self-row is
-                    // 1, fold is `[self]`, `out().count()` is the per-element out-degree) —
-                    // NOT a whole-stream reducing body, which would collapse the whole batch
-                    // to a single number (`coalesce(count())` → `[3]` instead of `[1,1,1]`).
-                    if let Some(agg) = self.try_per_element_agg(from, slots)? {
-                        let seed = match &prior {
-                            None => Plan::Row,
-                            Some(p) => Plan::Row.filter(Expr::Not(Box::new(p.clone()))),
-                        };
-                        let body = seed.project(vec![("coalesce".to_string(), agg)]);
-                        bodies.push(body.reconverge(0));
-                        arm_edge_scopes.push(Some(false)); // an aggregate yields a scalar
-                                                           // Always fires where reached → later arms are unreachable.
-                        prior = Some(Expr::Lit(Value::Bool(true)));
-                        if self.peek() == Some(&Tok::Comma) {
-                            self.bump();
-                            continue;
-                        }
-                        break;
-                    }
                     if self.peek_leading_is_edge() {
                         any_edge = true;
                     }
-                    let this = match self.peek_leading_hop() {
-                        Some((dir, labels)) => {
-                            // A navigating body contributes where the FULL body produces
-                            // output — an EXACT correlated EXISTS when the body is
-                            // prov-safe (pure navigation/filter, no projection to drop the
-                            // provenance column); otherwise the leading-hop existence
-                            // approximation. Peek-parse the body (prov slot reserved,
-                            // width `slots + 1`), then restore the cursor for the real
-                            // parse below. `out('a').out('b')` where the 2nd hop is empty
-                            // would otherwise fire this arm's guard yet produce nothing,
-                            // wrongly excluding the element from a later arm.
-                            let save = self.pos;
-                            let gbody = self
-                                .parse_sub_body_seeded(Plan::Row, from, slots + 1)
-                                .map(|(b, _, _)| b);
-                            self.pos = save;
-                            match gbody {
-                                Ok(b) if body_is_exists_safe(&b) => Expr::Exists {
-                                    body: Box::new(b),
-                                    outer_width: slots,
-                                },
-                                _ => Expr::Exists {
-                                    body: Box::new(Plan::Row.expand(from, dir, &labels)),
-                                    outer_width: slots,
-                                },
-                            }
-                        }
-                        // An EDGE-hop body (`outE('KNOWS')…`) contributes where the hop lands
-                        // an edge — an EXACT correlated EXISTS when prov-safe, else the leading
-                        // edge-hop existence. Without this the arm defaulted to always-true, so
-                        // a later arm (`coalesce(outE('KNOWS'), count())`) could never fire.
-                        None if self.peek_leading_edge_hop().is_some() => {
-                            let (dir, labels) =
-                                self.peek_leading_edge_hop().expect("edge hop just peeked");
-                            let save = self.pos;
-                            let gbody = self
-                                .parse_sub_body_seeded(Plan::Row, from, slots + 1)
-                                .map(|(b, _, _)| b);
-                            self.pos = save;
-                            match gbody {
-                                Ok(b) if body_is_exists_safe(&b) => Expr::Exists {
-                                    body: Box::new(b),
-                                    outer_width: slots,
-                                },
-                                _ => Expr::Exists {
-                                    body: Box::new(
-                                        Plan::Row.expand_edge_gremlin(from, dir, &labels),
-                                    ),
-                                    outer_width: slots,
-                                },
-                            }
-                        }
-                        // A body led by a FILTER (`hasLabel('PERSON').values('name')`)
-                        // produces output only where the filter holds; that predicate is
-                        // the guard. Peek it via child_filter_expr, then restore the
-                        // cursor so parse_sub_body re-parses the full body.
-                        None if self.peek_leading_is_filter() => {
-                            let save = self.pos;
-                            let pred = self.child_filter_expr()?;
-                            self.pos = save;
-                            pred
-                        }
-                        None => Expr::Lit(Value::Bool(true)), // a value body always produces
-                    };
-                    let guard = match &prior {
-                        None => this.clone(),
-                        Some(p) => Expr::And(
-                            Box::new(Expr::Not(Box::new(p.clone()))),
-                            Box::new(this.clone()),
-                        ),
-                    };
-                    let (body, oc, _os) =
-                        self.parse_sub_body_seeded(Plan::Row.filter(guard), from, slots)?;
-                    // A PURE-BARRIER arm (only order/limit/range/skip/dedup over leading
-                    // filters — no hop/projection/aggregate) runs whole-stream here, but per
-                    // element each barrier is identity (`range(0,1)`/`limit(n>=1)`/`dedup`) or
-                    // empties the single traverser (`limit(0)`/`skip(n>=1)`/`range(lo>0,·)`).
-                    // Strip the identity barriers (yield the element where the filters hold),
-                    // and DROP a never-firing arm — matching TinkerPop's per-element branch
-                    // (`coalesce(hasLabel('X'), range(0,1))` yields every element, not one).
-                    // `arm_this` is what this arm adds to `prior` (which rows a LATER arm must
-                    // exclude). For a barrier-LED arm it is the arm's own filters, not the
-                    // Lit(true) that `this` defaulted to (`coalesce(dedup().has('lang'), id())`
-                    // otherwise marked arm 1 always-firing and dropped the id() arm).
-                    let (final_body, final_oc, contributes, arm_this) = if arm_always_empty(&body) {
-                        (Plan::Row, from, false, this.clone()) // a limit(0)/empty-range kills it
-                    } else {
-                        match strip_barrier_arm(body.clone()) {
-                            Some((_, false, _)) => (Plan::Row, from, false, this.clone()), // never fires
-                            Some((stripped, true, _)) => {
-                                // The arm fires where its (filter) body produces a row — a
-                                // DEFINITE `EXISTS` over the stripped body, not the raw filter
-                                // conjunction. A `has('k', pred)` filters absent `k` via a
-                                // three-valued Compare(null,·)=null; negating that for a later
-                                // arm's guard leaves null (dropped), so the later arm wrongly
-                                // saw no rows. EXISTS collapses it to true/false.
-                                let at = Expr::Exists {
-                                    body: Box::new(stripped.clone()),
-                                    outer_width: slots,
-                                };
-                                (stripped, from, true, at)
-                            }
-                            None => (body, oc, true, this.clone()),
-                        }
-                    };
-                    if contributes {
-                        // Reconverge every arm to a uniform width-1 frontier at slot 0 so
-                        // arms of different depth land their element at the SAME slot (a
-                        // 2-hop arm beside a 1-hop arm otherwise diverges downstream);
-                        // lineage-preserving, so `coalesce(...).inV().path()` still answers.
-                        bodies.push(final_body.reconverge(final_oc));
-                        arm_edge_scopes.push(self.last_arm_edge_scope);
-                        prior = Some(match prior {
-                            None => arm_this,
-                            Some(p) => Expr::Or(Box::new(p), Box::new(arm_this)),
-                        });
-                    }
+                    let (body, oc, _os) = self.parse_sub_body_seeded(Plan::Row, from, slots)?;
+                    bodies.push(body.reconverge(oc));
+                    arm_edge_scopes.push(self.last_arm_edge_scope);
+                    arm_fronts.push(ArmFrontier {
+                        is_element: self.last_arm_is_element,
+                        is_scalar: self.last_arm_is_scalar,
+                        is_path: self.last_arm_is_path,
+                        on_edge: self.last_arm_on_edge,
+                    });
                     if self.peek() == Some(&Tok::Comma) {
                         self.bump();
                     } else {
@@ -2269,18 +2210,31 @@ impl Parser {
                 self.current = 0;
                 self.slots = 1;
                 self.edge_hop = None; // the reconverged frontier is not a just-hopped edge
-                self.on_edge = any_edge;
-                // The coalesce output has an edge in scope only where EVERY arm did (port of TS
-                // combineHasEdge) — a following endpoint faults otherwise.
+                                      // An edge is in scope only where EVERY arm has one (port of TS combineHasEdge).
                 self.edge_scope = combine_edge_scope(&arm_edge_scopes);
-                // An edge-yielding coalesce keeps the interleaved edge-path answerable
-                // (its edge lands in the lineage); a non-edge coalesce breaks it.
+                // The post-branch frontier is UNKNOWN for VALUE and ADJACENCY checks (matches
+                // pure-TS: a following sum/values/adjacency reaches the runtime check rather
+                // than a static fault) — clear element/scalar/on_edge. Only `edge_scope` is
+                // propagated, for the ENDPOINT fault (`coalesce(count(), inE()).outV()`), and a
+                // path frontier when EVERY arm is a path (for a following path()).
+                let (_is_elem, _is_scalar, is_path, all_edge) = combine_arm_frontier(&arm_fronts);
+                self.current_is_element = false;
+                self.current_is_scalar = false;
+                self.current_is_path = is_path;
+                // `on_edge` stays true for an all-edge branch so a following endpoint reads off
+                // the reconverged edge; adjacency stays lenient via `current_is_element` (false).
+                self.on_edge = all_edge;
                 if any_edge {
                     self.path_has_edges = true;
                 } else {
                     self.edge_path_ok = false;
                 }
-                plan.branch(bodies)
+                return Ok(plan.per_element_branch(
+                    crate::ir::PerElemKind::Coalesce,
+                    None,
+                    bodies,
+                    from,
+                ));
             }
             "match" => {
                 // match(<fragment>, …). A fragment is one of:
@@ -3730,7 +3684,11 @@ impl Parser {
                 } else {
                     // TinkerPop: min/max/sum/mean over raw graph ELEMENTS throws — a
                     // Vertex/Edge is neither numeric (sum/mean) nor comparable (min/max).
-                    // Project first with `values('<key>')`. Known statically from the chain.
+                    // Project first with `values('<key>')`. Static over a DEFINITE element
+                    // frontier (matches the pure-TS build-time Frontier check). After a
+                    // branch the frontier is UNKNOWN (`current_is_element` is cleared), so a
+                    // `coalesce(...).sum()` whose arms produce nothing reaches the RUNTIME
+                    // check and yields [null] instead of faulting here.
                     if self.current_is_element {
                         return Err(format!(
                             "{lname}() over graph elements is not supported — a vertex/edge \
@@ -6233,9 +6191,13 @@ impl Parser {
         }
         let out_current = self.current;
         let out_slots = self.slots;
-        // Capture the arm's OUTPUT edge-in-scope before restoring, so a branch lowering can
-        // combine its arms.
+        // Capture the arm's OUTPUT edge-in-scope + frontier KIND before restoring, so a branch
+        // lowering can combine its arms.
         self.last_arm_edge_scope = self.edge_scope;
+        self.last_arm_is_element = self.current_is_element;
+        self.last_arm_is_scalar = self.current_is_scalar;
+        self.last_arm_is_path = self.current_is_path;
+        self.last_arm_on_edge = self.on_edge;
         self.current = saved_current;
         self.slots = saved_slots;
         self.edge_hop = saved_edge;
@@ -6516,24 +6478,6 @@ impl Parser {
         Ok(Some(expr))
     }
 
-    /// True when the coalesce body ahead starts with an element FILTER
-    /// (`hasLabel`/`has`/`hasNot`/`hasKey`/`hasValue`/`where`/`not`/`and`/`or`/`filter`),
-    /// so the body only produces output where that filter holds.
-    fn peek_leading_is_filter(&self) -> bool {
-        let mut p = self.pos;
-        if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
-            p += 1;
-            if self.toks.get(p) == Some(&Tok::Dot) {
-                p += 1;
-            }
-        }
-        matches!(self.toks.get(p), Some(Tok::Ident(s)) if matches!(
-            s.to_ascii_lowercase().as_str(),
-            "haslabel" | "has" | "hasnot" | "haskey" | "hasvalue" | "where" | "not"
-                | "and" | "or" | "filter"
-        ))
-    }
-
     /// True when the coalesce/union body ahead starts with an EDGE hop
     /// (`[__.](outE|inE|bothE)`), so the reconverged frontier holds edges.
     fn peek_leading_is_edge(&self) -> bool {
@@ -6548,83 +6492,6 @@ impl Parser {
             let l = s.to_ascii_lowercase();
             l == "oute" || l == "ine" || l == "bothe"
         })
-    }
-
-    fn peek_leading_hop(&self) -> Option<(Dir, Vec<String>)> {
-        let mut p = self.pos;
-        if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
-            p += 1;
-            if self.toks.get(p) != Some(&Tok::Dot) {
-                return None;
-            }
-            p += 1;
-        }
-        let dir = match self.toks.get(p) {
-            Some(Tok::Ident(s)) => match s.to_ascii_lowercase().as_str() {
-                "out" => Dir::Out,
-                "in" => Dir::In,
-                "both" => Dir::Both,
-                _ => return None,
-            },
-            _ => return None,
-        };
-        p += 1;
-        if self.toks.get(p) != Some(&Tok::LParen) {
-            return None;
-        }
-        p += 1;
-        let mut labels = Vec::new();
-        while let Some(Tok::Str(s)) = self.toks.get(p) {
-            labels.push(s.clone());
-            p += 1;
-            if self.toks.get(p) == Some(&Tok::Comma) {
-                p += 1;
-            } else {
-                break;
-            }
-        }
-        Some((dir, labels))
-    }
-
-    /// Like [`peek_leading_hop`] but for a leading EDGE hop (`outE`/`inE`/`bothE`), returning
-    /// its `(direction, edge labels)`. Used to build a coalesce/branch edge-hop arm's
-    /// existence guard — an edge-hop body contributes where the hop lands an edge, exactly as
-    /// a vertex adjacency arm does (without this the arm's guard defaulted to always-true, so
-    /// a later arm — `coalesce(outE('KNOWS'), count())` — could never fire).
-    fn peek_leading_edge_hop(&self) -> Option<(Dir, Vec<String>)> {
-        let mut p = self.pos;
-        if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
-            p += 1;
-            if self.toks.get(p) != Some(&Tok::Dot) {
-                return None;
-            }
-            p += 1;
-        }
-        let dir = match self.toks.get(p) {
-            Some(Tok::Ident(s)) => match s.to_ascii_lowercase().as_str() {
-                "oute" => Dir::Out,
-                "ine" => Dir::In,
-                "bothe" => Dir::Both,
-                _ => return None,
-            },
-            _ => return None,
-        };
-        p += 1;
-        if self.toks.get(p) != Some(&Tok::LParen) {
-            return None;
-        }
-        p += 1;
-        let mut labels = Vec::new();
-        while let Some(Tok::Str(s)) = self.toks.get(p) {
-            labels.push(s.clone());
-            p += 1;
-            if self.toks.get(p) == Some(&Tok::Comma) {
-                p += 1;
-            } else {
-                break;
-            }
-        }
-        Some((dir, labels))
     }
 
     /// Parse a comma-separated list of child filter traversals up to (but not
@@ -9516,7 +9383,9 @@ mod tests {
     /// A `values('<key>')` projection (or `order().by('<key>')`) makes it comparable/numeric.
     #[test]
     fn element_frontier_agg_and_order_fault() {
-        // sum/mean/min/max over raw vertices/edges → parse error.
+        // sum/mean/min/max over a DEFINITE raw element frontier → parse error (static). A
+        // POST-BRANCH element frontier is unknown, so `coalesce(...).sum()` reaches the
+        // runtime check instead (covered in the ported suite).
         for q in [
             "g.V().sum()",
             "g.V().mean()",
@@ -9528,7 +9397,7 @@ mod tests {
         ] {
             assert!(super::parse(q).is_err(), "expected fault: {q}");
         }
-        // Bare order() (or a direction-only by) over elements → parse error.
+        // Bare order() (or a direction-only by) over elements → parse error (static).
         for q in ["g.V().order()", "g.V().order().by(desc)", "g.E().order()"] {
             assert!(super::parse(q).is_err(), "expected fault: {q}");
         }

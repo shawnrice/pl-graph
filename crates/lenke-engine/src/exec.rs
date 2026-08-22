@@ -2741,17 +2741,18 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // 1-row sub-batch and concatenate the per-row outputs in row order (the
             // interleave TinkerPop/the TS engine produce).
             let inb = pull(input, store, track)?;
-            // An EMPTY frontier: the per-row loop below runs zero times, and
-            // `concat_batches(&[])` is a 0-slot batch — a downstream slot read would then
-            // index a column that isn't there. Reproduce the arms' natural width-1 EMPTY
-            // shape (typed column, zero rows) by running them over the empty input, so a
-            // following `has(...)`/`values(...)` short-circuits to [] instead of faulting.
+            // An EMPTY frontier: per element there are NO elements to route, so the result is
+            // empty — but `concat_batches(&[])` is a 0-slot batch and a downstream slot read
+            // would index a column that isn't there. Reproduce the arms' natural width-1 shape
+            // (typed column) and then take ZERO rows: running the arms whole-stream over the
+            // empty input yields the right column TYPE, and `gather(&[])` drops any row a
+            // reducer fabricated (`count()` over empty = [0]) so the output is truly empty.
             if inb.rows() == 0 {
                 let subs: Vec<Batch> = arms
                     .iter()
                     .map(|b| pull_body(b, store, &inb))
                     .collect::<Result<_, _>>()?;
-                return Ok(concat_batches(&subs, store));
+                return Ok(concat_batches(&subs, store).gather(&[]));
             }
             // The source element as a width-1 batch (the pass-through fallback), preserving
             // the row's lineage so a following path() still answers.
@@ -4919,6 +4920,15 @@ fn aggregate(
         // would SILENTLY SUM THE IDS; TinkerPop throws ClassCastException and pure-TS faults,
         // so fault here to match (`g.V().union(out(), …).sum()`). Collect/fold over elements
         // is fine (it builds a list of element maps), so only the numeric reducers fault.
+        let elem_col = match arg_col.as_ref() {
+            Some(Col::Nodes(v)) => !v.is_empty(),
+            Some(Col::Edges(v)) => !v.is_empty(),
+            // A mixed branch frontier carries elements UNBOXED in a Gen column.
+            Some(Col::Gen(vs)) => vs
+                .iter()
+                .any(|v| matches!(v, Value::Node(_) | Value::Edge(_))),
+            _ => false,
+        };
         if matches!(
             agg.func,
             AggFn::Sum
@@ -4929,7 +4939,7 @@ fn aggregate(
                 | AggFn::StddevSamp
                 | AggFn::PercentileCont
                 | AggFn::PercentileDisc
-        ) && matches!(arg_col, Some(Col::Nodes(_) | Col::Edges(_)))
+        ) && elem_col
         {
             return Err(format!(
                 "{}() over graph elements is not supported — a vertex/edge is not a number; \

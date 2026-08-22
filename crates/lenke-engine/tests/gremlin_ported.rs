@@ -10047,6 +10047,22 @@ fn optional_bare_count_is_one_per_element() {
 }
 
 #[test]
+fn sum_over_elements_faults_at_runtime_but_empty_branch_is_null() {
+    // A numeric reducer over actual vertices/edges faults (a vertex/edge is not a number,
+    // like TinkerPop's ClassCastException) — now at RUNTIME, not parse.
+    assert!(rejects("g.V().sum()"));
+    assert!(rejects("g.V().max()"));
+    assert!(rejects("g.E().sum()"));
+    assert!(rejects("g.V().out().max()"));
+    // But a coalesce whose arms produce NOTHING has no element to sum, so it is [null] —
+    // a static parse fault would wrongly reject it (matches TS runtime typing).
+    assert_eq!(
+        qs("g.V().coalesce(outE('NOPE'), hasLabel('NOPE')).sum()"),
+        vec![GVal::Null]
+    );
+}
+
+#[test]
 fn optional_arm_barriers_apply_per_element() {
     // A barrier inside an optional arm runs on ONE traverser at a time (TinkerPop
     // per-traverser semantics), NOT the whole batch. Verified against TinkerPop on the
