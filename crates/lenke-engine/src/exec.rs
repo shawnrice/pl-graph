@@ -2805,7 +2805,15 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                                 break;
                             }
                         }
-                        chosen.unwrap_or_else(|| sub.gather(&[]))
+                        match chosen {
+                            Some(b) => b,
+                            // No arm produced — an EMPTY row shaped like an arm's WIDTH-1 output
+                            // (running arm[0] on the empty sub), NOT `sub.gather(&[])` which keeps
+                            // the sub's full width: a leading hop makes sub width-2, and the width
+                            // mismatch would desync the concat into a Gen column that a following
+                            // fused hop mishandles (`out('KNOWS').coalesce(...).outE()` → null).
+                            None => pull_body(&arms[0], store, &sub.gather(&[]))?,
+                        }
                     }
                     crate::ir::PerElemKind::Optional => {
                         let r = pull_body(&arms[0], store, &sub)?;
