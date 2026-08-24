@@ -2,22 +2,29 @@
 
 ## Benchmarks: look before you build
 
-There are ~28 benchmarks already. **`crates/lenke-core/examples/README.md` indexes
-them by the question they answer** — start there, not with a new file.
+The engine has a few native Rust benchmark examples under
+`crates/lenke-engine/examples/`. Read their module headers before writing a new
+one — each opens with the exact question it answers:
 
-The file names do not tell you what they cover. `storage_probe` is the
-adjacency-layout question. `eval_vs_columnar` is the predicate-evaluation
-question. `perf_bench` covers query shapes _and_ write throughput. Several
-domain-shaped workloads (`bench_aml_shapes`, `bench_hris_shapes`) live as
-`#[ignore]`d tests rather than examples, because they need crate-private access.
+- `expand_bench` — the adjacency / edge-type question: what does a type-filtered
+  `expand` pay to scan a node's whole adjacency and filter by edge type? It scales
+  with degree and with how many types the degree spans (a selective type over a
+  high-degree, many-type node is where an index could win; a degree-4 single-type
+  fixture is where it can only lose).
+- `interval_bench` — the bitemporal question: what does an "as of T" query pay to
+  expand all of a node's edges and post-filter by validity interval, vs. an
+  interval-index seek?
+- `spelling_probe` — equivalent-spelling plan + perf coverage; see the section
+  below.
 
-Writing a new benchmark feels like progress and reading twenty file headers feels
-like overhead. It is the other way round: a session was spent re-deriving the
-adjacency-storage question from scratch — build a fixture, vary the degree, price
-the write penalty — when `storage_probe` already did all of it, better.
+Writing a new benchmark feels like progress and reading three file headers feels
+like overhead. It is the other way round — re-deriving a question one of these
+already answers is the expensive path. Add a new example only when the question
+genuinely is not covered.
 
-Add a new one only when the question genuinely is not covered, and add it to the
-index when you do.
+(A larger benchmark corpus, indexed by a README, lived in the retired `lenke-core`
+crate and went with it when it was deleted; rebuilding the parts that still matter
+against `lenke-engine` is open work.)
 
 ### Three engines, two harnesses
 
@@ -70,16 +77,19 @@ have changed. Several have been re-attempted otherwise.
 
 ### Equivalent spellings must cost the same
 
-Every index-seeding bug found so far had one shape: the planner recognized one
-spelling of a predicate and scanned for another that meant exactly the same
-thing — `$x = u.k` vs `u.k = $x`, `k = $a OR k = $b` vs `k IN [$a, $b]`, a clause
-`WHERE` vs an inline `{k: $x}`, `5 <= u.n` vs `u.n >= 5`. Each cost 100-300x and
-each returned the correct answer, so no correctness test could catch it.
+Every index-seeding bug found in the old engine had one shape: the planner
+recognized one spelling of a predicate and scanned for another that meant exactly
+the same thing — `$x = u.k` vs `u.k = $x`, `k = $a OR k = $b` vs `k IN [$a, $b]`, a
+clause `WHERE` vs an inline `{k: $x}`, `5 <= u.n` vs `u.n >= 5`. Each cost 100-300x
+and each returned the correct answer, so no correctness test could catch it.
 
-`equivalent_spellings_cost_the_same` (in `gql/index_seed_tests.rs`, ignored)
-asserts that groups of equivalent queries return the same rows AND run within a
-factor of each other. It found one of the four immediately, in the fix for
-another. When adding a predicate form to the planner, add its spellings there.
+This engine lowers BOTH GQL and Gremlin to one `ir::Plan` and runs one `exec`, so
+speed is a property of the optimized plan, not the surface syntax — two spellings
+that optimize to the same plan cannot differ. The `spelling_probe` example checks
+that claim directly: for each group of queries that should be equivalent it prints
+the canonicalized optimized plan and the measured time, and flags any group whose
+members disagree on either. A plan mismatch is the real signal; the time is the
+backstop. When adding a predicate form to the planner, add its spellings there.
 
 ## Gates
 
@@ -99,7 +109,7 @@ cd packages/native && FUZZ_SEED=<n> bun test src/codec-fuzz.test.ts \
 
 `backend-parity-fuzz` compares the wasm build against the FFI build, and
 **neither `bun run build` nor `cargo build` rebuilds the wasm** — only
-`cd packages/native && bun run build:wasm` does. A stale `lenke_core.wasm`
+`cd packages/native && bun run build:wasm` does. A stale `lenke_engine.wasm`
 turns that fuzzer into a comparison between your change and an old copy of
 itself: it reports failures you did not cause and passes you did not earn.
 Found with the artifact two days behind the `.so`, after chasing a `max()`
@@ -107,6 +117,6 @@ Found with the artifact two days behind the `.so`, after chasing a `max()`
 suite, and check the timestamps if it says something surprising:
 
 ```
-stat -c '%y %n' crates/lenke-core/target/release/liblenke_core.so \
-  crates/lenke-core/target/wasm32-unknown-unknown/release/lenke_core.wasm
+stat -c '%y %n' crates/lenke-engine/target/release/liblenke_engine.so \
+  crates/lenke-engine/target/wasm32-unknown-unknown/release/lenke_engine.wasm
 ```
