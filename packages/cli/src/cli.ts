@@ -4,7 +4,7 @@ import { env, stderr, stdout } from 'node:process';
 import { openBackend } from './engine.js';
 import { emptyGraph, formatFor, loadGraph, saveGraph } from './io.js';
 import { type Lang, runQuery } from './query.js';
-import { runRepl } from './repl.js';
+import { runShell } from './shell.js';
 
 const USAGE = `lenke — a REPL and CLI for the lenke graph engine
 
@@ -144,7 +144,7 @@ export const main = async (argv: readonly string[]): Promise<void> => {
   const convert = args.out !== undefined;
 
   if (!oneShot && !convert) {
-    await runRepl({ graph, backend, color });
+    await runShell({ graph, backend, color });
 
     return;
   }

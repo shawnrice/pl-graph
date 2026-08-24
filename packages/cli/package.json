@@ -6,8 +6,9 @@
     "lenke": "./bin/lenke.mjs"
   },
   "files": [
+    "bin",
     "dist",
-    "bin"
+    "samples"
   ],
   "type": "module",
   "sideEffects": false,
@@ -23,6 +24,7 @@
     "test": "bun test"
   },
   "dependencies": {
+    "@lenke/core": "workspace:*",
     "@lenke/inspect": "workspace:*",
     "@lenke/native": "workspace:*"
   },

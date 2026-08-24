@@ -12,4 +12,6 @@ export {
   type Format,
 } from './io.js';
 export { openBackend, resolveWasmPath } from './engine.js';
-export { runRepl, type ReplContext } from './repl.js';
+export { runShell, type ShellContext } from './shell.js';
+export { SAMPLES, findSample, loadSample, type Sample } from './samples.js';
+export { complete, type Mode } from './completion.js';

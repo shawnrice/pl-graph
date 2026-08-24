@@ -1,6 +1,6 @@
 # @lenke/cli
 
-> A REPL and command-line tool for lenke: load a graph through any codec, query it in **GQL or Gremlin**, and serialize it back out.
+> A graph shell and command-line tool for lenke: explore a graph interactively in **GQL** (or Gremlin), load bundled sample graphs, and convert between codecs.
 
 For quick analysis and trying queries against a graph file without writing a
 script. It runs the Rust engine as WebAssembly, so it works on plain Node or Bun
@@ -20,63 +20,83 @@ The CLI needs the wasm engine (`lenke_engine.wasm`). It looks at the `--wasm <pa
 flag, then `$LENKE_WASM`, then the workspace build output — so after
 `bun run build:wasm` it just works in-repo.
 
-## The REPL
+## The shell
 
-The REPL **is Node's REPL** with the lenke helpers preloaded — so you get the
-whole language (multiline, `await`, history, tab-completion) alongside the graph,
-and query results auto-render as tables.
+A `psql`-style shell. **GQL is the default** — type a query, press Enter, get a
+table. Backslash meta-commands drive the session, and the prompt always shows the
+mode, so there's no guessing what a line means. Runs on Node **and** Bun.
 
 ```sh
 lenke                      # empty graph
 lenke graph.ndjson         # load a file (codec inferred from the extension)
 ```
 
+Start with a bundled sample — no data file needed:
+
 ```text
-lenke> g
-Graph — 2 vertices, 1 edges (version 3)
-Vertex labels
-  Person  2
+lenke=# \l
+  modern       Apache TinkerPop "modern": 6 person/software vertices, weighted edges.
+  employment   Bitemporal org — people, companies, WORKS_AT with valid-time and system-time.
+lenke=# \c employment
+loaded employment — 5 vertices, 7 edges
+lenke=# \clock 2020-06-01
+clock: 2020-06-01 (current_date / current_timestamp now resolve to it)
+lenke=# MATCH (p:Person)-[e:WORKS_AT]->(c) WHERE e.vf <= current_date AND e.vt > current_date
+lenke-#   RETURN p.name AS person, c.name AS role ORDER BY person
+┌────────┬─────────────────┐
+│ person │ role            │
+├────────┼─────────────────┤
+│ Alice  │ Engineer        │
 …
-lenke> query('MATCH (p:Person) RETURN p.name, p.age')
-┌────────┬───────┐
-│ p.name │ p.age │
-├────────┼───────┤
-│ marko  │ 29    │
-│ josh   │ 32    │
-└────────┴───────┘
-lenke> query('MATCH (p:Person) RETURN p.name, p.age').filter((r) => r['p.age'] > 30)
-┌────────┬───────┐
-│ p.name │ p.age │
-├────────┼───────┤
-│ josh   │ 32    │
-└────────┴───────┘
-lenke> gremlin("g.V().hasLabel('Person').count()")
-┌───────┐
-│ value │
-├───────┤
-│ 2     │
-└───────┘
 ```
 
-Because it's the real REPL, a query returns plain data you can keep working with
-in JavaScript (`.filter`, `.map`, assign to a variable, …); it just renders as a
-table when it's the value of the line.
+A query that isn't finished (an open bracket, or a trailing `\`) continues on the
+next line — the prompt turns to `lenke-#`. No `;` needed.
 
-Helpers available in the session:
+### Modes
 
-| Helper                 | Does                                                |
-| ---------------------- | --------------------------------------------------- |
-| `g`                    | the current graph (type it for a summary)           |
-| `query('…'[, params])` | run a GQL query → rows                              |
-| `gremlin('…')`         | run a Gremlin traversal → results                   |
-| `describe([graph])`    | the graph summary as data (counts, labels, indexes) |
-| `table(rows)`          | render rows as a table string                       |
-| `load('file'[, fmt])`  | load a graph from a file (replaces `g`)             |
-| `save('file'[, fmt])`  | serialize the graph to a file                       |
-| `formats`              | the list of codec names                             |
+The language is an explicit mode, shown in the prompt — never sniffed:
 
-> The interactive REPL is **Node-only** — Bun's `node:repl` has no `start()`. The
-> one-shot (`-q`) and conversion (`-o`) modes below work on both Node and Bun.
+| Command     | Prompt             | What you type                                 |
+| ----------- | ------------------ | --------------------------------------------- |
+| _(default)_ | `lenke=#`          | GQL: `MATCH (p:Person) RETURN p.name`         |
+| `\gremlin`  | `lenke(gremlin)=#` | Gremlin: `g.V().hasLabel('Person').count()`   |
+| `\js`       | `lenke(js)=#`      | JavaScript, where `_` is the last result rows |
+
+`\js` is the escape hatch for keeping data in JavaScript:
+
+```text
+lenke=# MATCH (p:Person)-[e:WORKS_AT]->(c) RETURN p.name AS person, c.name AS company, e.role AS role
+… (a table) …
+lenke=# \js
+lenke(js)=# _.filter((r) => r.company === 'Globex').map((r) => r.person + ' — ' + r.role)
+┌─────────────────────────┐
+│ value                   │
+├─────────────────────────┤
+│ Alice — Senior Engineer │
+…
+```
+
+### Meta-commands
+
+| Command                       | Does                                                          |
+| ----------------------------- | ------------------------------------------------------------- |
+| `\l`                          | list the bundled sample graphs                                |
+| `\c <name\|file> [fmt]`       | load a sample by name, or a file (codec from extension/`fmt`) |
+| `\d`                          | describe the graph (labels + counts)                          |
+| `\dv` / `\de`                 | list vertex / edge labels                                     |
+| `\d <Label>`                  | property keys + element count for a label                     |
+| `\clock <date>\|off`          | set `current_date` / `current_timestamp` (for as-of queries)  |
+| `\format table\|json\|ndjson` | how results render (`json`/`ndjson` are pipe-friendly)        |
+| `\timing on\|off`             | show query time                                               |
+| `\i <file>`                   | run queries from a file (one per line)                        |
+| `\o <file>\|off`              | also write query output to a file                             |
+| `\save <file> [fmt]`          | serialize the graph to a file                                 |
+| `\r`                          | reset the current input buffer                                |
+| `\?` / `\q`                   | help / quit                                                   |
+
+Tab completes meta-commands, GQL keywords / Gremlin steps, and the loaded graph's
+labels. History persists in `~/.lenke_history`.
 
 ## One-shot & conversion
 
