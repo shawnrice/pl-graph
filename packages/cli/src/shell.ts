@@ -16,6 +16,33 @@ export type ShellContext = { graph: RustGraph; backend: Backend; color: boolean 
 
 type OutFormat = 'table' | 'json' | 'ndjson';
 
+// The clock feeds `current_date` / `current_timestamp`. `live` follows the system
+// clock (read per query), which is the shell default; `fixed` pins a date for
+// as-of exploration; `off` leaves the now-functions unset.
+type ClockDesc = { kind: 'live' } | { kind: 'off' } | { kind: 'fixed'; date: Date };
+
+const applyClock = (graph: RustGraph, c: ClockDesc): void => {
+  if (c.kind === 'off') {
+    graph.setClock(null);
+  } else if (c.kind === 'live') {
+    graph.setClock(() => LocalDateTime.fromJSDate(new Date(), { zone: 'utc' }));
+  } else {
+    graph.setClock(() => LocalDateTime.fromJSDate(c.date, { zone: 'utc' }));
+  }
+};
+
+const describeClock = (c: ClockDesc): string => {
+  if (c.kind === 'live') {
+    return 'live (follows the system clock)';
+  }
+
+  if (c.kind === 'off') {
+    return 'off (current_date is unset)';
+  }
+
+  return `${c.date.toISOString().slice(0, 10)} (fixed)`;
+};
+
 export type State = {
   graph: RustGraph;
   backend: Backend;
@@ -25,18 +52,25 @@ export type State = {
   timing: boolean;
   labels: string[];
   last: readonly unknown[];
+  clock: ClockDesc;
 };
 
-export const makeState = (ctx: ShellContext): State => ({
-  graph: ctx.graph,
-  backend: ctx.backend,
-  color: ctx.color,
-  mode: 'gql',
-  format: 'table',
-  timing: false,
-  labels: labelsOf(ctx.graph),
-  last: [],
-});
+export const makeState = (ctx: ShellContext): State => {
+  // Wire the wall clock by default, so current_date works without a `\clock` first.
+  applyClock(ctx.graph, { kind: 'live' });
+
+  return {
+    graph: ctx.graph,
+    backend: ctx.backend,
+    color: ctx.color,
+    mode: 'gql',
+    format: 'table',
+    timing: false,
+    labels: labelsOf(ctx.graph),
+    last: [],
+    clock: { kind: 'live' },
+  };
+};
 
 const freeGraph = (graph: RustGraph): void => {
   try {
@@ -170,7 +204,7 @@ Meta-commands
   \\d                    describe the graph (labels + counts)
   \\dv / \\de            list vertex / edge labels
   \\d <Label>            property keys + count for a label
-  \\clock <date>|off     set current_date/current_timestamp (for as-of queries)
+  \\clock [date|now|off] as-of date for current_date (default: the system clock)
   \\format table|json|ndjson    how results render
   \\timing on|off        show query time
   \\i <file>             run queries from a file (one per line)
@@ -197,6 +231,7 @@ const metaLoad = (state: State, rest: string[], out: (s: string) => void): void 
   freeGraph(state.graph);
   state.graph = next;
   state.labels = labelsOf(next);
+  applyClock(next, state.clock); // a fresh graph starts clockless — carry the session's setting
   out(
     `loaded ${sample ? sample.name : rest[0]} — ${next.vertexCount} vertices, ${next.edgeCount} edges`,
   );
@@ -319,22 +354,31 @@ export const runMeta = (state: State, raw: string, out: (s: string) => void): bo
       out(`timing: ${state.timing ? 'on' : 'off'}`);
 
       return false;
-    case '\\clock':
-      if (!arg || arg === 'off') {
-        state.graph.setClock(null);
-        out('clock: off (current_date is unset)');
+    case '\\clock': {
+      const set = (c: ClockDesc): void => {
+        state.clock = c;
+        applyClock(state.graph, c);
+        out(`clock: ${describeClock(c)}`);
+      };
+
+      if (!arg) {
+        out(`clock: ${describeClock(state.clock)}`); // no arg → report, don't change
+      } else if (arg === 'now' || arg === 'live') {
+        set({ kind: 'live' });
+      } else if (arg === 'off') {
+        set({ kind: 'off' });
       } else {
         const d = new Date(`${arg}T00:00:00Z`);
 
         if (Number.isNaN(d.getTime())) {
-          out(`\\clock: '${arg}' is not a date (try YYYY-MM-DD)`);
+          out(`\\clock: '${arg}' is not a date (try YYYY-MM-DD, or 'now' / 'off')`);
         } else {
-          state.graph.setClock(() => LocalDateTime.fromJSDate(d, { zone: 'utc' }));
-          out(`clock: ${arg} (current_date / current_timestamp now resolve to it)`);
+          set({ kind: 'fixed', date: d });
         }
       }
 
       return false;
+    }
     case '\\i':
       if (!rest[0]) {
         out('usage: \\i <file>');

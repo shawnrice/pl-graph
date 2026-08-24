@@ -86,7 +86,7 @@ lenke(js)=# _.filter((r) => r.company === 'Globex').map((r) => r.person + ' — 
 | `\d`                          | describe the graph (labels + counts)                          |
 | `\dv` / `\de`                 | list vertex / edge labels                                     |
 | `\d <Label>`                  | property keys + element count for a label                     |
-| `\clock <date>\|off`          | set `current_date` / `current_timestamp` (for as-of queries)  |
+| `\clock [date\|now\|off]`     | as-of date for `current_date` (defaults to the system clock)  |
 | `\format table\|json\|ndjson` | how results render (`json`/`ndjson` are pipe-friendly)        |
 | `\timing on\|off`             | show query time                                               |
 | `\i <file>`                   | run queries from a file (one per line)                        |

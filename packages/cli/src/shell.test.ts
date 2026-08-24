@@ -100,4 +100,35 @@ describe('runMeta', () => {
     runMeta(state, '\\clock not-a-date', out);
     expect(lines.at(-1)).toContain('not a date');
   });
+
+  test('\\clock defaults to live; now / off / <date> switch it', () => {
+    const state = stateWith();
+
+    expect(state.clock.kind).toBe('live');
+    runMeta(state, '\\clock off', () => {});
+    expect(state.clock.kind).toBe('off');
+    runMeta(state, '\\clock now', () => {});
+    expect(state.clock.kind).toBe('live');
+  });
+
+  test('the clock setting carries to a graph loaded with \\c', () => {
+    const state = stateWith();
+
+    runMeta(state, '\\clock 2020-06-01', () => {});
+    runMeta(state, '\\c employment', () => {});
+
+    // current_date resolves to the fixed date on the freshly loaded graph.
+    const rows = state.graph.query('RETURN current_date AS d') as { d: { '@date': string } }[];
+
+    expect(rows[0].d).toEqual({ '@date': '2020-06-01' });
+  });
+});
+
+describe('the clock is live by default', () => {
+  test('current_date resolves without a \\clock first', () => {
+    const state = makeState({ graph: emptyGraph(backend), backend, color: false });
+    const rows = state.graph.query('RETURN current_date AS d') as { d: unknown }[];
+
+    expect(rows[0].d).toBeTruthy(); // today's date, not null/unset
+  });
 });
