@@ -1,11 +1,13 @@
 # GQL conformance corpus
 
-One set of GQL cases, run against **both** engines. Each `*.jsonl` file holds cases
-extracted from a lenke-core behavioral test file. The runner (`../gql_corpus.rs`)
-loads each case's fixture into lenke-core (the reference) **and** lenke-engine, runs
-the query on both, and asserts the engine's result multiset matches core's. Core's
-own inline tests still pin core to the spec; this extends the same query surface to
-the engine.
+One set of GQL cases, run as an engine regression snapshot. Each `*.jsonl` file holds
+cases extracted from a lenke-core behavioral test file. The runner (`../gql_corpus.rs`)
+loads each case's fixture into lenke-engine and asserts its result multiset matches the
+recorded outcome in `snapshots.jsonl`. That snapshot was captured while lenke-core still
+existed and the differential was green, so each recorded outcome equals core's
+spec-anchored answer. lenke-core has since been deleted; the live byte-identity contract
+is now upheld by the TS engine (`@lenke/core`) fuzzers, and this corpus guards against
+engine regressions from the frozen baseline.
 
 ## Case format — one JSON object per line
 
@@ -32,7 +34,7 @@ the engine.
 
 - Read queries `MATCH ... RETURN <scalars>` (names, numbers, counts, bools, strings).
 - Single-statement write-and-return where the RETURN is scalar (`CREATE (n:X {..}) RETURN n.k`).
-- Queries the test expects to ERROR — include them; the runner checks error-parity (both must reject).
+- Queries the test expects to ERROR — include them; the snapshot records the rejection and the runner checks the engine still rejects.
 - A test with several queries → one case per query (same fixture, `name` suffixed `_1`, `_2`, …).
 
 ## What to SKIP (do not emit a case)
@@ -44,19 +46,25 @@ the engine.
 - Tests whose fixture or expected can't be read off directly (custom Rust logic, loops building data).
 
 When unsure, skip — a missing case is fine, a wrong one is noise. The runner reports every
-engine≠core mismatch, so genuine engine gaps surface for review.
+case that diverges from its snapshot, so genuine engine regressions surface for review.
 
 ## Verify
 
 ```
-cargo test --release --manifest-path crates/lenke-engine/Cargo.toml --test gql_corpus -- --nocapture
+cargo test -p lenke-engine --test gql_corpus -- --nocapture
+```
+
+After an INTENDED behavior change, regenerate the frozen baseline (and review the diff —
+an unexplained change there is a regression):
+
+```
+CORPUS_SNAPSHOT=1 cargo test -p lenke-engine --test gql_corpus
 ```
 
 ## Excluded: parser recursion-depth cases
 
-Four core hardening cases (`h_deep_nested_{parens,not,label_negation,lists}`) feed
-thousands of nested tokens to assert a clean syntax error. Core has a parser
-recursion-depth guard; the engine's recursive-descent parser has none, so it
-**overflows the stack** (uncatchable) instead of erroring. They are omitted from the
-corpus (they would abort the run) and tracked as a known gap: the engine parser
-needs depth limits like core's.
+Four hardening cases (`h_deep_nested_{parens,not,label_negation,lists}`) feed
+thousands of nested tokens to assert a clean syntax error. The engine's
+recursive-descent parser has no recursion-depth guard, so it **overflows the stack**
+(uncatchable) instead of erroring. They are omitted from the corpus (they would abort
+the run) and tracked as a known gap: the engine parser needs depth limits.

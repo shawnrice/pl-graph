@@ -183,7 +183,7 @@ fn write_col_json(out: &mut String, col: &Col, store: &Store, first: &mut bool) 
     }
 }
 
-/// Entry point the FFI's `lnk_e_gremlin_json` uses: stream the result JSON when the shape
+/// Entry point the FFI's `lnk_query` (Gremlin, JSON) uses: stream the result JSON when the shape
 /// and cost allow, else materialize + serialize as before. Kept here (not in the FFI) so
 /// it has the plan + streaming machinery; falls back transparently.
 pub fn run_gremlin_json(plan: &Plan, store: &Store) -> String {
@@ -200,7 +200,7 @@ pub fn try_run_gremlin_json(plan: &Plan, store: &Store) -> Result<String, String
     on_big_stack(plan, || try_run_gremlin_json_inner(plan, store))
 }
 
-/// GQL egress (`lnk_e_query_rows`): stream a var-length endpoint projection to the
+/// GQL egress (`lnk_query`, JSON rows): stream a var-length endpoint projection to the
 /// `{columns, rows}` document when it applies — so a large closure completes without
 /// materializing the row batch — else materialize + serialize. Big-stack-dispatched like
 /// `try_run`. Byte-identical to `gql_rows_json(try_run(...))`.

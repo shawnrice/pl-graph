@@ -2,18 +2,17 @@
 name = "lenke-engine"
 version = "0.0.0"
 edition = "2021"
-description = "The from-scratch query engine: one neutral algebra, one columnar batch model. Independent of lenke-core; see docs/design/engine-from-scratch.md."
+description = "The from-scratch query engine: one neutral algebra, one columnar batch model. See docs/design/engine-from-scratch.md."
 license = "Apache-2.0"
 
-# Standalone crate on purpose — NOT part of any workspace with lenke-core, so the
-# existing engine's build/tooling is untouched. Build/test with:
+# Standalone crate on purpose — not yet part of a cargo workspace. Build/test with:
 #   cargo test --manifest-path crates/lenke-engine/Cargo.toml
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 
 [lib]
-# "lib" for the engine-compare harness (core dev-depends on it); "cdylib" so the
-# engine emits its own liblenke_engine.so / lenke_engine.wasm for the C ABI (src/ffi.rs).
+# "lib" so dependents link it as a Rust lib (packages/node's N-API addon, the tests);
+# "cdylib" so the engine emits its own liblenke_engine.so / lenke_engine.wasm for the C ABI (src/ffi.rs).
 crate-type = ["lib", "cdylib"]
 
 [features]
@@ -22,11 +21,10 @@ crate-type = ["lib", "cdylib"]
 # native, not in the optional crate — so load/query/snapshot still work).
 default = ["codecs"]
 
-# `capi`: expose the C ABI (`src/ffi.rs` — the `lnk_*` exports). OFF by default so
-# that when lenke-core links this crate as a lib for its `engine-compare` harness,
-# the engine's `#[no_mangle]` symbols (lnk_abi_version, lnk_alloc, lnk_last_error_json,
-# …) do NOT collide with core's identically-named exports. Build the standalone
-# backend cdylib/wasm WITH this feature:
+# `capi`: expose the C ABI (`src/ffi.rs` — the `lnk_*` exports). OFF by default so the
+# plain lib/test build does not export the engine's `#[no_mangle]` FFI symbols
+# (lnk_abi_version, lnk_alloc, lnk_query, …). Build the standalone backend cdylib/wasm
+# WITH this feature:
 #   cargo build -p lenke-engine --release --features capi
 capi = []
 
@@ -43,16 +41,16 @@ codecs = ["dep:lenke-codec"]
 lenke-engine-core = { path = "../lenke-engine-core" }
 
 # The shared serialization codecs (pg-json/pg-text/graphson/csv) over a neutral
-# graph model — the SAME crate lenke-core uses, so both engines emit byte-identical
-# format output from identical data. Zero-dep and wasm-clean; the engine supplies
+# graph model — so the native and wasm builds emit byte-identical format output from
+# identical data. Zero-dep and wasm-clean; the engine supplies
 # only the Store<->GraphData bridge (see `src/codec.rs`). Optional so a minimal
 # build can drop the whole dependency — see the `codecs` feature.
 lenke-codec = { path = "../lenke-codec", optional = true }
 
 # The Gremlin `regex()` / `TextP.regex()` predicate. The ONE runtime dependency:
-# byte-identity with core's regex predicate requires the SAME engine, so the crate
-# and its feature set mirror lenke-core exactly (linear-time, no backreferences/
-# lookaround; a trimmed unicode set — `unicode-perl` + `unicode-case`). Everything
+# byte-identity across the native/wasm/TS targets requires the SAME regex engine and
+# feature set (linear-time, no backreferences/lookaround; a trimmed unicode set —
+# `unicode-perl` + `unicode-case`). Everything
 # else in this crate stays std-only.
 regex = { version = "1", default-features = false, features = [
   "std",

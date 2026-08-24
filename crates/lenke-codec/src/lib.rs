@@ -1,6 +1,6 @@
 //! Shared graph serialization codecs (pg-json, pg-text, graphson, csv) over a
-//! NEUTRAL graph model ([`GraphData`] / [`Value`]). Both `lenke-core` and
-//! `lenke-engine` convert their own graph to/from the neutral model and call
+//! NEUTRAL graph model ([`GraphData`] / [`Value`]). `lenke-engine` converts its
+//! graph to/from the neutral model and calls
 //! [`serialize`] / [`deserialize`] here, so the byte-for-byte format logic lives
 //! in exactly one place.
 //!

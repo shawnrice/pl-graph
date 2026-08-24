@@ -4,8 +4,8 @@
 //! compile into one neutral algebra ([`ir`]); one columnar batch model
 //! ([`batch`]) executes it ([`exec`]) over a typed columnar store ([`store`]);
 //! and one value contract ([`value`]) owns representation and semantics for every
-//! layer. Independent of `lenke-core` — this is the new engine, grown against the
-//! existing one and its conformance suite as an oracle, not built on it.
+//! layer. This is the from-scratch engine, grown against a conformance suite as an
+//! oracle (the TS engine, `@lenke/core`), not built on the former `lenke-core` crate.
 //!
 //! Status: the design's build order is complete for its subset.
 //! - [`value`] — the value contract: representation + semantics (order, equality,
@@ -39,8 +39,8 @@ pub mod bind;
 pub mod codec;
 pub mod cost;
 pub mod exec;
-// The C ABI (`lnk_*` exports). Gated behind `capi` so the engine's `#[no_mangle]`
-// symbols never collide with core's when core links this crate for engine-compare.
+// The C ABI (`lnk_*` exports). Gated behind `capi` so the plain lib/test build does
+// not export the engine's `#[no_mangle]` FFI symbols.
 #[cfg(feature = "capi")]
 pub mod ffi;
 #[cfg(feature = "capi")]

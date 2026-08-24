@@ -1,6 +1,6 @@
-//! The neutral graph + value model the codecs operate on. Both `lenke-core`
-//! (`Graph`) and `lenke-engine` (`Store`) convert to/from these types, so the
-//! codec logic never touches either engine's storage or `Value`.
+//! The neutral graph + value model the codecs operate on. `lenke-engine` (`Store`)
+//! converts to/from these types, so the codec logic never touches the engine's
+//! storage or `Value`.
 
 /// A neutral property value — the same variant set both engines' `Value` types
 /// carry. A temporal is kept as its `(tag, iso)` strings (e.g. `("date",

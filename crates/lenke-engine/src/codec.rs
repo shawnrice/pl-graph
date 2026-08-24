@@ -3,8 +3,8 @@
 //! The pg-json / pg-text / graphson / csv format logic lives ONCE, in
 //! `lenke_codec`, over a neutral graph model ([`GraphData`]/[`lenke_codec::Value`]).
 //! This module only projects a `Store` into that model ([`to_graph_data`]) and
-//! rebuilds a `Store` from it ([`from_graph_data`]) — so the engine and
-//! `lenke-core` emit byte-identical bytes from identical data. NDJSON keeps its
+//! rebuilds a `Store` from it ([`from_graph_data`]) — so the native and wasm builds
+//! (and the TS engine) emit byte-identical bytes from identical data. NDJSON keeps its
 //! own native module ([`crate::ndjson`]); binary is the engine's own format.
 
 use std::sync::Arc;
@@ -28,8 +28,8 @@ enum TemporalOnErr {
     TagToken,
 }
 
-/// The per-codec policy: endpoint strictness + temporal-parse fallback. Mirrors
-/// `lenke-core`'s bridge so both engines interpret the same bytes identically.
+/// The per-codec policy: endpoint strictness + temporal-parse fallback. Shared with
+/// the TS engine's bridge so every target interprets the same bytes identically.
 fn policy(format: &str) -> (bool, TemporalOnErr) {
     match format {
         "csv" => (true, TemporalOnErr::StringIso),

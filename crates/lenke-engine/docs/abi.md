@@ -21,9 +21,8 @@ Two guiding principles, both from how core's surface sprawled:
 out`. Adding a feature fills in a match arm, not a new export — so the ABI is
    the same 16 symbols whether the engine ships 5 exotic features or 50.
 
-The handle is the engine's `Store` (core's is `Graph`). The existing
-`ffi_engine.rs` compare shim (`lnk_e_*` over `*mut Store`) already proves the
-core of the pattern; this completes it and drops the prefix.
+The handle is the engine's `Store`. The flat `lnk_*` surface described here is what
+the engine ships (`src/ffi.rs`).
 
 ## The surface at a glance: 44 → 16 (flat)
 
@@ -69,8 +68,8 @@ lnk_tx     action:  0 = begin    1 = commit  2 = rollback
 lnk_encode format:  0 = NDJSON   1 = binary snapshot   2 = pg-json  3 = pg-text  4 = graphson  5 = csv
 
 Formats 2..5 (pg-json/pg-text/graphson/csv) route through the shared `lenke-codec`
-crate via the `src/codec.rs` Store<->GraphData bridge — the SAME format logic
-lenke-core uses, so both engines emit byte-identical bytes from identical data.
+crate via the `src/codec.rs` Store<->GraphData bridge — so the native and wasm builds
+emit byte-identical bytes from identical data.
 ```
 
 An unknown enum value is a `-1` / null error, never undefined behaviour — a host
@@ -201,20 +200,16 @@ transport reshape — byte-identity and the conformance suites are unaffected.
 
 - `Cargo.toml`: `crate-type = ["lib", "cdylib"]`, so the engine emits its own
   `liblenke_engine.so` / `lenke_engine.wasm`.
-- **The C ABI is behind a `capi` feature (off by default).** core links this
-  crate as a _lib_ for `engine-compare`, and the engine's `#[no_mangle]` symbols
-  (`lnk_abi_version`, `lnk_alloc`, `lnk_last_error_json`, …) are byte-identical
-  names to core's own exports — linking both into core's cdylib is a duplicate-
-  symbol error. Gating `ffi`/`ffi_error` on `capi` keeps them out of the
-  compare-lib build; the standalone backend builds with
+- **The C ABI is behind a `capi` feature (off by default).** Gating
+  `ffi`/`ffi_error` on `capi` keeps the engine's `#[no_mangle]` symbols
+  (`lnk_abi_version`, `lnk_alloc`, `lnk_query`, …) out of the plain lib/test build;
+  the standalone backend builds with
   `cargo build -p lenke-engine --release --features capi`.
-- Symbols export as plain `lnk_*` (not the `lnk_e_*` compare prefix): the engine
-  is its own cdylib, so the names don't collide with core the way they do inside
-  the shared engine-compare build.
-- `lnk_abi_version()` returns the ABI the host asserts; the host loads core's or
-  the engine's artifact by these names.
+- Symbols export as plain `lnk_*`.
+- `lnk_abi_version()` returns the ABI the host asserts; the host loads the engine's
+  artifact by these names.
 - Arrow buffers must use the _same_ allocator as every other returned buffer, so
-  one `lnk_free` releases them all (core needed a separate `free_arrow`).
+  one `lnk_free` releases them all.
 
 ## wasm build
 
@@ -324,8 +319,7 @@ the schema dump. Covered by store + exec + schema_op unit tests.
 
 ### Testing note
 
-The `capi` feature exports the engine's `lnk_*` symbols, which collide with
-`lenke-core`'s identical exports. The engine's _integration_ tests dev-depend on
-core, so **do not** combine `--features capi` with them. Run `cargo test -p
-lenke-engine` (no capi) for the cross-engine conformance/corpus suites, and
-`cargo test -p lenke-engine --lib --features capi` for the ffi/schema unit tests.
+The `capi` feature exports the engine's `lnk_*` `#[no_mangle]` symbols; the plain
+build leaves them off. Run `cargo test -p lenke-engine` (no capi) for the
+conformance/corpus suites, and `cargo test -p lenke-engine --lib --features capi`
+for the ffi/schema unit tests.
