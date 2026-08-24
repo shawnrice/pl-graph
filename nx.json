@@ -11,7 +11,9 @@
     "sharedGlobals": [],
     "rustEngine": [
       "{workspaceRoot}/crates/lenke-engine/src/**/*",
-      "{workspaceRoot}/crates/lenke-engine/Cargo.toml"
+      "{workspaceRoot}/crates/lenke-engine/Cargo.toml",
+      "{workspaceRoot}/crates/lenke-engine-core/src/**/*",
+      "{workspaceRoot}/crates/lenke-engine-core/Cargo.toml"
     ]
   },
   "targetDefaults": {

@@ -1,0 +1,32 @@
+{
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "name": "lenke-engine-core",
+  "projectType": "library",
+  "sourceRoot": "crates/lenke-engine-core/src",
+  "tags": ["rust"],
+  "targets": {
+    "test": {
+      "executor": "nx:run-commands",
+      "options": { "command": "cargo test", "cwd": "crates/lenke-engine-core" },
+      "inputs": ["rustEngine"],
+      "cache": true
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": { "command": "cargo clippy --all-targets -- -D warnings", "cwd": "crates/lenke-engine-core" },
+      "inputs": ["rustEngine"],
+      "cache": true
+    },
+    "fmt": {
+      "executor": "nx:run-commands",
+      "options": { "command": "cargo fmt", "cwd": "crates/lenke-engine-core" },
+      "cache": false
+    },
+    "fmt-check": {
+      "executor": "nx:run-commands",
+      "options": { "command": "cargo fmt --check", "cwd": "crates/lenke-engine-core" },
+      "inputs": ["rustEngine"],
+      "cache": true
+    }
+  }
+}

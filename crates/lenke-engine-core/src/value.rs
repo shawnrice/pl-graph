@@ -221,18 +221,6 @@ pub enum CastTarget {
     List,
 }
 
-impl From<crate::ir::CastTarget> for CastTarget {
-    fn from(t: crate::ir::CastTarget) -> Self {
-        match t {
-            crate::ir::CastTarget::Integer => Self::Integer,
-            crate::ir::CastTarget::Float => Self::Float,
-            crate::ir::CastTarget::String => Self::String,
-            crate::ir::CastTarget::Boolean => Self::Boolean,
-            crate::ir::CastTarget::List => Self::List,
-        }
-    }
-}
-
 /// Coerce `v` to `target`, the ONE home for the conversion table. Policy (fixed
 /// by the design decision): a failed conversion is `Err(E_INVALID_VALUE)` — the
 /// caller turns that into a thrown error — while a NULL input is NULL for every
@@ -288,11 +276,11 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
             match v {
                 Value::Str(s) => return Ok(Value::Str(s.clone())),
                 // Numbers render exactly as they do on JSON egress — JS `Number.toString`
-                // (`crate::json::js_number`), NOT Rust's decimal-at-all-magnitudes `{}`; a
+                // (`crate::json_fmt::js_number`), NOT Rust's decimal-at-all-magnitudes `{}`; a
                 // non-finite number has no textual form here.
                 Value::Num(x) => {
                     if x.is_finite() {
-                        crate::json::js_number(*x)
+                        crate::json_fmt::js_number(*x)
                     } else {
                         return bad("non-finite number", "string");
                     }
@@ -303,7 +291,7 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
                 // A composite serializes rather than faulting: a list joins its elements
                 // with "," and a record/map renders as JSON — same as `to_string` and
                 // core's `js_str`.
-                Value::List(_) | Value::Record(_) | Value::Map(_) => crate::json::js_str(v),
+                Value::List(_) | Value::Record(_) | Value::Map(_) => crate::json_fmt::js_str(v),
                 Value::Node(_) => return bad("node", "string"),
                 Value::Edge(_) => return bad("edge", "string"),
                 Value::Null => unreachable!("null handled above"),

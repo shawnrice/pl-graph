@@ -1,0 +1,19 @@
+[package]
+name = "lenke-engine-core"
+version = "0.0.0"
+edition = "2021"
+description = "Foundational types for the lenke engine — the Value model, the columnar Batch/Col/Lineage, temporal types, and error codes. Depends on NOTHING above it (no ir/store/exec/frontends), so it compiles and caches independently of the query layers."
+license = "Apache-2.0"
+
+# A leaf crate, split out of lenke-engine so these foundational modules compile and
+# cache on their own — editing the executor no longer recompiles them. Path-depended
+# by lenke-engine (no workspace, same pattern as lenke-codec), so the engine's target/
+# dir and the TS build paths are unchanged.
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+# None — these types are std-only by design.

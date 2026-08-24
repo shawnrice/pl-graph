@@ -21,14 +21,14 @@
         "command": "cargo build --release --target wasm32-unknown-unknown --features capi",
         "cwd": "crates/lenke-engine"
       },
-      "inputs": ["default"],
+      "inputs": ["rustEngine"],
       "outputs": ["{projectRoot}/target/wasm32-unknown-unknown/release/lenke_engine.wasm"],
       "cache": true
     },
     "test": {
       "executor": "nx:run-commands",
       "options": { "command": "cargo test", "cwd": "crates/lenke-engine" },
-      "inputs": ["default"],
+      "inputs": ["rustEngine"],
       "cache": true
     },
     "lint": {
@@ -37,7 +37,7 @@
         "command": "cargo clippy --all-targets -- -D warnings",
         "cwd": "crates/lenke-engine"
       },
-      "inputs": ["default"],
+      "inputs": ["rustEngine"],
       "cache": true
     },
     "fmt": {
@@ -48,7 +48,7 @@
     "fmt-check": {
       "executor": "nx:run-commands",
       "options": { "command": "cargo fmt --check", "cwd": "crates/lenke-engine" },
-      "inputs": ["default"],
+      "inputs": ["rustEngine"],
       "cache": true
     }
   }

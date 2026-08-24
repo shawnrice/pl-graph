@@ -37,6 +37,11 @@ codecs = ["dep:lenke-codec"]
 
 [dependencies]
 
+# Foundational types (Value, Batch/Col/Lineage, temporal, error codes) — split into
+# a leaf crate so they compile/cache independently of the query layers. A path dep
+# (no workspace), like lenke-codec below, so this crate's target/ dir is unchanged.
+lenke-engine-core = { path = "../lenke-engine-core" }
+
 # The shared serialization codecs (pg-json/pg-text/graphson/csv) over a neutral
 # graph model — the SAME crate lenke-core uses, so both engines emit byte-identical
 # format output from identical data. Zero-dep and wasm-clean; the engine supplies

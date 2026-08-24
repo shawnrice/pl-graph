@@ -20,7 +20,7 @@ import { ErrorCode } from './src/index.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const TS_SOURCE = join(here, 'src/index.ts');
-export const RUST_TARGET = join(here, '../../crates/lenke-engine/src/error_codes.rs');
+export const RUST_TARGET = join(here, '../../crates/lenke-engine-core/src/error_codes.rs');
 
 /** name → one-line JSDoc, scraped from the const-object members. Best-effort. */
 const docComments = (): Map<string, string> => {

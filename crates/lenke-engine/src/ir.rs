@@ -377,6 +377,20 @@ pub enum CastTarget {
     List,
 }
 
+impl CastTarget {
+    /// Convert the IR cast target to the value-layer `CastTarget` (kept here, not as
+    /// a `From` in the value crate, so the value layer needs no dependency on the IR).
+    pub(crate) fn to_value(self) -> crate::value::CastTarget {
+        match self {
+            Self::Integer => crate::value::CastTarget::Integer,
+            Self::Float => crate::value::CastTarget::Float,
+            Self::String => crate::value::CastTarget::String,
+            Self::Boolean => crate::value::CastTarget::Boolean,
+            Self::List => crate::value::CastTarget::List,
+        }
+    }
+}
+
 /// Which part of a path an accessor returns. `Length` is the hop count (= number
 /// of relationships); `Elements` interleaves nodes and relationships
 /// (`n0, e0, n1, …, nk`).

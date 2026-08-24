@@ -1281,7 +1281,7 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
             // failed conversion aborts the whole evaluation (E_INVALID_VALUE) —
             // the read pipeline is fallible precisely so this can throw.
             let col = eval(expr, store, batch)?;
-            let t = value::CastTarget::from(*target);
+            let t = (*target).to_value();
             let mut out = Vec::with_capacity(col.len());
             for i in 0..col.len() {
                 out.push(value::cast(&col.value_at(i), t)?);

@@ -26,9 +26,14 @@ name = "lenke-engine"
 version = "0.0.0"
 dependencies = [
  "lenke-codec",
+ "lenke-engine-core",
  "regex",
  "serde_json",
 ]
+
+[[package]]
+name = "lenke-engine-core"
+version = "0.0.0"
 
 [[package]]
 name = "memchr"

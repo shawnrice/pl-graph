@@ -31,7 +31,6 @@
 
 pub mod algo;
 pub mod arrow;
-pub mod batch;
 pub mod binary;
 pub mod bind;
 // The textual codecs (pg-json/pg-text/graphson/csv) over the shared crate — the
@@ -39,9 +38,6 @@ pub mod bind;
 #[cfg(feature = "codecs")]
 pub mod codec;
 pub mod cost;
-/// Canonical error codes shared with the TypeScript `@lenke/errors` package —
-/// `@generated` by `packages/errors/gen-rust.ts`, kept in sync by its drift test.
-pub mod error_codes;
 pub mod exec;
 // The C ABI (`lnk_*` exports). Gated behind `capi` so the engine's `#[no_mangle]`
 // symbols never collide with core's when core links this crate for engine-compare.
@@ -58,5 +54,9 @@ pub mod opt;
 pub mod prepared;
 pub mod schema_op;
 pub mod store;
-pub mod temporal;
-pub mod value;
+
+// Foundational types live in the `lenke-engine-core` leaf crate so they compile and
+// cache independently of the query layers. Re-exported here so `crate::{value, batch,
+// temporal, error_codes}` and `lenke_engine::{…}` paths are unchanged. `error_codes`
+// keeps its @generated sync-with-@lenke/errors contract (drift test targets core now).
+pub use lenke_engine_core::{batch, error_codes, temporal, value};
