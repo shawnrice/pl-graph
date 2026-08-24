@@ -1,4 +1,5 @@
 use super::evaluator::*;
+use super::order::FRONTIER_FOLD_MIN;
 use super::*;
 use crate::batch::{Batch, Col};
 use crate::ir::{Agg, AggFn};
