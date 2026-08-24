@@ -135,8 +135,13 @@ name = "lenke-engine"
 version = "0.0.0"
 dependencies = [
  "lenke-codec",
+ "lenke-engine-core",
  "regex",
 ]
+
+[[package]]
+name = "lenke-engine-core"
+version = "0.0.0"
 
 [[package]]
 name = "lenke-node"
