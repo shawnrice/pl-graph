@@ -31,7 +31,7 @@
       "inputs": ["default", "^production"],
       "cache": true,
       "dependsOn": ["build", "^build"],
-      "//": "A package's tests import its workspace dependencies through their built dist/ (@lenke/* are externalized, resolved at runtime), so those must exist before a test runs. `^build` alone is not enough: nx still interleaves the DAG and let a package's test run before a sibling dependency's dist/ finished being written (observed: list:build scheduled AFTER core:test, giving 'Cannot find module @lenke/list from packages/core/dist/esm/index.mjs'). Depending on this package's own `build` too forces it fully built — its dist/ and transitively its deps' — before any of its tests run. Same task hash producing pass-or-fail by dist freshness is exactly what nx flags as flaky. Projects also declaring lenke-engine:build/build-wasm cover the RUST artifacts (loaded by path, invisible to the graph); this covers the JS side."
+      "//": "A package's tests import its workspace dependencies through their built dist/ (@lenke/* are externalized and resolved at runtime), so those must exist before a test runs. `^build` alone is not enough — nx can interleave the DAG and start a package's tests before a sibling dependency's dist/ is fully written. Depending on this package's own `build` too forces it and, transitively, its deps fully built before any of its tests run. Projects that also declare lenke-engine:build/build-wasm cover the Rust artifacts (loaded by path, invisible to the nx graph); this covers the JS side."
     }
   },
   "defaultBase": "main",

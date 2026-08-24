@@ -5,7 +5,7 @@ edition = "2021"
 description = "The from-scratch query engine: one neutral algebra, one columnar batch model. See docs/design/engine-from-scratch.md."
 license = "Apache-2.0"
 
-# Standalone crate on purpose — not yet part of a cargo workspace. Build/test with:
+# Not part of a cargo workspace. Build and test directly:
 #   cargo test --manifest-path crates/lenke-engine/Cargo.toml
 [lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -35,23 +35,19 @@ codecs = ["dep:lenke-codec"]
 
 [dependencies]
 
-# Foundational types (Value, Batch/Col/Lineage, temporal, error codes) — split into
-# a leaf crate so they compile/cache independently of the query layers. A path dep
-# (no workspace), like lenke-codec below, so this crate's target/ dir is unchanged.
+# Foundational types (Value, Batch/Col/Lineage, temporal, error codes) in a leaf
+# crate, so they compile and cache independently of the query layers. Path dependency.
 lenke-engine-core = { path = "../lenke-engine-core" }
 
 # The shared serialization codecs (pg-json/pg-text/graphson/csv) over a neutral
-# graph model — so the native and wasm builds emit byte-identical format output from
-# identical data. Zero-dep and wasm-clean; the engine supplies
-# only the Store<->GraphData bridge (see `src/codec.rs`). Optional so a minimal
-# build can drop the whole dependency — see the `codecs` feature.
+# graph model. Zero-dep and wasm-clean; the engine supplies only the
+# Store<->GraphData bridge (`src/codec.rs`). Optional — gated on the `codecs` feature.
 lenke-codec = { path = "../lenke-codec", optional = true }
 
-# The Gremlin `regex()` / `TextP.regex()` predicate. The ONE runtime dependency:
-# byte-identity across the native/wasm/TS targets requires the SAME regex engine and
-# feature set (linear-time, no backreferences/lookaround; a trimmed unicode set —
-# `unicode-perl` + `unicode-case`). Everything
-# else in this crate stays std-only.
+# The Gremlin `regex()` / `TextP.regex()` predicate — the crate's only runtime
+# dependency. Byte-identity across the native/wasm/TS targets needs the same regex
+# engine and feature set: linear-time, no backreferences/lookaround, a trimmed
+# unicode set (`unicode-perl` + `unicode-case`). Everything else stays std-only.
 regex = { version = "1", default-features = false, features = [
   "std",
   "unicode-perl",
@@ -60,28 +56,20 @@ regex = { version = "1", default-features = false, features = [
 
 [dev-dependencies]
 # Test-only: the ported Gremlin suite (tests/gremlin_ported.rs) and the GQL
-# conformance corpus (tests/gql_corpus.rs) read fixtures/JSONL as serde_json.
-# A dev-dependency compiles only for the test build, so the runtime crate stays
-# dependency-free. (The former `lenke-core` dev-dep — the cross-engine oracle — is
-# gone: those suites now run engine-only, with the TS engine as the byte-identity
-# reference; see docs/design/engine-from-scratch.md.)
+# conformance corpus (tests/gql_corpus.rs) read fixtures/JSONL as serde_json. A
+# dev-dependency, so the runtime crate stays dependency-free.
 serde_json = "1"
 
-# Compile-speed tuning for the dev/test loop. `debug = 1` emits line-tables only
-# (file/line for backtraces + panics) instead of full DWARF — the test binaries
-# here are large, and full debuginfo dominates both codegen and link time, so this
-# is a sizeable `cargo test` speedup with no effect on correctness or on the
-# `--release` artifacts (the .so/.wasm) which keep their own profile. Move these to
-# the workspace root if/when this crate joins one.
+# `debug = 1` emits line-tables only (file/line for backtraces and panics) instead
+# of full DWARF, cutting codegen and link time for the large test binaries. The
+# `--release` artifacts (.so/.wasm) keep their own profile.
 [profile.dev]
 debug = 1
 
-# Tests run OPTIMIZED (opt-level 1). The heavy suites — the GQL corpus, the varlen/
-# algo tests — are compute-bound, and unoptimized they dominate `cargo test` wall
-# time (the corpus alone ran ~74s at opt-level 0, ~7s optimized). opt-level 1 is a
-# fraction of the compile cost of a full release build yet recovers most of that
-# runtime, and mold + `debug = 1` keep the (re)compile fast. `cargo build`/`check`
-# stay at opt-level 0 (profile.dev) so the plain build loop is untouched.
+# Tests run at opt-level 1: the compute-bound suites (GQL corpus, varlen/algo)
+# dominate `cargo test` wall time when unoptimized, and opt-level 1 recovers most of
+# that at a fraction of a release build's compile cost. `cargo build` and `check`
+# stay at opt-level 0 (profile.dev).
 [profile.test]
 opt-level = 1
 debug = 1
