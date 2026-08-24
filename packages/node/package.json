@@ -1,7 +1,7 @@
 {
   "name": "@lenke/node",
   "version": "0.1.0",
-  "description": "Fast native Node.js addon (N-API via napi-rs) for the lenke-core graph engine. The idiomatic Node path — no C-ABI marshalling, no dynamic library to locate.",
+  "description": "Fast native Node.js addon (N-API via napi-rs) for the lenke-engine graph engine. The idiomatic Node path — no C-ABI marshalling, no dynamic library to locate.",
   "license": "Apache-2.0",
   "files": [
     "index.js",

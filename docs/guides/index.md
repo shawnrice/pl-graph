@@ -10,7 +10,7 @@ Every deployment is a point in three **orthogonal** axes. Pick each independentl
 
 | Axis                             | Options                                            | How you choose                                                                                                                                                                                        |
 | -------------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Engine** — the graph substrate | pure-TS (`@lenke/core`) · Rust core (`lenke-core`) | Two complete, interchangeable implementations. TS runs anywhere with zero native deps; Rust is faster and columnar.                                                                                   |
+| **Engine** — the graph substrate | pure-TS (`@lenke/core`) · Rust core (`lenke-engine`) | Two complete, interchangeable implementations. TS runs anywhere with zero native deps; Rust is faster and columnar.                                                                                   |
 | **Query frontend**               | GQL (`@lenke/gql`) · Gremlin (`@lenke/gremlin`)    | A shop standardizes on one. The graph is language-agnostic — you bolt on the frontend you use and leave the other out. On TS it's a package you install; on Rust it's a Cargo feature you compile in. |
 | **Reach-path** — Rust only       | bun:ffi · N-API · WebAssembly                      | Which runtime you're on: Bun, Node, or the browser. All three expose one identical JS surface.                                                                                                        |
 
@@ -23,7 +23,7 @@ Pick by what you're building:
 - **A graph you query in-process, anywhere** → [pure-ts](./pure-ts.md) — `@lenke/core` + a query frontend, no native artifacts.
 - **A server-side cache or view machine** (Node/Bun) → [backend-embedded](./backend-embedded.md) — the Rust engine embedded in a process, bulk-loaded and queried; covers multi-tenancy.
 - **The Rust engine on a server or CLI** → [native](./native.md) — N-API (`@lenke/node`, the fast Node path) and bun:ffi.
-- **The Rust engine in a browser** → [wasm](./wasm.md) — `@lenke/native/wasm`, async load, no native addon.
+- **The Rust engine in a browser** → [wasm](./wasm.md) — `@lenke/native/wasm-engine`, async load, no native addon.
 - **A React UI over a graph on the main thread** → [frontend-main-thread](./frontend-main-thread.md) — `@lenke/react`, either engine.
 - **A local-first UI with the graph in a worker** → [frontend-worker](./frontend-worker.md) — `@lenke/sync` as a worker-resident cache against your own API.
 

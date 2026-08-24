@@ -76,7 +76,7 @@ hasErrorCode(error: unknown, code: ErrorCode): boolean;
 | `E_UNKNOWN_FUNCTION`   | An unknown function/step/symbol referenced in a query.                                                                                                                                                                                                                                                                        |
 | `E_FFI`                | A failure crossing the native/wasm FFI boundary.                                                                                                                                                                                                                                                                              |
 
-The `ErrorCode` values are the source of truth for a generated Rust mirror in the core crate, so both languages share the same wire strings.
+The `ErrorCode` values are the source of truth for a generated Rust mirror in the `lenke-engine-core` crate, so both languages share the same wire strings.
 
 ## License
 

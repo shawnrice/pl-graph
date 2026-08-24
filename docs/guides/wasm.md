@@ -1,23 +1,23 @@
 # The Rust engine in WebAssembly
 
-**Engine:** Rust `lenke-core` · **Reach-path:** WebAssembly (`@lenke/native/wasm`) · **Runtime:** browser, and anything with a `WebAssembly` global (Node, Deno, Bun).
+**Engine:** Rust `lenke-engine` · **Reach-path:** WebAssembly (`@lenke/native/wasm-engine`) · **Runtime:** browser, and anything with a `WebAssembly` global (Node, Deno, Bun).
 
 Use this to run the columnar Rust engine in a browser with no native addon — or in any host where you'd rather ship a `.wasm` than a platform binary. Same `RustGraph` API as the [native](./native.md) reach-paths; the differences are an **async load**, no threads, and that you build and ship the `.wasm` yourself.
 
 ## Loading
 
-`createWasmBackend` is async and accepts `.wasm` bytes, a `Response`, or a compiled `Module`:
+`createWasmEngineBackend` is async and accepts `.wasm` bytes, a `Response`, or a compiled `Module`:
 
 ```ts
-import { createWasmBackend } from '@lenke/native/wasm';
+import { createWasmEngineBackend } from '@lenke/native/wasm-engine';
 import { graphFromNdjson } from '@lenke/native';
 
 // Browser — stream-compile from a fetch:
-const backend = await createWasmBackend(fetch(new URL('./lenke_core.wasm', import.meta.url)));
+const backend = await createWasmEngineBackend(fetch(new URL('./lenke_engine.wasm', import.meta.url)));
 
 // Node — from bytes:
 // import { readFile } from 'node:fs/promises';
-// const backend = await createWasmBackend(await readFile('lenke_core.wasm'));
+// const backend = await createWasmEngineBackend(await readFile('lenke_engine.wasm'));
 
 using g = graphFromNdjson(backend, ndjsonBytes);
 const rows = g.query`MATCH (p:Person) RETURN p.name AS name`;
@@ -35,19 +35,18 @@ One wasm-specific caveat if you drop below the facade: the module's `memory.buff
 
 ```bash
 # in packages/native
-bun run build:wasm      # gql, gremlin, ndjson, codecs, arrow — no threads
-bun run build:wasm:min  # gql only — the smallest bundle
+bun run build:wasm      # the full engine: GQL, Gremlin, NDJSON, binary, textual codecs, Arrow
 ```
 
-This is `cargo build --release --target wasm32-unknown-unknown --no-default-features --features …`. `--no-default-features` deliberately drops `rayon`: wasm has no threads, so NDJSON decode runs serially.
+This is `cargo build --release --target wasm32-unknown-unknown --features capi` (the `capi` feature exposes the C ABI the backend calls). wasm has no threads, so anything the native build parallelizes runs serially here.
 
-### Trim it to your query language
+### Trim the textual codecs
 
-The feature flags are how you shrink the bundle to what you actually use — this is the [query-frontend choice](./choosing-your-build.md#axis-2--the-query-frontend) expressed as a compile-time option. A Gremlin-only shop builds `--features gremlin,ndjson` and leaves GQL out; a GQL-only read cache uses `build:wasm:min`. You ship only the engine surface you query.
+The one size lever today is the `codecs` feature (on by default), which pulls in the pg-json / pg-text / graphson / csv serializers. Build with `--no-default-features --features capi` to drop them — a smaller module that still runs GQL, Gremlin, NDJSON, binary snapshots, and Arrow, just without the extra textual formats. Both query languages are always compiled in; there is no separate GQL-only or Gremlin-only build.
 
 ## Packaging (roadmap)
 
-Today, **you build the `.wasm` and hand its bytes/`Response` to `createWasmBackend` yourself** — `@lenke/native` does not yet bundle or publish a prebuilt artifact, and there's no packaging step that copies it into a `dist/`. A packaged distribution (so you can `import` the wasm without a manual build) is planned but **not yet built**. Until then, wire the build output into your app's bundler (the [`examples/service-map`](../../examples/service-map) worker imports it with a Vite `?url` import).
+Today, **you build the `.wasm` and hand its bytes/`Response` to `createWasmEngineBackend` yourself** — `@lenke/native` does not yet bundle or publish a prebuilt artifact, and there's no packaging step that copies it into a `dist/`. A packaged distribution (so you can `import` the wasm without a manual build) is planned but **not yet built**. Until then, wire the build output into your app's bundler (the [`examples/service-map`](../../examples/service-map) worker imports it with a Vite `?url` import).
 
 ## In a worker
 

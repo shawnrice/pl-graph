@@ -91,7 +91,7 @@ has no skipped tests.)
 
 ### Cross-engine parity (TS engine ⟷ Rust core)
 
-The Rust gremlin engine (`crates/lenke-core/src/gremlin`) mirrors the TS package
+The Rust gremlin engine (`crates/lenke-engine/src/gremlin`) mirrors the TS package
 step-for-step. Parity is verified by a differential runner
 (`packages/native/src/gremlin-conformance.test.ts`): a single TS `Plan` is run
 through the TS engine in-process and the Rust core over `bun:ffi`, and the

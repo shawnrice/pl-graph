@@ -74,10 +74,10 @@ The WebAssembly backend needs no native addon, so it runs the Rust engine from p
 
 ```ts
 import { readFile } from 'node:fs/promises';
-import { createWasmBackend } from '@lenke/native/wasm';
+import { createWasmEngineBackend } from '@lenke/native/wasm-engine';
 import { graphFromNdjson } from '@lenke/native';
 
-const backend = await createWasmBackend(await readFile('lenke_core.wasm'));
+const backend = await createWasmEngineBackend(await readFile('lenke_engine.wasm'));
 
 // The graph is heap-owned by the wasm module; `using` frees it at scope exit
 // (or call `g.free()` explicitly). Same rule on the ffi and N-API backends.
@@ -87,12 +87,12 @@ const rows = g.query`MATCH (p:Person) RETURN p.name AS name`;
 console.log(rows); // [{ name: 'marko' }, ...]
 ```
 
-Under Bun, swap `@lenke/native/wasm` for `@lenke/native/ffi` (`createFfiBackend(libPath)`) to load the native dynamic library directly — the rest of the API is identical.
+Under Bun, swap `@lenke/native/wasm-engine` for `@lenke/native/ffi-engine` (`createFfiEngineBackend(libPath)`) to load the native dynamic library directly — the rest of the API is identical.
 
 ## How it fits together
 
 - **Graph & queries (pure TS).** [`@lenke/core`](packages/core) is the in-memory graph; [`@lenke/gql`](packages/gql) and [`@lenke/gremlin`](packages/gremlin) query it; [`@lenke/serialization`](packages/serialization) reads and writes it.
-- **Native engine (Rust).** [`lenke-core`](crates/lenke-core) is a columnar reimplementation of the graph and both query engines; [`@lenke/native`](packages/native) binds it to JS via FFI or wasm. Same query languages, more throughput.
+- **Native engine (Rust).** [`lenke-engine`](crates/lenke-engine) is a columnar reimplementation of the graph and both query engines; [`@lenke/native`](packages/native) binds it to JS via FFI or wasm. Same query languages, more throughput.
 - **React.** [`@lenke/react`](packages/react) drives components from either the in-process graph or the native store, re-rendering only when a relevant mutation changes what a component reads.
 - **Live queries & sync.** [`@lenke/sync`](packages/sync) turns a store into a declarative live-query service over any port-shaped channel — a Worker in the browser or a WebSocket on a server — pushing an update only when a standing query's result actually changes.
 - **Building blocks.** Small standalone primitives the rest are built on.
@@ -112,7 +112,7 @@ Under Bun, swap `@lenke/native/wasm` for `@lenke/native/ffi` (`createFfiBackend(
 
 | Package                            | Description                                                                      |
 | ---------------------------------- | -------------------------------------------------------------------------------- |
-| [`lenke-core`](crates/lenke-core)  | Rust columnar graph + GQL/Gremlin engines + Apache Arrow output, behind a C ABI. |
+| [`lenke-engine`](crates/lenke-engine)  | Rust columnar graph + GQL/Gremlin engines + Apache Arrow output, behind a C ABI. |
 | [`@lenke/native`](packages/native) | JS/TS bindings to the Rust core via `bun:ffi` or WebAssembly.                    |
 
 **React & live queries**
@@ -150,7 +150,7 @@ The package READMEs are the API reference; the **[deployment guides](docs/guides
 
 ## Develop
 
-A Bun + nx monorepo (`packages/*`) plus a Rust crate (`crates/lenke-core`).
+A Bun + nx monorepo (`packages/*`) plus Rust crates under `crates/` (`lenke-engine`, the foundational-types crate `lenke-engine-core`, and the shared codecs crate `lenke-codec`).
 
 ```bash
 bun install
@@ -159,9 +159,9 @@ bun run check    # typecheck + lint + format check (the pre-commit gate)
 bun run build    # build all packages
 bun run test     # run all package tests
 
-# Rust core
-cargo test --manifest-path crates/lenke-core/Cargo.toml
-cargo build --release --manifest-path crates/lenke-core/Cargo.toml   # cdylib for bun:ffi
+# Rust engine
+cargo test --manifest-path crates/lenke-engine/Cargo.toml
+cargo build --release --features capi --manifest-path crates/lenke-engine/Cargo.toml   # cdylib for bun:ffi
 ```
 
 ## License

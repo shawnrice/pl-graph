@@ -1,6 +1,6 @@
 # The Rust engine on a server or CLI
 
-**Engine:** Rust `lenke-core` · **Reach-paths:** N-API (`@lenke/node`) and bun:ffi (`@lenke/native/ffi`) · **Runtime:** Node or Bun.
+**Engine:** Rust `lenke-engine` · **Reach-paths:** N-API (`@lenke/node`) and bun:ffi (`@lenke/native/ffi-engine`) · **Runtime:** Node or Bun.
 
 Use this when you want the columnar Rust engine in a server process or a command-line tool. Two reach-paths, by runtime: **N-API** on Node (the fast production path) and **bun:ffi** on Bun. Both present the identical `RustGraph` facade, so the only difference is how the engine loads. For the browser, see [wasm](./wasm.md); for embedding it as a cache/view machine, see [backend-embedded](./backend-embedded.md).
 
@@ -33,16 +33,16 @@ const buf = g.query('MATCH (p:Person) RETURN p.name', undefined);
 
 **Build:** `napi build --platform --release --esm` (the package's `build` script) emits `index.js` (ESM), `index.d.ts`, and the `.node` for each configured target triple.
 
-## bun:ffi — `@lenke/native/ffi` (the Bun path)
+## bun:ffi — `@lenke/native/ffi-engine` (the Bun path)
 
 Loads the Rust `cdylib` directly via `bun:ffi`. You supply the path to the built library — the package does **not** auto-locate it.
 
 ```ts
-import { createFfiBackend } from '@lenke/native/ffi';
+import { createFfiEngineBackend } from '@lenke/native/ffi-engine';
 import { graphFromNdjson } from '@lenke/native';
 
-const libPath = new URL('./liblenke_core.so', import.meta.url).pathname; // your build output
-const backend = createFfiBackend(libPath);
+const libPath = new URL('./liblenke_engine.so', import.meta.url).pathname; // your build output
+const backend = createFfiEngineBackend(libPath);
 
 using g = graphFromNdjson(backend, ndjsonBytes); // freed at scope exit
 const rows = g.query`MATCH (p:Person) RETURN p.name AS name`;
@@ -50,7 +50,7 @@ const rows = g.query`MATCH (p:Person) RETURN p.name AS name`;
 
 **Memory:** the ffi graph is heap-owned — release it with `using` or `g.free()`. A `FinalizationRegistry` backstop catches a forgotten free, but don't rely on it. See the [memory model](./choosing-your-build.md#memory-model).
 
-**Build:** `bun run build:rust` — `cargo build --release` producing `liblenke_core.{so,dylib,dll}` under the crate's `target/release/`.
+**Build:** `bun run build:rust` — `cargo build --release --features capi` (the `capi` feature exposes the C ABI) producing `liblenke_engine.{so,dylib,dll}` under the crate's `target/release/`.
 
 ## The shared graph API
 

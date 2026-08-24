@@ -35,7 +35,7 @@ React tab  ──►  sync client  ──►  SharedWorker (wasm store + sync en
 bun install
 
 # once: build the two engine artifacts the demo loads
-bun run --cwd ../../packages/native build:wasm     # → lenke_core.wasm  (browser)
+bun run --cwd ../../packages/native build:wasm     # → lenke_engine.wasm  (browser)
 bunx nx build @lenke/node                          # → native addon     (server)
 
 bun run dev       # runs BOTH the ws server and vite; open the printed URL

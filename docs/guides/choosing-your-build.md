@@ -6,7 +6,7 @@ Three independent choices — **engine**, **query frontend**, **reach-path** —
 
 The graph substrate comes in two complete, interchangeable implementations. You pick one; you don't stack them (there's no "Rust storage behind a TS frontend" hybrid — that's nonsense, and lenke doesn't do it).
 
-|                 | pure-TS — `@lenke/core`                                                                                                          | Rust core — `lenke-core`                                                                      |
+|                 | pure-TS — `@lenke/core`                                                                                                          | Rust core — `lenke-engine`                                                                      |
 | --------------- | -------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | **What it is**  | A mutable in-memory labeled-property graph, driven by method calls (`addVertex`, `getVerticesByLabel`, opt-in property indexes). | A columnar graph you drive with a query language (GQL DML for writes, GQL/Gremlin for reads). |
 | **Runs on**     | Anything that runs JS — browser, Node, Deno, Bun. No native artifact.                                                            | Reached from JS via one of three reach-paths (below).                                         |
@@ -34,9 +34,9 @@ The Rust core is one crate reachable three ways. All three present the **same JS
 
 |              | bun:ffi                                                                          | N-API                                                                                            | WebAssembly                                                                                           |
 | ------------ | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| **Package**  | `@lenke/native/ffi`                                                              | [`@lenke/node`](../../packages/node)                                                             | `@lenke/native/wasm`                                                                                  |
-| **Load**     | `createFfiBackend(libPath)` — synchronous `dlopen`; you supply the library path. | `createNodeBackend()` (facade) or raw `Graph` — synchronous `require` of a per-platform `.node`. | `await createWasmBackend(source)` — **async**; `source` is `.wasm` bytes / a `Response` / a `Module`. |
-| **Artifact** | `liblenke_core.{so,dylib,dll}`                                                   | `lenke-node.<triple>.node`                                                                       | `lenke_core.wasm`                                                                                     |
+| **Package**  | `@lenke/native/ffi-engine`                                                              | [`@lenke/node`](../../packages/node)                                                             | `@lenke/native/wasm-engine`                                                                                  |
+| **Load**     | `createFfiEngineBackend(libPath)` — synchronous `dlopen`; you supply the library path. | `createNodeBackend()` (facade) or raw `Graph` — synchronous `require` of a per-platform `.node`. | `await createWasmEngineBackend(source)` — **async**; `source` is `.wasm` bytes / a `Response` / a `Module`. |
+| **Artifact** | `liblenke_engine.{so,dylib,dll}`                                                   | `lenke-node.<triple>.node`                                                                       | `lenke_engine.wasm`                                                                                     |
 | **Build**    | `bun run build:rust` (in `@lenke/native`)                                        | `napi build --platform --release --esm` (in `@lenke/node`)                                       | `bun run build:wasm` (in `@lenke/native`)                                                             |
 | **Runtime**  | Bun only (`bun:ffi`)                                                             | Node (the fast production path)                                                                  | Browser — and anything with a `WebAssembly` global (Node, Deno, Bun)                                  |
 | **Threads**  | rayon (parallel NDJSON decode)                                                   | rayon                                                                                            | none — wasm has no threads, so the parallel decoder falls back to serial                              |
@@ -53,7 +53,7 @@ The **transcendental** functions are the exception — `exp`, `ln`, `log`, `log1
 | ------------------------ | --------------------------------------------------------------------------------------------------- |
 | pure-TS — `@lenke/core`  | the JS runtime's `Math.*` (so it can also vary between V8, JSC and SpiderMonkey)                    |
 | native — bun:ffi / N-API | the **host operating system's** math library — glibc on Linux, Apple's on macOS, the CRT on Windows |
-| wasm                     | compiled into the module by Rust; `lenke_core.wasm` imports nothing from the host                   |
+| wasm                     | compiled into the module by Rust; `lenke_engine.wasm` imports nothing from the host                   |
 
 Two consequences worth planning around:
 

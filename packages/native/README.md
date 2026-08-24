@@ -1,6 +1,6 @@
 # @lenke/native
 
-> JavaScript/TypeScript bindings to the Rust `lenke-core` columnar graph engine, with a single facade over native (FFI) and WebAssembly backends.
+> JavaScript/TypeScript bindings to the Rust `lenke-engine` columnar graph engine, with a single facade over native (FFI) and WebAssembly backends.
 
 Loads a labeled-property graph into the native columnar core and runs GQL or Gremlin queries against it from JS/TS. One C ABI is exposed through interchangeable backends behind a shared `Backend` contract: a native dynamic library loaded over `bun:ffi` (server/CLI, requires Bun), a WebAssembly module instantiated from bytes or a `fetch` response (browser), and — for plain Node — the prebuilt N-API addon in the sibling `@lenke/node` package (`createNodeBackend()`). Reach for this when you want the Rust engine's query performance from JS without reimplementing it. The backend modules are split behind subpath exports so importing the package in a browser never pulls in the Bun-only `bun:ffi` builtin.
 
@@ -13,12 +13,12 @@ bun add @lenke/native
 ## Usage
 
 ```ts
-import { createFfiBackend } from '@lenke/native/ffi';
+import { createFfiEngineBackend } from '@lenke/native/ffi-engine';
 import { graphFromNdjson } from '@lenke/native';
 
-// Load the native library built from `crates/lenke-core`
-// (liblenke_core.{dylib,so,dll}).
-const backend = createFfiBackend('/path/to/liblenke_core.dylib');
+// Load the native library built from `crates/lenke-engine`
+// (liblenke_engine.{dylib,so,dll}).
+const backend = createFfiEngineBackend('/path/to/liblenke_engine.dylib');
 
 // Decode an NDJSON document into a graph.
 const g = graphFromNdjson(backend, await Bun.file('graph.ndjson').bytes());
@@ -41,10 +41,10 @@ g.free();
 In the browser, swap the backend for the wasm one; the rest of the API is identical:
 
 ```ts
-import { createWasmBackend } from '@lenke/native/wasm';
+import { createWasmEngineBackend } from '@lenke/native/wasm-engine';
 import { graphFromNdjson } from '@lenke/native';
 
-const backend = await createWasmBackend(fetch('/lenke_core.wasm'));
+const backend = await createWasmEngineBackend(fetch('/lenke_engine.wasm'));
 const g = graphFromNdjson(backend, ndjsonBytes);
 ```
 
@@ -67,8 +67,8 @@ language itself, worked recipes, and the graph-algorithm / graph-ML surface, see
 
 The entry point (`@lenke/native`) is environment-neutral: it exports the `RustGraph` facade, the graph constructors, and the reactive store. The backend itself comes from a subpath:
 
-- `@lenke/native/ffi` — `createFfiBackend(libPath: string): Backend`. Requires **Bun** (uses `bun:ffi`). Pass the absolute path to the built `liblenke_core.{dylib,so,dll}`.
-- `@lenke/native/wasm` — `createWasmBackend(source): Promise<Backend>`. `source` is a `WebAssembly.Module`, `ArrayBuffer`, `ArrayBufferView`, or a (promise of a) `fetch` `Response`.
+- `@lenke/native/ffi-engine` — `createFfiEngineBackend(libPath: string): Backend`. Requires **Bun** (uses `bun:ffi`). Pass the absolute path to the built `liblenke_engine.{dylib,so,dll}`.
+- `@lenke/native/wasm-engine` — `createWasmEngineBackend(source): Promise<Backend>`. `source` is a `WebAssembly.Module`, `ArrayBuffer`, `ArrayBufferView`, or a (promise of a) `fetch` `Response`.
 - **Node** — use the sibling `@lenke/node` package's `createNodeBackend()`, a prebuilt N-API addon. It's the intended production backend under plain Node (no Bun, no wasm overhead) and plugs into this same `Backend` contract.
 
 All assert that the loaded artifact's ABI version matches the exported `ABI_VERSION`, throwing on mismatch. `isBun` is exported as a convenience flag (`true` when running under Bun, where the FFI backend is available).

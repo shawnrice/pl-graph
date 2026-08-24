@@ -233,10 +233,10 @@ client.subscribeWrites((writes) => engine.ingest(writes), {
 
 ```ts
 import { createStore, graphFromNdjson, type Store } from '@lenke/native';
-import { createFfiBackend } from '@lenke/native/ffi';
+import { createFfiEngineBackend } from '@lenke/native/ffi-engine';
 import { createSyncClient, createSyncHost, createWriteLog, type SyncClient } from '@lenke/sync';
 
-const backend = createFfiBackend('/path/to/liblenke_core.so'); // your built cdylib
+const backend = createFfiEngineBackend('/path/to/liblenke_engine.so'); // your built cdylib
 const emptyStore = (): Store =>
   createStore(graphFromNdjson(backend, new TextEncoder().encode('\n'))); // one newline = empty
 

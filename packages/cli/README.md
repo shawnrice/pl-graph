@@ -11,12 +11,13 @@ with no native addon.
 In this monorepo it's the `lenke` bin:
 
 ```sh
-bun run build                     # builds the package + the wasm engine it loads
+bun run build                     # builds the JS packages
+bun run build:wasm                # builds the wasm engine the CLI loads (separate step)
 ./packages/cli/bin/lenke.mjs      # or `lenke` once linked / installed
 ```
 
-The CLI needs the wasm engine (`lenke_core.wasm`). It looks at `$LENKE_WASM`,
-then the `--wasm <path>` flag, then the workspace build output — so after
+The CLI needs the wasm engine (`lenke_engine.wasm`). It looks at the `--wasm <path>`
+flag, then `$LENKE_WASM`, then the workspace build output — so after
 `bun run build:wasm` it just works in-repo.
 
 ## The REPL

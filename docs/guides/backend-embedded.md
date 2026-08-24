@@ -1,6 +1,6 @@
 # An embedded cache or view machine on the backend
 
-**Engine:** Rust `lenke-core` via [`@lenke/node`](./native.md) (or bun:ffi) · **Runtime:** Node or Bun server.
+**Engine:** Rust `lenke-engine` via [`@lenke/node`](./native.md) (or bun:ffi) · **Runtime:** Node or Bun server.
 
 Use this to hold a graph in a server process — a read cache, a materialized view, a projection of some source of truth that you query with GQL/Gremlin without standing up an external graph database. The [`examples/service-map`](../../examples/service-map) server is a worked instance (a fleet of services held in an N-API store, served over WebSocket). For how the engine loads per runtime, see [native](./native.md).
 

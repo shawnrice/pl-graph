@@ -1,6 +1,6 @@
 # @lenke/node
 
-> Fast native Node.js addon (N-API via [napi-rs](https://napi.rs)) for the `lenke-core` graph engine.
+> Fast native Node.js addon (N-API via [napi-rs](https://napi.rs)) for the `lenke-engine` graph engine.
 
 The idiomatic **Node** path to the engine. Where `@lenke/native/ffi` (Bun) and `@lenke/native/wasm` (browser) cross a hand-marshalled **C ABI**, this addon speaks **N-API directly**: JS strings and `Buffer`s arrive as real Rust values, results come back as `Buffer`s — no per-call pointer marshalling, and no dynamic library to locate at runtime (the engine is compiled straight in).
 
