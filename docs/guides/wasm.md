@@ -13,7 +13,9 @@ import { createWasmEngineBackend } from '@lenke/native/wasm-engine';
 import { graphFromNdjson } from '@lenke/native';
 
 // Browser — stream-compile from a fetch:
-const backend = await createWasmEngineBackend(fetch(new URL('./lenke_engine.wasm', import.meta.url)));
+const backend = await createWasmEngineBackend(
+  fetch(new URL('./lenke_engine.wasm', import.meta.url)),
+);
 
 // Node — from bytes:
 // import { readFile } from 'node:fs/promises';

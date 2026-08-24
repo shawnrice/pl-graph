@@ -110,10 +110,10 @@ Under Bun, swap `@lenke/native/wasm-engine` for `@lenke/native/ffi-engine` (`cre
 
 **Native engine (Rust)**
 
-| Package                            | Description                                                                      |
-| ---------------------------------- | -------------------------------------------------------------------------------- |
-| [`lenke-engine`](crates/lenke-engine)  | Rust columnar graph + GQL/Gremlin engines + Apache Arrow output, behind a C ABI. |
-| [`@lenke/native`](packages/native) | JS/TS bindings to the Rust core via `bun:ffi` or WebAssembly.                    |
+| Package                               | Description                                                                      |
+| ------------------------------------- | -------------------------------------------------------------------------------- |
+| [`lenke-engine`](crates/lenke-engine) | Rust columnar graph + GQL/Gremlin engines + Apache Arrow output, behind a C ABI. |
+| [`@lenke/native`](packages/native)    | JS/TS bindings to the Rust core via `bun:ffi` or WebAssembly.                    |
 
 **React & live queries**
 

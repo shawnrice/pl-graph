@@ -8,11 +8,11 @@ Because it composes rather than ships as one binary, "how do I use lenke?" has m
 
 Every deployment is a point in three **orthogonal** axes. Pick each independently.
 
-| Axis                             | Options                                            | How you choose                                                                                                                                                                                        |
-| -------------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Axis                             | Options                                              | How you choose                                                                                                                                                                                        |
+| -------------------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Engine** — the graph substrate | pure-TS (`@lenke/core`) · Rust core (`lenke-engine`) | Two complete, interchangeable implementations. TS runs anywhere with zero native deps; Rust is faster and columnar.                                                                                   |
-| **Query frontend**               | GQL (`@lenke/gql`) · Gremlin (`@lenke/gremlin`)    | A shop standardizes on one. The graph is language-agnostic — you bolt on the frontend you use and leave the other out. On TS it's a package you install; on Rust it's a Cargo feature you compile in. |
-| **Reach-path** — Rust only       | bun:ffi · N-API · WebAssembly                      | Which runtime you're on: Bun, Node, or the browser. All three expose one identical JS surface.                                                                                                        |
+| **Query frontend**               | GQL (`@lenke/gql`) · Gremlin (`@lenke/gremlin`)      | A shop standardizes on one. The graph is language-agnostic — you bolt on the frontend you use and leave the other out. On TS it's a package you install; on Rust it's a Cargo feature you compile in. |
+| **Reach-path** — Rust only       | bun:ffi · N-API · WebAssembly                        | Which runtime you're on: Bun, Node, or the browser. All three expose one identical JS surface.                                                                                                        |
 
 See **[choosing-your-build](./choosing-your-build.md)** for the full matrix, including build commands and the memory model.
 

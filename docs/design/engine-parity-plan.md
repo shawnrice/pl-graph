@@ -430,8 +430,8 @@ r.hi >= Y)` over a bind-edge `Expand` into it (recognizes both spellings
       `open || scopes∋S`. Optimization-not-boundary; the host owns the scope-key
       authority (the engine derives, never mints). Scopes cmp_total-sorted. 1 test
       (distinct rooms A/B, dedup, fail-open on an unscoped node).
-- [x] H3. Typed nodes — HOST-SIDE by design (not an engine capability). R-TYPED
-      is `defineNode` with a bring-your-own Standard Schema (Zod/Valibot/ArkType)
+- [x] H3. Typed nodes — HOST-SIDE by design (not an engine capability).
+      `defineNode` takes a bring-your-own Standard Schema (Zod/Valibot/ArkType)
       validating on the HOST before the write; a JS schema cannot be an engine
       validator, and rebuilding a schema DSL in Rust would duplicate the host's
       job. The ENGINE seam is already provided: H1 constraints (unique/required,

@@ -21,7 +21,9 @@ import { createStore, graphFromNdjson } from '@lenke/native';
 import { createWasmEngineBackend } from '@lenke/native/wasm-engine';
 import { createSyncEngine } from '@lenke/sync';
 
-const backend = await createWasmEngineBackend(fetch(new URL('./lenke_engine.wasm', import.meta.url)));
+const backend = await createWasmEngineBackend(
+  fetch(new URL('./lenke_engine.wasm', import.meta.url)),
+);
 const store = createStore(graphFromNdjson(backend, seedBytes));
 
 const engine = createSyncEngine({
