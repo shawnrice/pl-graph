@@ -1,3 +1,4 @@
+use super::varlen::{run_varlen, DistinctEndpointEmit};
 use super::*;
 use crate::batch::{Batch, Col};
 use crate::ir::Expr;
