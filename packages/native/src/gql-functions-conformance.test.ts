@@ -264,7 +264,7 @@ suite('GQL function differential (TS vs native)', () => {
   ];
 
   // A function either RETURNS a value (compare the rendered JSON byte-for-byte) or FAULTS
-  // (compare the error `code`). Many of this session's strict-typing cases fault in both
+  // (compare the error `code`). Many strict-typing cases fault in both
   // engines — `upper({map})`, `radians('1e3')`, `stddev(string)` — so the outcome must
   // capture the throw, not let it bubble and fail the test structurally.
   const evalOutcome = (run: () => unknown): { json: string } | { code: unknown } => {

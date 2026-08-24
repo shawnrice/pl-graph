@@ -3093,8 +3093,8 @@ fn regex_invalid_pattern_is_a_parse_error() {
 
 // ===== JSON output characterization =====
 //
-// These pin `results_to_json`'s exact bytes so the upcoming hand-rolled writer
-// (which drops `serde_json`) can be proven equivalent. `serde_json::Map` is a
+// These pin `results_to_json`'s exact bytes so any JSON writer can be proven
+// equivalent. `serde_json::Map` is a
 // `BTreeMap`, so object keys come out lexicographically sorted — the sync
 // live-query layer diffs cells by `JSON.stringify` byte-equality, so that
 // canonical order is load-bearing and the writer must preserve it.
@@ -7991,9 +7991,8 @@ fn repeat_emit_loops_predicate_offset() {
 
 /// `id()` / `label()` on a PATH is an error, and one raised from the PLAN.
 ///
-/// This reverses what this test used to assert. It required null, on the
-/// grounds that the TS engine returned null too — which it did, so the engines
-/// agreed with each other and with nothing else. TinkerPop types
+/// (Both engines once returned null here, agreeing only with each other.)
+/// TinkerPop types
 /// `IdStep<S extends Element>` and does `traverser.get().id()`, so on a path the
 /// erased generic gives a bare `ClassCastException` ("ImmutablePath cannot be
 /// cast to ...Element"). A path has no id and no label; answering null said it
@@ -8017,10 +8016,9 @@ fn id_of_a_path_faults_from_the_plan() {
 
 /// The fault reaches the caller through whatever follows it.
 ///
-/// This test previously asserted the OPPOSITE — that summing the ids of paths
-/// was an all-null fold and explicitly "not a fault" — which is the decision
-/// reversed above. A terminal downstream must not swallow it: the plan is
-/// unsatisfiable whatever `sum()` would have done with the nulls.
+/// A terminal downstream step must not swallow the plan fault: the plan is
+/// unsatisfiable whatever `sum()` would have done with the nulls a path's
+/// missing id produces.
 #[test]
 fn a_plan_fault_survives_the_steps_after_it() {
     let mut graph = modern();

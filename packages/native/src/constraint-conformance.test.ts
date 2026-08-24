@@ -106,7 +106,7 @@ suite('unique-constraint differential (TS vs native)', () => {
     expect(native).toEqual(ts);
   });
 
-  // Round 15: dropping the index that backs a unique constraint would downgrade
+  // Dropping the index that backs a unique constraint would downgrade
   // enforcement to a scan (native) or silently lose it (TS). Both engines now
   // refuse it identically; a plain index still drops, and enforcement survives.
   test('dropping a unique-constraint-backing index is refused, identically', () => {
@@ -830,7 +830,7 @@ suite('graph-level invariant differential (TS vs native)', () => {
   });
 });
 
-// Round 15: a temporal value ANYWHERE in a numeric aggregate makes it
+// A temporal value ANYWHERE in a numeric aggregate makes it
 // unrepresentable — a heterogeneous numeric+temporal column must throw, not
 // silently coerce the temporal to null (native faulted per-value; TS only checked
 // the first row). Both engines now throw E_INVALID_VALUE identically.
@@ -855,7 +855,7 @@ suite('temporal-in-aggregate differential (TS vs native)', () => {
   }
 });
 
-// Round 15: aggregates over LIST-valued columns. Prior art (SQL/Postgres/DuckDB/
+// Aggregates over LIST-valued columns. Prior art (SQL/Postgres/DuckDB/
 // Cypher/ISO): sum/avg over an array is a type error; min/max order arrays
 // element-wise. lenke's GQL now matches — sum/avg throw, min/max use the total
 // order recursively (both engines). (Gremlin keeps its own TinkerPop semantics —

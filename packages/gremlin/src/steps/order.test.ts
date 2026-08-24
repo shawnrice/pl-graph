@@ -22,7 +22,7 @@ const arr = (r: Iterable<unknown>): unknown[] => [...r];
 describe('Gremlin tests', () => {
   const tinkerGraph = createTestTinkerGraph();
 
-  // Round-11 BUG A: order().by('<key>') over project() Map rows sorts by the keyed
+  // Regression guard: order().by('<key>') over project() Map rows sorts by the keyed
   // value instead of throwing "cannot order an element with an element".
   test('order().by(key) sorts project() rows by the keyed value', () => {
     const rows = arr(

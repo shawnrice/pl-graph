@@ -1,8 +1,8 @@
 import { defineConfig } from 'vite';
 
 export default defineConfig({
-  // No react plugin on purpose (esbuild handles automatic JSX; we trade fast
-  // refresh for zero extra dependencies in an example).
+  // No react plugin: esbuild handles automatic JSX, trading fast refresh for zero
+  // extra dependencies in an example.
   esbuild: { jsx: 'automatic' },
   server: {
     fs: {

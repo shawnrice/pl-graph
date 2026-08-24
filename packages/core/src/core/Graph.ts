@@ -170,7 +170,7 @@ export type GraphOptions = {
 };
 
 /**
- * The scalar type a TYPE constraint (R-CONSTRAINTS) can require of a property
+ * The scalar type a TYPE constraint can require of a property
  * value — every stored non-null value maps to exactly one of these. `list` means
  * "an array" (element types are not constrained); the three temporals match the
  * `LocalDate`/`LocalDateTime`/`Duration` value classes.
@@ -464,7 +464,7 @@ export const valueMatches = (
 };
 
 /**
- * A declared CARDINALITY constraint (R-CONSTRAINTS): every vertex carrying
+ * A declared CARDINALITY constraint: every vertex carrying
  * `label` must have `min <= degree <= max` over `edgeType` in `direction`
  * (`out` = the vertex is the edge source, `in` = the target). `max: null` is
  * unbounded. Returned by {@link Graph.cardinalityConstraints} for introspection.
@@ -478,7 +478,7 @@ export type CardinalityConstraint = {
 };
 
 /**
- * A declared VALIDATOR (custom constraint, R-CONSTRAINTS): every element carrying
+ * A declared VALIDATOR (custom constraint): every element carrying
  * `label` — vertex label OR edge type, one namespace — must satisfy the GQL
  * boolean predicate `src`, with the element bound to variable `varName`.
  * SQL-`CHECK` semantics: the element is rejected only when the predicate is a
@@ -624,7 +624,7 @@ export class Graph {
 
   emitter: Emitter<keyof GraphEvents, GraphEvents>;
 
-  // R-TX transaction state. `txDepth > 0` means an open transaction: writes still
+  // Transaction state. `txDepth > 0` means an open transaction: writes still
   // apply eagerly to the live store (so reads inside see their own writes), but
   // each mutation records an inverse op in `txUndo`, emitted events buffer in
   // `txEvents` (dispatched together on commit, discarded on rollback), and the
@@ -646,7 +646,7 @@ export class Graph {
   private txEvents: Array<EmitterEvent<any, any>> = [];
   private txTouched = new Set<string>();
   // Edge analogue of `txTouched`: edge ids whose built-in edge constraints must be
-  // re-checked at commit (R-TX deferral for edge writes).
+  // re-checked at commit (deferred for edge writes).
   private txTouchedEdges = new Set<string>();
   private applyingUndo = false;
   // Access mode of the active explicit transaction opened by ISO GQL
@@ -1909,7 +1909,7 @@ export class Graph {
       .flatMap(([label, keys]) => [...keys].map((key): [string, string] => [label, key]))
       .sort((a, b) => (a[0] === b[0] ? a[1].localeCompare(b[1]) : a[0].localeCompare(b[0])));
 
-  // --- REQUIRED constraints (R-CONSTRAINTS) --------------------------------
+  // --- REQUIRED constraints --------------------------------
   // A required `(label, key)` means: every vertex carrying `label` must have a
   // present, non-null value under `key`. Enforced at the core mutation boundary
   // (addVertex + property removal/null-set + addLabel), so every write path —
@@ -2071,7 +2071,7 @@ export class Graph {
     }
   };
 
-  // --- TYPE constraints (R-CONSTRAINTS) ------------------------------------
+  // --- TYPE constraints ------------------------------------
   // A type `(label, key, type)` means: every present, non-null value under `key`
   // on a vertex carrying `label` must be of the given scalar type. Null/absent
   // are exempt (a null has no type — use a `required` constraint for presence).
@@ -2410,7 +2410,7 @@ export class Graph {
     return undefined;
   };
 
-  // --- EDGE constraints (R-CONSTRAINTS, edge types) ------------------------
+  // --- EDGE constraints (edge types) ------------------------
   // A direct mirror of the vertex unique/required/type constraints, keyed by edge
   // TYPE instead of node label, enforced against each edge's properties and the
   // edge property index. Byte-identical to the Rust core. Enforcement is at the
@@ -2913,7 +2913,7 @@ export class Graph {
     }
   };
 
-  // --- CARDINALITY constraints (R-CONSTRAINTS, degree bounds) --------------
+  // --- CARDINALITY constraints (degree bounds) --------------
   // A cardinality constraint bounds the DEGREE of each vertex carrying `label`
   // over `edgeType` in `direction` (out = the vertex is the edge source; in =
   // the target): for every such vertex V, `min <= degree(V) <= max`. "exactly
@@ -2921,7 +2921,7 @@ export class Graph {
   // max:null. A self-loop (V—[e]->V) counts once for out AND once for in (it
   // appears in both adjacency directions), matching the Rust core.
   //
-  // Enforcement splits by satisfiability at a single write (see docs/design/r-tx.md):
+  // Enforcement splits by satisfiability at a single write (see docs/design/transactions.md):
   //   - MAX is reachable by one write, so it's eager on a bare `addEdge` outside
   //     a transaction (the over-the-limit edge throws) and deferred to commit
   //     inside one.
@@ -2931,7 +2931,7 @@ export class Graph {
   //     so those are min's enforcement boundaries. A bare `addVertex(...)` outside
   //     any transaction has NO commit boundary, so it does not trip a min check —
   //     intended: min inherently needs a second write (the edge), which is why
-  //     R-TX was its prerequisite. Declaring the constraint scans existing data.
+  //     Transactions were its prerequisite. Declaring the constraint scans existing data.
 
   private readonly vertexCardinalityConstraints = new Map<string, CardinalityConstraint>();
 
@@ -3098,7 +3098,7 @@ export class Graph {
     this.txTouched.add(edge.to.id);
   };
 
-  // --- VALIDATORS (R-CONSTRAINTS, custom GQL-predicate constraints) ---------
+  // --- VALIDATORS (custom GQL-predicate constraints) ---------
   // A validator attaches a GQL boolean expression to a label (vertex label OR
   // edge type — one string namespace): every element carrying `label` must
   // satisfy the predicate, with the element bound to `varName`. SQL-`CHECK`
@@ -3291,7 +3291,7 @@ export class Graph {
     return this.emitter.emit(event as never) as T;
   };
 
-  /* Transactions (R-TX) */
+  /* Transactions */
 
   /**
    * Run `fn` as one atomic transaction. Every write inside applies to the live

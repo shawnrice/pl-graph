@@ -188,7 +188,7 @@ describe('hardening: deep nesting is a syntax error, not a stack overflow', () =
     expect(() => parse(`RETURN (((1 + 2)) * 3) AS r`)).not.toThrow();
   });
 
-  // Round-12 C1: the associative operator AST is n-ary (a flat array), so a long
+  // The associative operator AST is n-ary (a flat array), so a long
   // left-associative chain far past the old crash point evaluates without a stack
   // overflow (native SIGSEGV'd; TS threw an uncatchable RangeError) instead of
   // aborting — given a ceiling that admits it. Only the anti-resource-abuse

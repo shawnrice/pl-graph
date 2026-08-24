@@ -193,7 +193,7 @@ suite('createReconnectingClient', () => {
       clientId: 'me',
     });
 
-    // clientId is now exposed (it used to be Pick<>'d out of the reconnect surface).
+    // clientId is part of the reconnect client's public surface.
     expect(client.clientId).toBe('me');
 
     // A second, independent client on the same server — the "other player".

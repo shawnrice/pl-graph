@@ -35,8 +35,7 @@ const USER_ID = 'demo'; // a real app: the authenticated user, + a key for AES-G
 // boot
 // ---------------------------------------------------------------------------
 //
-// The server link used to be a ~40-line hand-rolled reconnecting client right
-// here (the tire-kick finding that motivated it). It now IS the library's
+// The server link is the library's
 // `createReconnectingClient`: loaders are its `query`, write-back its `mutate`,
 // both parking while offline and replaying on reconnect; `onConnectivity`
 // nudges every tab's status line. The whole transport is the `connect`

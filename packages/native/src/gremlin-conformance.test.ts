@@ -687,9 +687,9 @@ suite('gremlin conformance: TS engine ⟷ Rust core (over ffi)', () => {
 // CORPUS because it needs edges carrying temporal properties, and the shared
 // "modern" fixture deliberately has none.
 //
-// This is the query that motivated the whole thread: an as-of read needs
+// The canonical case for this shape: an as-of read needs
 // `vf <= t AND vt > t` on an EDGE, so it requires edge steps and temporal
-// literals together. Before, the emitter refused it ("unsupported: step outE"),
+// literals together. The emitter once refused it ("unsupported: step outE"),
 // and even hand-written the dialect could not express `date(...)`.
 suite('gremlin conformance: bitemporal as-of across the bridge', () => {
   const TEMPORAL_NDJSON = [
@@ -776,8 +776,8 @@ suite('gremlin conformance: bitemporal as-of across the bridge', () => {
 
 // property(key, <traversal>) — "traversal-induced values" (standard TinkerPop).
 // The child traversal is evaluated per element, rooted at the current traverser;
-// its first output is written. Both engines must agree. Motivated by GraphMind's
-// message-passing write path (`property('deg', __.outE().count())`).
+// its first output is written. Both engines must agree. A representative use is a
+// message-passing write path that stores a computed degree (`property('deg', __.outE().count())`).
 suite('gremlin conformance: property(key, traversal) — traversal-induced values', () => {
   const NDJSON = [
     { type: 'node', id: 'marko', labels: ['P'], properties: { id: 'marko' } },
