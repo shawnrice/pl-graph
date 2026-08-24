@@ -396,3 +396,230 @@ pub(super) fn execute_merge_edge(
     stmt_commit(store, scope);
     Ok(empty_rows())
 }
+
+/// Whether node `n`'s `id` PROPERTY is its identity — a string equal to its external
+/// id (as set by `INSERT (:P {id: 'x'})`). Such an id is fixed at creation, so a
+/// `SET n.id` is rejected; a numeric / absent / divergent `id` is an ordinary,
+/// SET-able property. Stateless, matching core's `vertex_id_is_identity`.
+fn node_id_is_identity(store: &Store, n: u32) -> bool {
+    if let Value::Str(s) = store.prop(n, "id") {
+        store
+            .node_ext_id(n)
+            .is_some_and(|ext| ext.as_ref() == s.as_ref())
+    } else {
+        false
+    }
+}
+
+/// The edge analogue of [`node_id_is_identity`] — matching core's `edge_id_is_identity`.
+fn edge_id_is_identity(store: &Store, e: u32) -> bool {
+    if let Value::Str(s) = store.edge_prop(e, "id") {
+        store
+            .edge_ext_id(e)
+            .is_some_and(|ext| ext.as_ref() == s.as_ref())
+    } else {
+        false
+    }
+}
+
+/// Create a node for an INSERT, honoring a string `id` property as the element's
+/// EXTERNAL identity (like core's `insert_vertex_with_id`): a string `id` becomes the
+/// node's external id — unique across the graph, a duplicate is a constraint violation
+/// — AND is still stored as an ordinary property (`RETURN n.id` works). A non-string
+/// or absent `id` mints a synthetic external id. (Numeric `id` stays a plain property.)
+fn insert_node_with_identity(
+    store: &mut Store,
+    labels: &[&str],
+    props: &[(&str, Value)],
+) -> Result<u32, String> {
+    if let Some((_, Value::Str(id))) = props.iter().find(|(k, _)| *k == "id") {
+        if store.node_by_ext(id).is_some() {
+            return Err(ID_DUP_ERR.into());
+        }
+        let ext: std::sync::Arc<str> = std::sync::Arc::from(id.as_ref());
+        return Ok(store.add_node_with_id(&ext, labels, props));
+    }
+    Ok(store.add_node(labels, props))
+}
+
+/// Create an edge for an INSERT, honoring a string `id` property as its external
+/// identity (like core's `insert_edge_with_id`): a string `id` becomes the edge's
+/// external id — unique among edges, a duplicate is a constraint violation — and is
+/// still stored as a property. A non-string / absent `id` mints a synthetic edge id.
+/// Sets the edge's properties in either case.
+fn insert_edge_with_identity(
+    store: &mut Store,
+    from: u32,
+    to: u32,
+    etype: &str,
+    props: &[(String, Value)],
+) -> Result<u32, String> {
+    let eid = if let Some((_, Value::Str(id))) = props.iter().find(|(k, _)| k == "id") {
+        if store.edge_by_ext(id).is_some() {
+            return Err(ID_DUP_ERR.into());
+        }
+        let ext: std::sync::Arc<str> = std::sync::Arc::from(id.as_ref());
+        store.add_edge_with_id(&ext, from, to, etype)
+    } else {
+        store.add_edge(from, to, etype)
+    };
+    for (k, v) in props {
+        store.set_edge_prop(eid, k, v.clone());
+    }
+    Ok(eid)
+}
+
+/// `Plan::Insert` and `Plan::InsertReturn`.
+pub(super) fn run_insert(
+    store: &mut Store,
+    nodes: &[crate::ir::InsertNode],
+    edges: &[crate::ir::InsertEdge],
+) -> Result<Vec<u32>, String> {
+    // In a transaction so a constraint violation (or a duplicate string `id`) rolls
+    // the whole INSERT back rather than leaving a partial write.
+    let scope = stmt_begin(store);
+    let result = (|| -> Result<Vec<u32>, String> {
+        let mut ids = Vec::with_capacity(nodes.len());
+        for spec in nodes {
+            let labels: Vec<&str> = spec.labels.iter().map(String::as_str).collect();
+            let props: Vec<(&str, Value)> = spec
+                .props
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.clone()))
+                .collect();
+            ids.push(insert_node_with_identity(store, &labels, &props)?);
+        }
+        for e in edges {
+            insert_edge_with_identity(store, ids[e.from], ids[e.to], &e.etype, &e.props)?;
+        }
+        // Enforce the declared constraints this INSERT could have violated (unique,
+        // required, type, cardinality, validators, invariants) — NOW if standalone,
+        // else DEFERRED to the enclosing transaction's COMMIT.
+        check_deferred_if_standalone(store, scope)?;
+        Ok(ids)
+    })();
+    match result {
+        Ok(ids) => {
+            stmt_commit(store, scope);
+            Ok(ids)
+        }
+        Err(e) => {
+            stmt_rollback(store, scope);
+            Err(e)
+        }
+    }
+}
+
+/// `Plan::InsertFrom` — a row-driven INSERT (`FOR … INSERT`, `MATCH … INSERT`).
+/// Evaluate the templates' property expressions over the input rows (read phase,
+/// immutable borrow), then create each row's nodes/edges (write phase). The whole
+/// statement is ONE atomic scope — a constraint violation on any row rolls back
+/// EVERY row (so `FOR x IN [1,2] INSERT (:U {id:'dup'})` under a unique constraint
+/// leaves zero rows), matching `run_insert`'s per-statement atomicity.
+pub(super) fn run_insert_from(
+    store: &mut Store,
+    input: &Plan,
+    nodes: &[crate::ir::InsertNodeExpr],
+    edges: &[crate::ir::InsertEdgeExpr],
+) -> Result<(), String> {
+    // Read phase: pull the rows and materialize every template property to an OWNED
+    // per-row value vector, so the immutable borrow ends before the write phase.
+    let (node_props, edge_props, bound_ids, nrows) = {
+        let batch = pull(input, store, needs_lineage(input))?;
+        let nrows = batch.rows();
+        let eval_props = |props: &[(String, Expr)]| -> Result<Vec<(String, Vec<Value>)>, String> {
+            props
+                .iter()
+                .map(|(k, e)| {
+                    let col = eval(e, store, &batch)?;
+                    Ok((k.clone(), (0..nrows).map(|i| col.value_at(i)).collect()))
+                })
+                .collect()
+        };
+        let node_props: Vec<_> = nodes
+            .iter()
+            .map(|n| eval_props(&n.props))
+            .collect::<Result<_, _>>()?;
+        let edge_props: Vec<_> = edges
+            .iter()
+            .map(|e| eval_props(&e.props))
+            .collect::<Result<_, _>>()?;
+        // A bound pattern node (`MATCH (a) INSERT (a)-[:E]->…`) resolves to the matched
+        // node ids at its slot — captured per row now, used instead of creating a node.
+        let bound_ids: Vec<Option<Vec<u32>>> = nodes
+            .iter()
+            .map(|n| {
+                n.bound
+                    .map(|slot| match batch.slot(slot) {
+                        Col::Nodes(ids) => Ok(ids.clone()),
+                        _ => {
+                            Err("INSERT references a bound variable that is not a node".to_string())
+                        }
+                    })
+                    .transpose()
+            })
+            .collect::<Result<_, _>>()?;
+        (node_props, edge_props, bound_ids, nrows)
+    };
+    // Write phase: create every row's nodes/edges under one per-statement scope. A
+    // string `id` property is the node's external identity (unique) — a duplicate
+    // (across rows or with an existing node) rolls back EVERY row.
+    let scope = stmt_begin(store);
+    let result = (|| -> Result<(), String> {
+        for i in 0..nrows {
+            let mut row_ids = Vec::with_capacity(nodes.len());
+            for (t, n) in nodes.iter().enumerate() {
+                // A bound reference reuses the matched node's id; otherwise create one.
+                if let Some(ids) = &bound_ids[t] {
+                    row_ids.push(ids[i]);
+                    continue;
+                }
+                let labels: Vec<&str> = n.labels.iter().map(String::as_str).collect();
+                let props: Vec<(&str, Value)> = node_props[t]
+                    .iter()
+                    .map(|(k, vals)| (k.as_str(), vals[i].clone()))
+                    .collect();
+                row_ids.push(insert_node_with_identity(store, &labels, &props)?);
+            }
+            for (t, e) in edges.iter().enumerate() {
+                let row_props: Vec<(String, Value)> = edge_props[t]
+                    .iter()
+                    .map(|(k, vals)| (k.clone(), vals[i].clone()))
+                    .collect();
+                insert_edge_with_identity(
+                    store,
+                    row_ids[e.from],
+                    row_ids[e.to],
+                    &e.etype,
+                    &row_props,
+                )?;
+            }
+        }
+        check_deferred_if_standalone(store, scope)
+    })();
+    if let Err(err) = result {
+        stmt_rollback(store, scope);
+        return Err(err);
+    }
+    stmt_commit(store, scope);
+    Ok(())
+}
+
+/// Whether `plan`'s root is a write (INSERT / SET / REMOVE / DELETE / _MERGE /
+/// addE). A write must run through [`execute`] (mutable store); a read goes through
+/// the immutable [`try_run`] path. The C ABI's `lnk_query` routes on this.
+// Only the `capi` ffi layer consults it; without that feature it is unused.
+#[cfg_attr(not(feature = "capi"), allow(dead_code))]
+pub(crate) fn is_write(plan: &Plan) -> bool {
+    matches!(
+        plan,
+        Plan::Insert { .. }
+            | Plan::InsertFrom { .. }
+            | Plan::InsertReturn { .. }
+            | Plan::Update { .. }
+            | Plan::UpdateReturn { .. }
+            | Plan::Merge { .. }
+            | Plan::MergeEdge { .. }
+            | Plan::AddEdge { .. }
+    )
+}
