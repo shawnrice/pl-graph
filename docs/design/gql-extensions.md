@@ -22,8 +22,7 @@ matching how Gremlin exposes them — see `docs/design/transactions.md`. GQL's I
 `START TRANSACTION`/`COMMIT`/`ROLLBACK` keywords are a planned thin veneer over
 those primitives, not invented syntax.) Every graph vendor (Neo4j, Ultipa,
 TigerGraph, SQL Server) fills those gaps with **mutually incompatible,
-non-conformant extensions** (see
-the memory `iso-gql-reference`). When the whole field is extending in different
+non-conformant extensions**. When the whole field is extending in different
 directions, the standard is not yet carrying that weight.
 
 lenke's stance, which drives everything below:
@@ -87,7 +86,7 @@ holds: **no bare token ever carries lenke-specific semantics.**
 ### What this must NOT do
 
 - **Never add sigil words to the ISO `RESERVED` set** (`packages/gql/src/lexer.ts`
-  `RESERVED`, `crates/lenke-core/src/gql/lexer.rs` `RESERVED_WORDS`). That set is
+  `RESERVED`, `crates/lenke-engine/src/gql.rs` `RESERVED_WORDS`). That set is
   "verbatim from the standard so the list can't drift" — keep it pristine.
 - **Extensions are contextual keywords.** `_MERGE` is recognized only in
   statement-leading position; `_ON_*` only inside a `_MERGE`. Elsewhere a
@@ -247,8 +246,7 @@ _MERGE (p:Presence {sessionId: $s, x: $x, y: $y})
 ## 3. The unique-constraint primitive
 
 `createUniqueConstraint(label, keys)` — a **programmatic host API**, mirroring the
-existing `createVertexIndex` / `createEdgeIndex` seam (memory
-`native-property-indexes`). Both engines, byte-identical.
+existing `createIndex({ on, kind, keys })` seam. Both engines, byte-identical.
 
 **Why programmatic, not GQL DDL.** A host API is **not** GQL, so it can _never_
 collide with a future GQL constraint-DDL edition — the strongest forward-compat
@@ -273,13 +271,13 @@ it is the low-surprise seam.
 
 ## 4. Byte-identical requirement
 
-Both engines (`@lenke/gql` + `crates/lenke-core`) implement `_MERGE` and the
+Both engines (`@lenke/gql` + `crates/lenke-engine`) implement `_MERGE` and the
 constraint identically. The differential harness
 (`packages/native/src/gql-functions-conformance.test.ts` and siblings) must cover
 upsert cases and assert byte-identical results across TS and Rust. The
 conformance corpus runs under `iso-strict` (§1) to prove the ISO surface stays
 pure. New behavioral tests live in both `packages/gql/src/*.test.ts` and
-`crates/lenke-core/src/gql/*.rs`, each carrying the divergence comments from §2.7.
+`crates/lenke-engine/src/gql/tests.rs`, each carrying the divergence comments from §2.7.
 
 ---
 
@@ -352,8 +350,8 @@ through arithmetic and only testable through the classifiers below.
 renders as `null` when it leaves through JSON (`RETURN n.v` on a stored `+∞` yields
 `null`). That is a rendering coercion at the boundary only — the value is still a present,
 non-null, ordered number inside the graph. (Storing it and dumping back to NDJSON is
-therefore lossy: the reloaded value is `null`.) The retiring `lenke-core` collapsed
-non-finite to `null` at _ingest_ (Model A); the engine and pure-TS keep it (Model B).
+therefore lossy: the reloaded value is `null`.) The retired `lenke-core` collapsed
+non-finite to `null` at _ingest_ (Model A); lenke-engine and pure-TS keep it (Model B).
 
 ### 7.2 The classifiers
 

@@ -1,7 +1,14 @@
 # What GQL and Gremlin could share
 
-Status: **not built, deliberately deferred.** This records the shape, what it
-would be worth, and what has to exist before it is safe to attempt. It replaces
+> **Historical.** This records a GQL/Gremlin IR-sharing experiment in the retired
+> `lenke-core` crate (deleted 2026-08-21); the file paths and symbols it cites
+> (`gql/eval/*`, `gremlin/exec.rs`, `crate::seek`, `Val`/`GVal`) no longer exist. The
+> one-neutral-IR goal was instead realized from scratch in `lenke-engine` — see
+> [engine-from-scratch.md](./engine-from-scratch.md). Kept for its enduring findings:
+> the two total orders, the byte-identity contracts, and desugaring vs mistranslation.
+
+Status (at the time): **not built, deliberately deferred.** This records the shape,
+what it would be worth, and what has to exist before it is safe to attempt. It replaces
 an earlier note that covered only the GQL half of the same problem.
 
 ## What is already shared

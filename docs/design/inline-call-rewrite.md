@@ -1,9 +1,10 @@
 # Scoping: inline `CALL (scope) { … }` rewrite
 
-Status: **scoping only, not started.** This documents what it would take to bring the
-engine's inline correlated-subquery `CALL` up to the ISO surface pure-TS already
-supports. Pure-TS `@lenke/gql` is the **oracle** here — it is correct; the engine is
-the limited one.
+Status: **DONE (Phases 0–3, implemented and fuzzed)** — see the status section at the
+end. This documented what it took to bring the engine's inline correlated-subquery
+`CALL` up to the ISO surface pure-TS already supports. Pure-TS `@lenke/gql` was the
+**oracle** here — it is correct; the engine now matches it across the three
+inline-CALL conformance tests.
 
 ## What the engine supports today
 

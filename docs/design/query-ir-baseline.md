@@ -1,5 +1,9 @@
 # Baseline before the shared access-path work
 
+> **Historical.** Baseline for the `lenke-core` IR work (see
+> [query-ir.md](./query-ir.md), now historical). The example binaries referenced below
+> lived in the retired `lenke-core` crate and are not in the current tree.
+
 Recorded 2026-08-01 at commit `14e223c`, before any of the work in
 [`query-ir.md`](./query-ir.md) started. One machine, one binary — these numbers
 are a **before/after pair**, not a portable claim. Re-run the same commands after

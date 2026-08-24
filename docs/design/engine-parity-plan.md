@@ -1,5 +1,11 @@
 # From-scratch engine: the path to parity
 
+> **Historical — build log.** This plan is complete. `lenke-engine` is now the sole
+> Rust engine; the `lenke-core` crate it was checked against was deleted 2026-08-21,
+> and the byte-identity oracle is now the TS `@lenke/core` engine. References below to
+> `lenke-core` as a live parallel engine, a dev-dependency, or a comparison target are
+> preserved as the record of that migration, not as the current state.
+
 `crates/lenke-engine` is, today, a proof-of-architecture: one neutral IR that GQL
 and Gremlin compile into, executing a read-only subset end to end, competitive
 with `lenke-core` on aggregation/grouping and level on traversal. This document

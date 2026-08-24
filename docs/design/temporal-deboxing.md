@@ -1,6 +1,11 @@
 # Temporal column de-boxing
 
-Status: **shipped** (both phases, all 6 types; 1253 native + full TS/FFI gate green,
+> **Historical (lenke-core).** The design and results below describe the de-boxing as
+> implemented in the retired `lenke-core` crate (`graph.rs`, `Val::Temporal`, the
+> `temporal_bench` example). The same change shipped in `lenke-engine` as a per-type
+> `Column::Temporal` over `Value::Temporal`; only the file/symbol names differ there.
+
+Status: **shipped** (both phases, all 6 types; full native + TS/FFI gate green,
 byte-identical). Overflow-policy prerequisite shipped.
 
 ## Implementation

@@ -4,7 +4,7 @@ Status: **open decision, deliberately not taken.** This records what was measure
 
 ## The situation
 
-Exact arithmetic agrees everywhere. The transcendentals (`exp`, `ln`, `log`, `log10`, `power`, `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`) do not, because IEEE 754 does not require correct rounding for them and each build reaches a different implementation: the JS runtime's `Math.*` for pure-TS, the **host OS's** libm for native, and Rust's compiled-in math for wasm (`lenke_core.wasm` imports nothing from the host — verified by reading its import section).
+Exact arithmetic agrees everywhere. The transcendentals (`exp`, `ln`, `log`, `log10`, `power`, `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`) do not, because IEEE 754 does not require correct rounding for them and each build reaches a different implementation: the JS runtime's `Math.*` for pure-TS, the **host OS's** libm for native, and Rust's compiled-in math for wasm (`lenke_engine.wasm` imports nothing from the host — verified by reading its import section).
 
 The consequence that actually matters is not accuracy. A 1-ulp difference is far below any tolerance anyone would set, but it still breaks `=`, `DISTINCT` and `GROUP BY` on a computed double — two engines put the same logical value in different buckets. That is why this is a correctness question for a graph database and not merely a numerics nicety.
 
@@ -30,7 +30,7 @@ Measured on Linux/glibc. `libm` here means routing the Rust engine through the `
 | **swap** — `libm` crate on both | **100%, OS-independent** | 88%              | +0.6%  | −38% on transcendentals |
 | **fdlibm in both engines**      | **100%**                 | **100%**         | +0.6%  | −38% on transcendentals |
 
-Binary cost of the swap, measured by building it: `liblenke_core.so` 3,168,120 → 3,187,000 B (**+18,880**, +0.60%); `lenke_core.wasm` 2,282,023 → 2,296,181 B (**+14,158**, +0.62%). The wasm growth is avoidable in principle — calling `libm::` explicitly pulls in the crate's copy alongside the one std already used — but is not worth chasing.
+Binary cost of the swap, measured by building it: `liblenke_engine.so` 3,168,120 → 3,187,000 B (**+18,880**, +0.60%); `lenke_engine.wasm` 2,282,023 → 2,296,181 B (**+14,158**, +0.62%). The wasm growth is avoidable in principle — calling `libm::` explicitly pulls in the crate's copy alongside the one std already used — but is not worth chasing.
 
 Speed cost, on a deliberately math-saturated query (20k rows × 4 transcendentals): 14.81 → 20.44 ms/query, **+38%**. glibc's routines are hand-optimized and vectorized; the pure-Rust ones are not. Ordinary graph queries do essentially no transcendental math, so the end-to-end effect there is ~0; numeric analytics pays the full 38%.
 
@@ -46,4 +46,4 @@ The only option that removes the seam entirely is the third row, which is the in
 
 ## Reproducing the measurements
 
-The call sites are one dispatch block in `crates/lenke-core/src/gql/eval/scalar_fns.rs` plus three in `src/gremlin/exec.rs`. Cross-build agreement is guarded continuously by `packages/native/src/backend-parity-fuzz.test.ts`, which excludes these functions and says why.
+The call sites are the scalar-function dispatch in `crates/lenke-engine/src/exec/scalar.rs` and `crates/lenke-engine/src/gremlin.rs`. Cross-build agreement is guarded continuously by `packages/native/src/backend-parity-fuzz.test.ts`, which excludes these functions and says why.

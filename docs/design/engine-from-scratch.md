@@ -25,6 +25,12 @@ in TypeScript.** Both are first-class. They are not kept in lockstep byte-identi
 by continuous fuzzing; they are kept in **agreement**, which is a looser and more
 maintainable coupling, and the neutral IR is what makes it tractable:
 
+> **Note (current practice).** This section describes the intended coupling. In the
+> shipped project the two engines are in fact held to **byte-identity**, enforced
+> per-change by the differential / codec / write / injection fuzzers (TS vs FFI) and
+> the backend-parity fuzzer (wasm vs FFI) — tighter than the "agreement" this design
+> anticipated.
+
 - **The IR and its execution semantics are the specification.** Both engines
   implement the _same_ algebra. Agreement is therefore structural — it follows
   from both implementing one spec — rather than enforced by two hand-written
