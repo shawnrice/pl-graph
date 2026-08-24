@@ -13,7 +13,10 @@
     },
     "lint": {
       "executor": "nx:run-commands",
-      "options": { "command": "cargo clippy --all-targets -- -D warnings", "cwd": "crates/lenke-engine-core" },
+      "options": {
+        "command": "cargo clippy --all-targets -- -D warnings",
+        "cwd": "crates/lenke-engine-core"
+      },
       "inputs": ["rustEngine"],
       "cache": true
     },
