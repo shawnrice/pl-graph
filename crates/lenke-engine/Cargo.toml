@@ -63,3 +63,22 @@ regex = { version = "1", default-features = false, features = [
 # gone: those suites now run engine-only, with the TS engine as the byte-identity
 # reference; see docs/design/engine-from-scratch.md.)
 serde_json = "1"
+
+# Compile-speed tuning for the dev/test loop. `debug = 1` emits line-tables only
+# (file/line for backtraces + panics) instead of full DWARF — the test binaries
+# here are large, and full debuginfo dominates both codegen and link time, so this
+# is a sizeable `cargo test` speedup with no effect on correctness or on the
+# `--release` artifacts (the .so/.wasm) which keep their own profile. Move these to
+# the workspace root if/when this crate joins one.
+[profile.dev]
+debug = 1
+
+# Tests run OPTIMIZED (opt-level 1). The heavy suites — the GQL corpus, the varlen/
+# algo tests — are compute-bound, and unoptimized they dominate `cargo test` wall
+# time (the corpus alone ran ~74s at opt-level 0, ~7s optimized). opt-level 1 is a
+# fraction of the compile cost of a full release build yet recovers most of that
+# runtime, and mold + `debug = 1` keep the (re)compile fast. `cargo build`/`check`
+# stay at opt-level 0 (profile.dev) so the plain build loop is untouched.
+[profile.test]
+opt-level = 1
+debug = 1

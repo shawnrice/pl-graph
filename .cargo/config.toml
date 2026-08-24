@@ -15,8 +15,14 @@ rustflags = ["-C", "target-cpu=native"]
 # AWS x86-64 nodes. x86-64-v3 ≈ Haswell+ (AVX2, BMI2, FMA) — true of every
 # current-gen AWS instance (m5/c5/m6i/…). Drop to x86-64-v2 (SSE4.2, no AVX) if
 # the fleet might include pre-2013 / some burstable hardware.
+#
+# `-fuse-ld=mold` swaps in the mold linker: linking the large debug test binaries
+# is a big fraction of `cargo test` wall time and mold cuts it several-fold. mold
+# is Linux-only (macOS builds use the default ld64 — see the darwin target above),
+# so this applies to this box + CI. CI installs mold (see .github/workflows/ci.yml);
+# if you build x86-64 Linux without mold on PATH, drop this one `link-arg`.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "link-arg=-fuse-ld=mold"]
 
 # AWS Graviton (arm64 Linux). neoverse-n1 = Graviton2 (safe broad baseline);
 # use neoverse-v1 for Graviton3, neoverse-v2 for Graviton4 if the fleet is fixed.
