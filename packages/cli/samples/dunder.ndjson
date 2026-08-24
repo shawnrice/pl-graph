@@ -1,0 +1,70 @@
+{"type":"node","id":"dm","labels":["Company"],"properties":{"name":"Dunder Mifflin","branch":"Scranton"}}
+{"type":"node","id":"sabre","labels":["Company"],"properties":{"name":"Sabre"}}
+{"type":"node","id":"mscott","labels":["Person"],"properties":{"name":"Michael Scott"}}
+{"type":"node","id":"dschrute","labels":["Person"],"properties":{"name":"Dwight Schrute"}}
+{"type":"node","id":"jhalpert","labels":["Person"],"properties":{"name":"Jim Halpert"}}
+{"type":"node","id":"pbeesly","labels":["Person"],"properties":{"name":"Pam Beesly"}}
+{"type":"node","id":"abernard","labels":["Person"],"properties":{"name":"Andy Bernard"}}
+{"type":"node","id":"shudson","labels":["Person"],"properties":{"name":"Stanley Hudson"}}
+{"type":"node","id":"pvance","labels":["Person"],"properties":{"name":"Phyllis Vance"}}
+{"type":"node","id":"rhoward","labels":["Person"],"properties":{"name":"Ryan Howard"}}
+{"type":"node","id":"kkapoor","labels":["Person"],"properties":{"name":"Kelly Kapoor"}}
+{"type":"node","id":"kmalone","labels":["Person"],"properties":{"name":"Kevin Malone"}}
+{"type":"node","id":"amartin","labels":["Person"],"properties":{"name":"Angela Martin"}}
+{"type":"node","id":"omartinez","labels":["Person"],"properties":{"name":"Oscar Martinez"}}
+{"type":"node","id":"tflenderson","labels":["Person"],"properties":{"name":"Toby Flenderson"}}
+{"type":"node","id":"cbratton","labels":["Person"],"properties":{"name":"Creed Bratton"}}
+{"type":"node","id":"mpalmer","labels":["Person"],"properties":{"name":"Meredith Palmer"}}
+{"type":"node","id":"dphilbin","labels":["Person"],"properties":{"name":"Darryl Philbin"}}
+{"type":"node","id":"ehannon","labels":["Person"],"properties":{"name":"Erin Hannon"}}
+{"type":"node","id":"hflax","labels":["Person"],"properties":{"name":"Holly Flax"}}
+{"type":"node","id":"glewis","labels":["Person"],"properties":{"name":"Gabe Lewis"}}
+{"type":"node","id":"jlevinson","labels":["Person"],"properties":{"name":"Jan Levinson"}}
+{"type":"node","id":"rcalifornia","labels":["Person"],"properties":{"name":"Robert California"}}
+{"type":"node","id":"nbertram","labels":["Person"],"properties":{"name":"Nellie Bertram"}}
+{"type":"node","id":"dvickers","labels":["Person"],"properties":{"name":"Deangelo Vickers"}}
+{"type":"node","id":"randerson","labels":["Person"],"properties":{"name":"Roy Anderson"}}
+{"type":"edge","id":"acq","from":"dm","to":"sabre","labels":["ACQUIRED_BY"],"properties":{"vf":{"@date":"2010-05-01"},"vt":{"@date":"2012-04-01"}}}
+{"type":"edge","id":"w-mscott","from":"mscott","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Regional Manager","dept":"Management","vf":{"@date":"2005-01-01"},"vt":{"@date":"2011-04-01"}}}
+{"type":"edge","id":"w-dschrute-1","from":"dschrute","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Assistant to the Regional Manager","dept":"Sales","vf":{"@date":"2005-01-01"},"vt":{"@date":"2013-03-01"}}}
+{"type":"edge","id":"w-dschrute-2","from":"dschrute","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Regional Manager","dept":"Management","vf":{"@date":"2013-03-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"w-jhalpert","from":"jhalpert","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Sales Representative","dept":"Sales","vf":{"@date":"2005-01-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"w-pbeesly-1","from":"pbeesly","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Receptionist","dept":"Reception","vf":{"@date":"2005-01-01"},"vt":{"@date":"2009-05-01"}}}
+{"type":"edge","id":"w-pbeesly-2","from":"pbeesly","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Sales Representative","dept":"Sales","vf":{"@date":"2009-05-01"},"vt":{"@date":"2011-05-01"}}}
+{"type":"edge","id":"w-pbeesly-3","from":"pbeesly","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Office Administrator","dept":"Administration","vf":{"@date":"2011-05-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"w-abernard-1","from":"abernard","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Sales Representative","dept":"Sales","vf":{"@date":"2007-01-01"},"vt":{"@date":"2011-09-01"}}}
+{"type":"edge","id":"w-abernard-2","from":"abernard","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Regional Manager","dept":"Management","vf":{"@date":"2011-09-01"},"vt":{"@date":"2013-01-01"}}}
+{"type":"edge","id":"w-abernard-3","from":"abernard","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Sales Representative","dept":"Sales","vf":{"@date":"2013-01-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"w-shudson","from":"shudson","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Sales Representative","dept":"Sales","vf":{"@date":"2005-01-01"},"vt":{"@date":"2013-05-01"}}}
+{"type":"edge","id":"w-pvance","from":"pvance","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Sales Representative","dept":"Sales","vf":{"@date":"2005-01-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"w-rhoward-1","from":"rhoward","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Temp","dept":"Sales","vf":{"@date":"2005-01-01"},"vt":{"@date":"2006-09-01"}}}
+{"type":"edge","id":"w-rhoward-2","from":"rhoward","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Sales Representative","dept":"Sales","vf":{"@date":"2006-09-01"},"vt":{"@date":"2007-08-01"}}}
+{"type":"edge","id":"w-rhoward-3","from":"rhoward","to":"dm","labels":["WORKS_AT"],"properties":{"role":"VP, Northeast Region","dept":"Corporate","vf":{"@date":"2007-08-01"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"2007-08-01"},"tt":{"@date":"2008-11-01"}}}
+{"type":"edge","id":"w-rhoward-4","from":"rhoward","to":"dm","labels":["WORKS_AT"],"properties":{"role":"VP, Northeast Region","dept":"Corporate","vf":{"@date":"2007-08-01"},"vt":{"@date":"2008-11-01"},"tf":{"@date":"2008-11-01"},"tt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"w-rhoward-5","from":"rhoward","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Temp","dept":"Sales","vf":{"@date":"2009-04-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"w-kkapoor","from":"kkapoor","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Customer Service Representative","dept":"Customer Service","vf":{"@date":"2005-01-01"},"vt":{"@date":"2012-05-01"}}}
+{"type":"edge","id":"w-kmalone","from":"kmalone","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Accountant","dept":"Accounting","vf":{"@date":"2005-01-01"},"vt":{"@date":"2013-05-01"}}}
+{"type":"edge","id":"w-amartin","from":"amartin","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Senior Accountant","dept":"Accounting","vf":{"@date":"2005-01-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"w-omartinez","from":"omartinez","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Accountant","dept":"Accounting","vf":{"@date":"2005-01-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"w-tflenderson-1","from":"tflenderson","to":"dm","labels":["WORKS_AT"],"properties":{"role":"HR Representative","dept":"Human Resources","vf":{"@date":"2005-01-01"},"vt":{"@date":"2008-11-01"}}}
+{"type":"edge","id":"w-tflenderson-2","from":"tflenderson","to":"dm","labels":["WORKS_AT"],"properties":{"role":"HR Representative","dept":"Human Resources","vf":{"@date":"2009-04-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"w-cbratton","from":"cbratton","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Director of Quality Assurance","dept":"Quality Assurance","vf":{"@date":"2005-01-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"w-mpalmer","from":"mpalmer","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Supplier Relations Representative","dept":"Supplier Relations","vf":{"@date":"2005-01-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"w-dphilbin-1","from":"dphilbin","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Warehouse Foreman","dept":"Warehouse","vf":{"@date":"2005-01-01"},"vt":{"@date":"2010-05-01"}}}
+{"type":"edge","id":"w-dphilbin-2","from":"dphilbin","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Sales Vice President Assistant","dept":"Administration","vf":{"@date":"2010-05-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"w-ehannon","from":"ehannon","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Receptionist","dept":"Reception","vf":{"@date":"2009-05-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"w-hflax","from":"hflax","to":"dm","labels":["WORKS_AT"],"properties":{"role":"HR Representative","dept":"Human Resources","vf":{"@date":"2008-05-01"},"vt":{"@date":"2009-04-01"}}}
+{"type":"edge","id":"w-glewis","from":"glewis","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Sabre Liaison","dept":"Corporate","vf":{"@date":"2010-05-01"},"vt":{"@date":"2012-04-01"}}}
+{"type":"edge","id":"w-jlevinson","from":"jlevinson","to":"dm","labels":["WORKS_AT"],"properties":{"role":"VP, Northeast Region","dept":"Corporate","vf":{"@date":"2005-01-01"},"vt":{"@date":"2008-05-01"}}}
+{"type":"edge","id":"w-rcalifornia","from":"rcalifornia","to":"dm","labels":["WORKS_AT"],"properties":{"role":"CEO","dept":"Corporate","vf":{"@date":"2011-05-01"},"vt":{"@date":"2012-04-01"}}}
+{"type":"edge","id":"w-nbertram-1","from":"nbertram","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Acting Manager","dept":"Management","vf":{"@date":"2012-03-01"},"vt":{"@date":"2012-09-01"}}}
+{"type":"edge","id":"w-nbertram-2","from":"nbertram","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Special Projects","dept":"Administration","vf":{"@date":"2012-09-01"},"vt":{"@date":"2013-02-01"}}}
+{"type":"edge","id":"w-dvickers","from":"dvickers","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Regional Manager","dept":"Management","vf":{"@date":"2011-04-01"},"vt":{"@date":"2011-06-01"}}}
+{"type":"edge","id":"w-randerson","from":"randerson","to":"dm","labels":["WORKS_AT"],"properties":{"role":"Warehouse Worker","dept":"Warehouse","vf":{"@date":"2005-01-01"},"vt":{"@date":"2007-05-01"}}}
+{"type":"edge","id":"m-mscott","from":"mscott","to":"dm","labels":["MANAGES"],"properties":{"vf":{"@date":"2005-01-01"},"vt":{"@date":"2011-04-01"}}}
+{"type":"edge","id":"m-dvickers","from":"dvickers","to":"dm","labels":["MANAGES"],"properties":{"vf":{"@date":"2011-04-01"},"vt":{"@date":"2011-06-01"}}}
+{"type":"edge","id":"m-dschrute-1","from":"dschrute","to":"dm","labels":["MANAGES"],"properties":{"vf":{"@date":"2011-06-01"},"vt":{"@date":"2011-09-01"}}}
+{"type":"edge","id":"m-abernard-1","from":"abernard","to":"dm","labels":["MANAGES"],"properties":{"vf":{"@date":"2011-09-01"},"vt":{"@date":"2012-03-01"}}}
+{"type":"edge","id":"m-nbertram","from":"nbertram","to":"dm","labels":["MANAGES"],"properties":{"vf":{"@date":"2012-03-01"},"vt":{"@date":"2012-09-01"}}}
+{"type":"edge","id":"m-abernard-2","from":"abernard","to":"dm","labels":["MANAGES"],"properties":{"vf":{"@date":"2012-09-01"},"vt":{"@date":"2013-03-01"}}}
+{"type":"edge","id":"m-dschrute-2","from":"dschrute","to":"dm","labels":["MANAGES"],"properties":{"vf":{"@date":"2013-03-01"},"vt":{"@date":"2099-12-31"}}}

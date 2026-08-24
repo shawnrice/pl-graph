@@ -35,20 +35,27 @@ Start with a bundled sample — no data file needed:
 
 ```text
 lenke=# \l
-  modern       Apache TinkerPop "modern": 6 person/software vertices, weighted edges.
-  employment   Bitemporal org — people, companies, WORKS_AT with valid-time and system-time.
-lenke=# \c employment
-loaded employment — 5 vertices, 7 edges
-lenke=# \clock 2020-06-01
-clock: 2020-06-01 (current_date / current_timestamp now resolve to it)
-lenke=# MATCH (p:Person)-[e:WORKS_AT]->(c) WHERE e.vf <= current_date AND e.vt > current_date
-lenke-#   RETURN p.name AS person, c.name AS role ORDER BY person
-┌────────┬─────────────────┐
-│ person │ role            │
-├────────┼─────────────────┤
-│ Alice  │ Engineer        │
-…
+  modern   Apache TinkerPop "modern": 6 person/software vertices, weighted edges.
+  dunder   Dunder Mifflin (The Office) — 24 employees over 9 seasons, bitemporal.
+lenke=# \c dunder
+loaded dunder — 26 vertices, 44 edges
+lenke=# \clock 2007-06-01
+clock: 2007-06-01 (fixed)
+lenke=# -- who ran the Scranton branch then?
+lenke=# MATCH (p:Person)-[m:MANAGES]->(:Company) WHERE m.vf <= current_date AND m.vt > current_date
+lenke-#   RETURN p.name AS regional_manager
+┌──────────────────┐
+│ regional_manager │
+├──────────────────┤
+│ Michael Scott    │
+└──────────────────┘
 ```
+
+The manager's chair turns over almost every season, so re-run that with
+`\clock 2013-04-01` and you get `Dwight Schrute`. The `dunder` graph is
+**bitemporal** — Ryan Howard's VP tenure was recorded open-ended, then corrected
+when he was fired, so his record reads differently depending on the system-time
+you ask "as recorded on".
 
 A query that isn't finished (an open bracket, or a trailing `\`) continues on the
 next line — the prompt turns to `lenke-#`. No `;` needed.
@@ -66,14 +73,16 @@ The language is an explicit mode, shown in the prompt — never sniffed:
 `\js` is the escape hatch for keeping data in JavaScript:
 
 ```text
-lenke=# MATCH (p:Person)-[e:WORKS_AT]->(c) RETURN p.name AS person, c.name AS company, e.role AS role
-… (a table) …
+lenke=# MATCH (p:Person)-[e:WORKS_AT]->(:Company) WHERE e.vt > current_date
+lenke-#   RETURN p.name AS person, e.role AS role, e.dept AS dept
+… (a table of current employees) …
 lenke=# \js
-lenke(js)=# _.filter((r) => r.company === 'Globex').map((r) => r.person + ' — ' + r.role)
-┌─────────────────────────┐
-│ value                   │
-├─────────────────────────┤
-│ Alice — Senior Engineer │
+lenke(js)=# _.filter((r) => r.dept === 'Sales').map((r) => r.person)
+┌────────────────┐
+│ value          │
+├────────────────┤
+│ Jim Halpert    │
+│ Phyllis Vance  │
 …
 ```
 

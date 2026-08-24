@@ -87,8 +87,8 @@ describe('runMeta', () => {
   test('\\c loads a bundled sample', () => {
     const state = stateWith();
 
-    runMeta(state, '\\c employment', () => {});
-    expect(state.graph.vertexCount).toBe(5);
+    runMeta(state, '\\c dunder', () => {});
+    expect(state.graph.vertexCount).toBe(26);
     expect(state.labels).toContain('Person');
   });
 
@@ -115,7 +115,7 @@ describe('runMeta', () => {
     const state = stateWith();
 
     runMeta(state, '\\clock 2020-06-01', () => {});
-    runMeta(state, '\\c employment', () => {});
+    runMeta(state, '\\c dunder', () => {});
 
     // current_date resolves to the fixed date on the freshly loaded graph.
     const rows = state.graph.query('RETURN current_date AS d') as { d: { '@date': string } }[];

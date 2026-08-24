@@ -17,10 +17,10 @@ export const SAMPLES: readonly Sample[] = [
     file: 'modern.ndjson',
   },
   {
-    name: 'employment',
+    name: 'dunder',
     description:
-      'Bitemporal org — people, companies, WORKS_AT with valid-time (vf/vt) and system-time (tf/tt). Try as-of queries.',
-    file: 'employment.ndjson',
+      'Dunder Mifflin (The Office) — 24 employees over 9 seasons: role changes, the manager succession, a Sabre acquisition, and a bitemporal correction. Try as-of queries.',
+    file: 'dunder.ndjson',
   },
 ];
 
