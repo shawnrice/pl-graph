@@ -3,7 +3,7 @@
  *
  * Two reasons this exists rather than another Rust example.
  *
- * The Rust benchmarks in `crates/lenke-core/examples` measure the NATIVE build
+ * The Rust benchmarks in `crates/lenke-engine/examples` measure the NATIVE build
  * and only the native build. They compile for `wasm32-unknown-unknown` but
  * cannot run there — `Instant::now()` panics (that target has no clock), there
  * is no stdout, and there is no runner. A green `cargo build --target
@@ -21,10 +21,9 @@
  *   BENCH_REPS=7 bun run bench          # more samples
  *
  * Reports the MINIMUM of N runs, not the mean: it is the sample least polluted
- * by whatever else the machine was doing. See `crates/lenke-core/examples/
- * README.md` for the rest of what this suite has learned about trusting its own
- * numbers — in particular that a cache-resident workload answers a different
- * question, so vary BENCH_N before drawing a conclusion.
+ * by whatever else the machine was doing. A cache-resident workload answers a
+ * different question than one that spills, so vary BENCH_N before drawing a
+ * conclusion.
  *
  * READING THE RATIOS. They are against the first engine listed. The decode rows
  * are not purely codegen: decode defaults to the parallel path and only ffi has

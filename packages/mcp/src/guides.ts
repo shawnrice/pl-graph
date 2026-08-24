@@ -77,7 +77,7 @@ using g = graphFromNdjson(backend, await Bun.file('graph.ndjson').bytes());
 g.query\`MATCH (a:Person) RETURN a.name\`;   // tagged-template form (safe binding)
 \`\`\`
 
-On Node, use \`createNodeBackend()\` from \`@lenke/node/backend\` (no path needed — the prebuilt addon ships with it); in the browser, \`createWasmBackend(fetch(wasmUrl))\`. A native graph owns memory — release it with \`using\`, \`g.free()\`, or let GC back you up. The native and wasm setup docs cover where the compiled artifact lives.`,
+On Node, use \`createNodeBackend()\` from \`@lenke/node/backend\` (no path needed — the prebuilt addon ships with it); in the browser, \`createWasmEngineBackend(fetch(wasmUrl))\` from \`@lenke/native/wasm-engine\`. A native graph owns memory — release it with \`using\`, \`g.free()\`, or let GC back you up. The native and wasm setup docs cover where the compiled artifact lives.`,
 };
 
 const gqlGuide: Guide = {
@@ -394,10 +394,11 @@ For a local-first UI, put the graph in a Web Worker so queries never block rende
 
 ## Worker (\`graph.worker.ts\`)
 \`\`\`ts
-import { createWasmBackend, createStore, graphFromNdjson } from '@lenke/native';
+import { createWasmEngineBackend } from '@lenke/native/wasm-engine';
+import { createStore, graphFromNdjson } from '@lenke/native';
 import { createSyncEngine } from '@lenke/sync';
 
-const backend = await createWasmBackend(fetch(wasmUrl));   // wasmUrl → the lenke wasm engine
+const backend = await createWasmEngineBackend(fetch(wasmUrl));   // wasmUrl → the lenke wasm engine
 const store = createStore(graphFromNdjson(backend, seedBytes));
 const engine = createSyncEngine({ store, collections, upstream });
 const host = engine.createHost({ send: (m) => self.postMessage(m) });

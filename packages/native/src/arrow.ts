@@ -16,7 +16,7 @@
  */
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
-// ARW1 column type tags (mirrors crates/lenke-core/src/arrow.rs and graph.ts).
+// ARW1 column type tags (mirrors crates/lenke-engine/src/arrow.rs and graph.ts).
 const ARW_FLOAT64 = 1;
 const ARW_BOOL = 2;
 const ARW_UTF8 = 3;

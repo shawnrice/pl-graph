@@ -1,15 +1,14 @@
 // Item 3 (TS side): the @lenke/gremlin executor emits map-producing steps
 // (project/valueMap) as plain JS objects in INSERTION order, so JSON.stringify
 // preserves the order the keys were written. The native Rust engine
-// (crates/lenke-core results_to_json) sorts map keys LEXICOGRAPHICALLY. The two
+// (crates/lenke-engine/src/exec/json_out.rs) sorts map keys LEXICOGRAPHICALLY. The two
 // engines therefore serialize the same logical map to different bytes — a real
 // TS<->Rust divergence that matters because the sync/live-query layer diffs
 // cells by JSON.stringify byte-equality.
 //
-// Companion native tests:
-//   crates/lenke-core/src/gremlin/bug_repro.rs
-//     item3_native_project_sorts_map_keys           -> {"a":...,"b":...}
-//     item3_native_numeric_keys_lexicographic_reversal -> {"10":2,"9":1}
+// Companion native coverage lives in the engine's gremlin tests
+// (crates/lenke-engine/tests/gremlin_ported.rs): the native serializer sorts map
+// keys lexicographically — {"a":...,"b":...}, and {"10":2,"9":1} for numeric keys.
 //
 // This file pins the TS behavior that contradicts them. CONFIRMED divergence.
 import { describe, expect, test } from 'bun:test';

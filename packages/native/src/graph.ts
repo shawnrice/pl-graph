@@ -505,7 +505,7 @@ export function composeGremlin(q: string | TemplateStringsArray, ...subs: unknow
   );
 }
 
-// ARW1 column type tags (mirrors crates/lenke-core/src/arrow.rs).
+// ARW1 column type tags (mirrors crates/lenke-engine/src/arrow.rs).
 const ARW_FLOAT64 = 1;
 const ARW_BOOL = 2;
 const ARW_UTF8 = 3;
@@ -718,8 +718,7 @@ export type RustGraph = {
    * committed write touched — that write's content-derived **value-scope**, for CDC
    * interest routing (`lastWriteScope('room')` → `['42']` right after a write into
    * room 42). Empty when the last write touched no vertex carrying `key`. Reads a
-   * handful of columns off the already-collected touched set — see
-   * `crates/lenke-core/examples/cdc_extract_bench.rs`.
+   * handful of columns off the already-collected touched set.
    */
   lastWriteScope: (key: string) => string[];
   /**

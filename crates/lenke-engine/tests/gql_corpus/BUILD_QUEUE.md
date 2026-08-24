@@ -1,5 +1,11 @@
 # GQL burn-down build queue (scout findings)
 
+> **Note.** Scouted while `lenke-core` was the authoritative Rust reference. That crate
+> was deleted 2026-08-21; the oracle is now the TS `@lenke/gql` engine. Read the
+> "grounded in core" / "mirror core" / "do NOT touch lenke-core" lines below as the
+> original scouting context. `exec.rs` source pointers predate the exec.rs module split
+> (the executor now lives across `crates/lenke-engine/src/exec/*.rs`).
+
 Condensed implementation plans from 6 read-only scouts (2026-08). Each is grounded
 in core (authoritative) + engine insertion points. Baseline after WALK/TRAIL: **419**.
 Verify every feature: `cargo test --release --lib`; differential_fuzz seeds 1 & 42
@@ -57,7 +63,7 @@ Concrete plan (implement in the MAIN tree; agent a5af0ba3 could not because its 
 
 - ir.rs: `enum ShortestSelector { Any, All }`; add `min: u32` + `selector: ShortestSelector` to `Plan::ShortestPath` (currently has input/from/dir/edge_label/max); update the `shortest_path(...)` builder signature.
 - gql.rs `shortest_path_binding` + `query`: accept `ANY SHORTEST`/`ALL SHORTEST`/`SHORTEST 1[ GROUP|GROUPS]` (→Any; `1 GROUP`→All; k>=2 and k=0 → parse error). Add a BARE-selector entry (no path var) before match_body. Translate inline endpoint/seed `label`+`{props}` into Scan-label + node_prop_filters (seed below the hop, endpoint filters above it; a same-var endpoint like `->{1,3}(a)` → a `Slot(src)=Slot(end)` equality filter). Keep rejecting per-hop edge WHERE. Thread `min` from `*`(0)/`+`(1).
-- exec.rs `shortest_path` (+ dispatch ~900): record ALL min-distance predecessors and enumerate the shortest-path DAG (`enumerate_shortest_paths`), emitting one row per distinct shortest path so endpoint multiplicity is right WITH OR WITHOUT lineage (do NOT gate multiplicity on `track`). Endpoints = nodes with `dist >= min`, so `*`(min 0) emits the seed at dist 0 (zero-length-to-self). `Any` keeps only the FIRST predecessor → one row per endpoint (existing 4 unit tests stay green at min=1). Mirror core all_shortest_walk / shortest_ends (crates/lenke-core/src/gql/eval/pathfind.rs). Seed-cycle re-emission is NOT needed for any required case.
+- exec.rs `shortest_path` (+ dispatch ~900): record ALL min-distance predecessors and enumerate the shortest-path DAG (`enumerate_shortest_paths`), emitting one row per distinct shortest path so endpoint multiplicity is right WITH OR WITHOUT lineage (do NOT gate multiplicity on `track`). Endpoints = nodes with `dist >= min`, so `*`(min 0) emits the seed at dist 0 (zero-length-to-self). `Any` keeps only the FIRST predecessor → one row per endpoint (existing 4 unit tests stay green at min=1). Mirror the all-shortest-walk / shortest-ends semantics (implemented in `crates/lenke-engine/src/exec/varlen.rs::enumerate_shortest_paths`; the original lenke-core reference has been deleted). Seed-cycle re-emission is NOT needed for any required case.
 - opt.rs: 4 `Plan::ShortestPath { .. }` match arms (rewrite ~202/211, pushdown ~671/681/697) need `min, selector` added to destructure + reconstruction. ALSO cost.rs estimate arm.
 - Fixes all 8 all*shortest*_/shortest*1*_ cases + incidental ANY-SHORTEST inline-props cases. DEFER SHORTEST k>=2 + shortest_k_per_hop_pred (parse error).
 

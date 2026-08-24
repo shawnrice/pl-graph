@@ -76,7 +76,7 @@ export const tailLocal = (v: unknown, n: number): unknown => {
 // Mulberry32 PRNG — tiny, fast, fully-specified. `sample(n)` uses it with a
 // FIXED seed so the pseudo-random selection is reproducible AND byte-identical
 // with the Rust engine, which runs the same algorithm. The seed constant and the
-// draw/shuffle order must match `crates/lenke-core/src/gremlin/exec.rs`.
+// draw/shuffle order must match `crates/lenke-engine/src/gremlin.rs`.
 const SAMPLE_SEED = 0x9e3779b9;
 
 const mulberry32 = (seed: number): (() => number) => {

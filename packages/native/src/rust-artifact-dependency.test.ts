@@ -4,7 +4,7 @@ import path from 'node:path';
 
 // Guard for the failure mode the `boundaries/no-cross-package-relative-import`
 // lint rule CANNOT catch: a package that depends on the compiled Rust engine by
-// loading its artifact at runtime — `createFfiBackend('…/liblenke_core.so')` or
+// loading its artifact at runtime — `createFfiEngineBackend('…/liblenke_engine.so')` or
 // the wasm module by path. There is no import, so nx's project graph sees no edge
 // to lenke-core. If such a package's nx `test` target does not key on `rustEngine`,
 // a Rust-only change leaves its cache key unchanged and nx serves a STALE PASS

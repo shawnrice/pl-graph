@@ -18,7 +18,7 @@ const codeOf = (fn: () => unknown): unknown => {
 };
 
 // Byte-identical with the Rust core's constraint tests
-// (crates/lenke-core/src/gql/tests.rs). See docs/design/gql-extensions.md §3.
+// (crates/lenke-engine/src/gql/tests.rs). See docs/design/gql-extensions.md §3.
 describe('GQL: unique constraints', () => {
   test('enforced on INSERT and SET; per-label; a self-set is not a collision', () => {
     const g = createTestSocialGraph(); // no Acct/Other labels — a clean namespace

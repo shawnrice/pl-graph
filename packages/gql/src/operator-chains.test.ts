@@ -10,7 +10,7 @@ import { prepare, query } from './index.js';
 // associativity, three-valued boolean folding, concat null propagation, error
 // propagation (the evaluator does NOT short-circuit), the long-chain value, or
 // the planner's AND-split index seed is caught. Mirror of
-// crates/lenke-core/src/gql/ported_gql_operator_chains.rs (byte-identity).
+// crates/lenke-engine/src/gql/tests.rs (byte-identity).
 
 const val = (expr: string): unknown => {
   const rows = query(new Graph(), `RETURN ${expr} AS r`) as Array<{ r: unknown }>;

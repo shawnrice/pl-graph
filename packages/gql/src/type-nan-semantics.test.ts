@@ -1,5 +1,5 @@
 // The JS ground truth for three type/NaN questions the Rust engine matches
-// (see crates/lenke-core gql/tests.rs bug1_*). The Rust core runs the same
+// (see crates/lenke-engine/src/gql/tests.rs). The Rust engine runs the same
 // logical query down two drivers (vectorized single-pattern vs scalar
 // multi-pattern) and both must agree with THIS engine — the JS library is the
 // reference. No coercion of a bool into the numeric domain; arithmetic on a

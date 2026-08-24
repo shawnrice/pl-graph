@@ -3,7 +3,7 @@
   "name": "@lenke/sync",
   "targets": {
     "test": {
-      "//": "engine/host/reconnect/gremlin-write/client/snapshot/websocket tests load the REAL Rust cdylib via `createFfiBackend(<path>)`, so — like @lenke/native — the cache must key on `rustEngine` (else a Rust-only change serves a stale pass) and rebuild the cdylib first via `dependsOn`.",
+      "//": "engine/host/reconnect/gremlin-write/client/snapshot/websocket tests load the REAL Rust cdylib via `createFfiEngineBackend(<path>)`, so — like @lenke/native — the cache must key on `rustEngine` (else a Rust-only change serves a stale pass) and rebuild the cdylib first via `dependsOn`.",
       "inputs": ["default", "^production", "rustEngine"],
       "dependsOn": ["lenke-engine:build"]
     }
