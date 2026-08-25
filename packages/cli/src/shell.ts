@@ -190,7 +190,7 @@ const BANNER = (color: boolean): string => {
   const b = color ? (s: string) => `\x1b[1m${s}\x1b[0m` : (s: string) => s;
 
   return `${b('lenke')} — a graph shell. Type GQL and press Enter; \\? for help, \\q to quit.
-Load a sample to explore: ${b('\\l')} lists them, e.g. ${b('\\c employment')}.`;
+Load a sample to explore: ${b('\\l')} lists them, e.g. ${b('\\c hillvalley')}.`;
 };
 
 const HELP = `Queries

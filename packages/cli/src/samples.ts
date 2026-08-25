@@ -22,6 +22,12 @@ export const SAMPLES: readonly Sample[] = [
       'Dunder Mifflin (The Office) — 24 employees over 9 seasons: role changes, the manager succession, a Sabre acquisition, and a bitemporal correction. Try as-of queries.',
     file: 'dunder.ndjson',
   },
+  {
+    name: 'hillvalley',
+    description:
+      'Back to the Future — Hill Valley across rewritten timelines. Facts carry BOTH valid time (vf/vt, when true in-story) and transaction time (tf/tt, which version of history recorded it), so a time-travel edit is a bitemporal correction. Ask what was true in 1985 "as of" the original vs the restored timeline.',
+    file: 'hillvalley.ndjson',
+  },
 ];
 
 // samples/ ships beside the built code. From dist/esm/*.mjs it is ../../samples;

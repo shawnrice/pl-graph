@@ -1,0 +1,45 @@
+{"type":"node","id":"marty","labels":["Person"],"properties":{"name":"Marty McFly"}}
+{"type":"node","id":"george","labels":["Person"],"properties":{"name":"George McFly"}}
+{"type":"node","id":"lorraine","labels":["Person"],"properties":{"name":"Lorraine Baines McFly"}}
+{"type":"node","id":"biff","labels":["Person"],"properties":{"name":"Biff Tannen"}}
+{"type":"node","id":"doc","labels":["Person"],"properties":{"name":"Emmett \"Doc\" Brown"}}
+{"type":"node","id":"jennifer","labels":["Person"],"properties":{"name":"Jennifer Parker"}}
+{"type":"node","id":"dave","labels":["Person"],"properties":{"name":"Dave McFly"}}
+{"type":"node","id":"linda","labels":["Person"],"properties":{"name":"Linda McFly"}}
+{"type":"node","id":"strickland","labels":["Person"],"properties":{"name":"Mr. Strickland"}}
+{"type":"node","id":"goldie","labels":["Person"],"properties":{"name":"Goldie Wilson"}}
+{"type":"node","id":"hillvalley","labels":["Place"],"properties":{"name":"Hill Valley"}}
+{"type":"node","id":"mall","labels":["Place"],"properties":{"name":"the shopping mall"}}
+{"type":"node","id":"clocktower","labels":["Place"],"properties":{"name":"Courthouse clock tower"}}
+{"type":"node","id":"school","labels":["Place"],"properties":{"name":"Hill Valley High"}}
+{"type":"node","id":"lyonestates","labels":["Place"],"properties":{"name":"Lyon Estates"}}
+{"type":"node","id":"delorean","labels":["Object"],"properties":{"name":"DeLorean time machine"}}
+{"type":"node","id":"almanac","labels":["Object"],"properties":{"name":"Grays Sports Almanac"}}
+{"type":"edge","id":"e1","from":"marty","to":"jennifer","labels":["DATES"],"properties":{"vf":{"@date":"1984-06-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e2","from":"marty","to":"school","labels":["STUDENT_AT"],"properties":{"vf":{"@date":"1984-09-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e3","from":"marty","to":"george","labels":["CHILD_OF"],"properties":{"vf":{"@date":"1968-06-12"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e4","from":"marty","to":"lorraine","labels":["CHILD_OF"],"properties":{"vf":{"@date":"1968-06-12"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e5","from":"dave","to":"marty","labels":["SIBLING_OF"],"properties":{"vf":{"@date":"1968-06-12"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e6","from":"linda","to":"marty","labels":["SIBLING_OF"],"properties":{"vf":{"@date":"1968-06-12"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e7","from":"doc","to":"marty","labels":["FRIEND_OF"],"properties":{"vf":{"@date":"1982-01-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e8","from":"doc","to":"delorean","labels":["BUILT"],"properties":{"vf":{"@date":"1985-10-25"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e9","from":"strickland","to":"school","labels":["PRINCIPAL_AT"],"properties":{"vf":{"@date":"1955-01-01"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e10","from":"marty","to":"clocktower","labels":["VISITED"],"properties":{"vf":{"@date":"1955-11-05"},"vt":{"@date":"1955-11-12"},"note":"the 1955 trip"}}
+{"type":"edge","id":"e11","from":"goldie","to":"hillvalley","labels":["ROLE"],"properties":{"vf":{"@date":"1955-11-05"},"vt":{"@date":"1959-01-01"},"value":"Busboy at Lou's Cafe"}}
+{"type":"edge","id":"e12","from":"goldie","to":"hillvalley","labels":["ROLE"],"properties":{"vf":{"@date":"1959-01-01"},"vt":{"@date":"2099-12-31"},"value":"Mayor of Hill Valley"}}
+{"type":"edge","id":"e13","from":"george","to":"lorraine","labels":["MARRIED_TO"],"properties":{"value":"married","vf":{"@date":"1958-03-01"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"1985-10-25"},"tt":{"@date":"2015-10-27"},"timeline":"original+restored"}}
+{"type":"edge","id":"e14","from":"mall","to":"hillvalley","labels":["NAMED"],"properties":{"value":"Twin Pines Mall","vf":{"@date":"1985-10-26"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"1985-10-25"},"tt":{"@date":"1985-10-26"},"timeline":"original"}}
+{"type":"edge","id":"e15","from":"mall","to":"hillvalley","labels":["NAMED"],"properties":{"value":"Lone Pine Mall","vf":{"@date":"1985-10-26"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"1985-10-26"},"tt":{"@date":"2099-12-31"},"timeline":"restored"}}
+{"type":"edge","id":"e16","from":"george","to":"hillvalley","labels":["STATUS"],"properties":{"value":"Meek pushover; bullied at work","vf":{"@date":"1985-10-26"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"1985-10-25"},"tt":{"@date":"1985-10-26"},"timeline":"original"}}
+{"type":"edge","id":"e17","from":"george","to":"hillvalley","labels":["STATUS"],"properties":{"value":"Confident; published science-fiction author","vf":{"@date":"1985-10-26"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"1985-10-26"},"tt":{"@date":"2099-12-31"},"timeline":"restored"}}
+{"type":"edge","id":"e18","from":"marty","to":"lyonestates","labels":["FAMILY_STATUS"],"properties":{"value":"Struggling; family dejected","vf":{"@date":"1985-10-26"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"1985-10-25"},"tt":{"@date":"1985-10-26"},"timeline":"original"}}
+{"type":"edge","id":"e19","from":"marty","to":"lyonestates","labels":["FAMILY_STATUS"],"properties":{"value":"Prosperous; a new 4x4 in the driveway","vf":{"@date":"1985-10-26"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"1985-10-26"},"tt":{"@date":"2099-12-31"},"timeline":"restored"}}
+{"type":"edge","id":"e20","from":"doc","to":"mall","labels":["FATE"],"properties":{"value":"Shot dead by Libyan terrorists","vf":{"@date":"1985-10-26"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"1985-10-25"},"tt":{"@date":"1985-10-26"},"timeline":"original"}}
+{"type":"edge","id":"e21","from":"doc","to":"mall","labels":["FATE"],"properties":{"value":"Survives — tipped off, he wore a bulletproof vest","vf":{"@date":"1985-10-26"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"1985-10-26"},"tt":{"@date":"2099-12-31"},"timeline":"restored"}}
+{"type":"edge","id":"e22","from":"biff","to":"george","labels":["STATUS"],"properties":{"value":"George McFly's supervisor and lifelong bully","vf":{"@date":"1985-10-26"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"1985-10-25"},"tt":{"@date":"1985-10-26"},"timeline":"original"}}
+{"type":"edge","id":"e23","from":"biff","to":"george","labels":["STATUS"],"properties":{"value":"Meek auto-detailer who waxes the McFlys car","vf":{"@date":"1985-10-26"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"1985-10-26"},"tt":{"@date":"2015-10-27"},"timeline":"restored"}}
+{"type":"edge","id":"e24","from":"biff","to":"george","labels":["STATUS"],"properties":{"value":"Billionaire casino tycoon; corrupt and untouchable","vf":{"@date":"1985-10-26"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"2015-10-27"},"tt":{"@date":"2015-11-16"},"timeline":"biff-hell"}}
+{"type":"edge","id":"e25","from":"biff","to":"george","labels":["STATUS"],"properties":{"value":"Meek auto-detailer who waxes the McFlys car","vf":{"@date":"1985-10-26"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"2015-11-16"},"tt":{"@date":"2099-12-31"},"timeline":"restored-again"}}
+{"type":"edge","id":"e26","from":"biff","to":"lorraine","labels":["MARRIED_TO"],"properties":{"value":"married her after George was killed","vf":{"@date":"1985-10-26"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"2015-10-27"},"tt":{"@date":"2015-11-16"},"timeline":"biff-hell"}}
+{"type":"edge","id":"e27","from":"george","to":"hillvalley","labels":["FATE"],"properties":{"value":"Murdered in 1973","vf":{"@date":"1973-03-15"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"2015-10-27"},"tt":{"@date":"2015-11-16"},"timeline":"biff-hell"}}
+{"type":"edge","id":"e28","from":"biff","to":"hillvalley","labels":["OWNS"],"properties":{"value":"Biff Tannen's Pleasure Paradise Casino","vf":{"@date":"1979-01-01"},"vt":{"@date":"2099-12-31"},"tf":{"@date":"2015-10-27"},"tt":{"@date":"2015-11-16"},"timeline":"biff-hell"}}
