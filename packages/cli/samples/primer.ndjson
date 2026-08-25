@@ -1,0 +1,30 @@
+{"type":"node","id":"aaron","labels":["Person"],"properties":{"name":"Aaron"}}
+{"type":"node","id":"abe","labels":["Person"],"properties":{"name":"Abe"}}
+{"type":"node","id":"rachel","labels":["Person"],"properties":{"name":"Rachel"}}
+{"type":"node","id":"granger","labels":["Person"],"properties":{"name":"Robert Granger"}}
+{"type":"node","id":"platt","labels":["Person"],"properties":{"name":"Will Platt"}}
+{"type":"node","id":"box","labels":["Object"],"properties":{"name":"the box (time machine)"}}
+{"type":"node","id":"failsafe","labels":["Object"],"properties":{"name":"the failsafe box"}}
+{"type":"node","id":"tape","labels":["Object"],"properties":{"name":"Aaron's recording of the day"}}
+{"type":"node","id":"storage","labels":["Place"],"properties":{"name":"the storage facility"}}
+{"type":"node","id":"party","labels":["Place"],"properties":{"name":"the party"}}
+{"type":"edge","id":"e1","from":"aaron","to":"abe","labels":["PARTNER_OF"],"properties":{"vf":{"@date":"2004-05-15"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e2","from":"abe","to":"rachel","labels":["DATES"],"properties":{"vf":{"@date":"2004-05-15"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e3","from":"platt","to":"rachel","labels":["EX_OF"],"properties":{"vf":{"@date":"2004-05-15"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e4","from":"granger","to":"rachel","labels":["FATHER_OF"],"properties":{"vf":{"@date":"2004-05-15"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e5","from":"aaron","to":"box","labels":["BUILT"],"properties":{"vf":{"@date":"2004-05-15"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e6","from":"abe","to":"box","labels":["BUILT"],"properties":{"vf":{"@date":"2004-05-15"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e7","from":"aaron","to":"failsafe","labels":["HID"],"properties":{"vf":{"@date":"2004-05-15"},"vt":{"@date":"2099-12-31"},"note":"a secret second box Abe does not know about"}}
+{"type":"edge","id":"e8","from":"aaron","to":"tape","labels":["RECORDED"],"properties":{"vf":{"@date":"2004-05-15"},"vt":{"@date":"2099-12-31"}}}
+{"type":"edge","id":"e9","from":"platt","to":"party","labels":["INCIDENT"],"properties":{"value":"Pulls a shotgun; a guest is shot","vf":{"@date":"2004-05-15"},"vt":{"@date":"2004-05-16"},"tf":{"@date":"2004-05-15"},"tt":{"@date":"2004-05-16"},"iteration":"take-0"}}
+{"type":"edge","id":"e10","from":"platt","to":"party","labels":["INCIDENT"],"properties":{"value":"Aaron tackles him; the gun fires into the ceiling","vf":{"@date":"2004-05-15"},"vt":{"@date":"2004-05-16"},"tf":{"@date":"2004-05-16"},"tt":{"@date":"2004-05-17"},"iteration":"take-1"}}
+{"type":"edge","id":"e11","from":"platt","to":"party","labels":["INCIDENT"],"properties":{"value":"Disarmed cleanly before he can draw","vf":{"@date":"2004-05-15"},"vt":{"@date":"2004-05-16"},"tf":{"@date":"2004-05-17"},"tt":{"@date":"2099-12-31"},"iteration":"take-2"}}
+{"type":"edge","id":"e12","from":"aaron","to":"party","labels":["ROLE"],"properties":{"value":"Caught by surprise, like everyone","vf":{"@date":"2004-05-15"},"vt":{"@date":"2004-05-16"},"tf":{"@date":"2004-05-15"},"tt":{"@date":"2004-05-16"},"iteration":"take-0"}}
+{"type":"edge","id":"e13","from":"aaron","to":"party","labels":["ROLE"],"properties":{"value":"Acts on a hazy memory; improvises","vf":{"@date":"2004-05-15"},"vt":{"@date":"2004-05-16"},"tf":{"@date":"2004-05-16"},"tt":{"@date":"2004-05-17"},"iteration":"take-1"}}
+{"type":"edge","id":"e14","from":"aaron","to":"party","labels":["ROLE"],"properties":{"value":"Executes a memorized script from the tape","vf":{"@date":"2004-05-15"},"vt":{"@date":"2004-05-16"},"tf":{"@date":"2004-05-17"},"tt":{"@date":"2099-12-31"},"iteration":"take-2"}}
+{"type":"edge","id":"e15","from":"aaron","to":"storage","labels":["DOUBLES"],"properties":{"value":"One Aaron — the original day","vf":{"@date":"2004-05-15"},"vt":{"@date":"2004-05-16"},"tf":{"@date":"2004-05-15"},"tt":{"@date":"2004-05-16"},"iteration":"take-0","count":1}}
+{"type":"edge","id":"e16","from":"aaron","to":"storage","labels":["DOUBLES"],"properties":{"value":"Two Aarons — original plus the traveler","vf":{"@date":"2004-05-15"},"vt":{"@date":"2004-05-16"},"tf":{"@date":"2004-05-16"},"tt":{"@date":"2004-05-17"},"iteration":"take-1","count":2}}
+{"type":"edge","id":"e17","from":"aaron","to":"storage","labels":["DOUBLES"],"properties":{"value":"Three Aarons — a failsafe loop nested inside","vf":{"@date":"2004-05-15"},"vt":{"@date":"2004-05-16"},"tf":{"@date":"2004-05-17"},"tt":{"@date":"2099-12-31"},"iteration":"take-2","count":3}}
+{"type":"edge","id":"e18","from":"abe","to":"box","labels":["BELIEVES"],"properties":{"value":"Aaron and I are in sync; no one went back further","vf":{"@date":"2004-05-15"},"vt":{"@date":"2004-05-16"},"tf":{"@date":"2004-05-15"},"tt":{"@date":"2004-05-17"},"iteration":"abe-thinks"}}
+{"type":"edge","id":"e19","from":"abe","to":"box","labels":["BELIEVES"],"properties":{"value":"Aaron used a hidden failsafe to get ahead of me","vf":{"@date":"2004-05-15"},"vt":{"@date":"2004-05-16"},"tf":{"@date":"2004-05-17"},"tt":{"@date":"2099-12-31"},"iteration":"revealed"}}
+{"type":"edge","id":"e20","from":"granger","to":"storage","labels":["FATE"],"properties":{"value":"Follows Abe into the box; later found comatose","vf":{"@date":"2004-05-15"},"vt":{"@date":"2004-05-16"},"tf":{"@date":"2004-05-16"},"tt":{"@date":"2099-12-31"},"iteration":"take-1+"}}

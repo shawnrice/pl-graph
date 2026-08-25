@@ -28,6 +28,12 @@ export const SAMPLES: readonly Sample[] = [
       'Back to the Future — Hill Valley across rewritten timelines. Facts carry BOTH valid time (vf/vt, when true in-story) and transaction time (tf/tt, which version of history recorded it), so a time-travel edit is a bitemporal correction. Ask what was true in 1985 "as of" the original vs the restored timeline.',
     file: 'hillvalley.ndjson',
   },
+  {
+    name: 'primer',
+    description:
+      'Primer — one day, lived over and over. The densest bitemporal graph: a single valid-time evening re-recorded each loop (transaction time), so the same instant reads differently "as of" take 0, 1, 2 — and the count of Aaron\'s doubles grows 1 → 2 → 3 with the recursion.',
+    file: 'primer.ndjson',
+  },
 ];
 
 // samples/ ships beside the built code. From dist/esm/*.mjs it is ../../samples;

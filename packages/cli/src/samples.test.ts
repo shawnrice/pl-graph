@@ -7,7 +7,7 @@ const backend = await openBackend();
 
 describe('samples', () => {
   test('the registry lists the bundled samples', () => {
-    expect(SAMPLES.map((s) => s.name)).toEqual(['modern', 'dunder', 'hillvalley']);
+    expect(SAMPLES.map((s) => s.name)).toEqual(['modern', 'dunder', 'hillvalley', 'primer']);
   });
 
   test('findSample resolves by name, else undefined', () => {
@@ -89,6 +89,38 @@ describe('samples', () => {
 
     expect(georgeFateAsOf('2015-11-01')).toEqual(['Murdered in 1973']);
     expect(georgeFateAsOf('2020-01-01')).toEqual([]); // erased when history was restored
+    g.free();
+  });
+
+  test('primer: one evening, the record grows denser each loop (bitemporal)', () => {
+    const g = loadSample(backend, findSample('primer')!);
+
+    // The count of Aaron's doubles on the party evening (fixed valid time) grows as
+    // of each successive iteration (transaction time) — 1 → 2 → 3.
+    const doublesAsOf = (rec: string) =>
+      (
+        g.query(
+          `MATCH (a:Person {name:'Aaron'})-[d:DOUBLES]->()
+           WHERE d.vf <= date('2004-05-15') AND d.vt > date('2004-05-15')
+             AND d.tf <= date('${rec}') AND d.tt > date('${rec}')
+           RETURN d.count AS n`,
+        ) as { n: number }[]
+      ).map((r) => r.n);
+
+    expect(doublesAsOf('2004-05-15')).toEqual([1]);
+    expect(doublesAsOf('2004-05-16')).toEqual([2]);
+    expect(doublesAsOf('2004-05-17')).toEqual([3]);
+
+    // Granger's fate enters the record only from the second iteration onward.
+    const grangerAsOf = (rec: string) =>
+      g.query(
+        `MATCH (gr:Person {name:'Robert Granger'})-[f:FATE]->()
+         WHERE f.tf <= date('${rec}') AND f.tt > date('${rec}')
+         RETURN f.value AS fate`,
+      ) as { fate: string }[];
+
+    expect(grangerAsOf('2004-05-15')).toEqual([]); // not yet in any record
+    expect(grangerAsOf('2004-05-16').length).toBe(1);
     g.free();
   });
 });
