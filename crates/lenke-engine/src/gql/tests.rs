@@ -5303,3 +5303,118 @@ fn insert_return_multi_label_ampersand() {
     let by_person = super::parse("MATCH (n:Person {name: 'root'}) RETURN n.name").unwrap();
     assert_eq!(bag(&run(&by_person, &st)), bag(&run(&by_admin, &st)));
 }
+
+// --- intermediate-frontier guard ------------------------------------------------
+// The `intermediate` frontier ceiling is a native-only anti-runaway bound (the lazy
+// pure-TS engine has no materialized frontier, so it ignores it). It must be ENFORCED:
+// a multi-segment MATCH whose interim frontier exceeds the limit trips a catchable
+// `E_RESOURCE_EXHAUSTED`, not an allocator abort. On the 32-bit wasm build (the CLI) an
+// unbounded such allocation aborts the whole module and kills the REPL; enforcing the
+// declared ceiling turns it into an error the host can report. Being an anti-runaway
+// bound, a query UNDER the limit returns exactly what an unbounded run would.
+
+/// A complete bipartite `A -> B` (`k*k` edges): one Expand materializes a `k*k`-row
+/// frontier — the knob under test, in miniature.
+fn guard_bipartite(k: usize) -> Store {
+    let mut b = Builder::default();
+    let a: Vec<_> = (0..k)
+        .map(|i| b.node(&["A"], &[("i", n(i as f64))]))
+        .collect();
+    let bs: Vec<_> = (0..k)
+        .map(|i| b.node(&["B"], &[("j", n(i as f64))]))
+        .collect();
+    for &x in &a {
+        for &y in &bs {
+            b.edge(x, y, "R");
+        }
+    }
+    b.build()
+}
+
+/// A hub `A0 -> {B} -> {C}` whose SINGLE source explodes across a two-hop body — the
+/// shape that overruns one block of the streaming `LIMIT` path.
+fn guard_hub(b_count: usize, c_per_b: usize) -> Store {
+    let mut b = Builder::default();
+    let a = b.node(&["A"], &[("i", n(0.0))]);
+    let bs: Vec<_> = (0..b_count)
+        .map(|i| b.node(&["B"], &[("j", n(i as f64))]))
+        .collect();
+    for &y in &bs {
+        b.edge(a, y, "R");
+        for k in 0..c_per_b {
+            let c = b.node(&["C"], &[("k", n(k as f64))]);
+            b.edge(y, c, "R2");
+        }
+    }
+    b.build()
+}
+
+fn guard_try(store: &Store, q: &str) -> Result<Rows, String> {
+    crate::exec::try_run(&super::parse(q).unwrap(), store)
+}
+
+#[test]
+fn intermediate_guard_trips_over_the_limit() {
+    let mut st = guard_bipartite(40); // a 1600-row single-hop frontier
+    st.set_limit(crate::store::ConfigId::LimitsIntermediate, 500);
+    let err = guard_try(&st, "MATCH (a:A)-[:R]->(b:B) RETURN a.i").unwrap_err();
+    assert!(err.contains("E_RESOURCE_EXHAUSTED"), "got: {err}");
+    assert!(
+        err.contains("1600"),
+        "reports the actual frontier size: {err}"
+    );
+}
+
+#[test]
+fn intermediate_guard_passes_under_the_limit() {
+    let st = guard_bipartite(40); // default 50M >> 1600
+    let rows = run(
+        &super::parse("MATCH (a:A)-[:R]->(b:B) RETURN a.i").unwrap(),
+        &st,
+    );
+    assert_eq!(rows.rows.len(), 1600);
+}
+
+/// The guard watches the FRONTIER, not the result: a query whose WHERE prunes the
+/// 1600-row interim down to a single row still trips, because the allocation that would
+/// OOM the wasm module happens before the filter runs. (The former-teammates shape: a
+/// huge cross-product, a tiny answer.)
+#[test]
+fn intermediate_guard_sees_the_frontier_not_the_result() {
+    let mut st = guard_bipartite(40);
+    st.set_limit(crate::store::ConfigId::LimitsIntermediate, 500);
+    let err = guard_try(
+        &st,
+        "MATCH (a:A)-[:R]->(b:B) WHERE a.i = 0 AND b.j = 0 RETURN a.i",
+    )
+    .unwrap_err();
+    assert!(err.contains("E_RESOURCE_EXHAUSTED"), "got: {err}");
+}
+
+#[test]
+fn intermediate_guard_limit_is_configurable() {
+    let q = "MATCH (a:A)-[:R]->(b:B) RETURN a.i"; // 1600-row frontier
+    let mut st = guard_bipartite(40);
+    st.set_limit(crate::store::ConfigId::LimitsIntermediate, 2_000);
+    assert!(guard_try(&st, q).is_ok(), "2000 > 1600 admits the query");
+    st.set_limit(crate::store::ConfigId::LimitsIntermediate, 1_000);
+    assert!(guard_try(&st, q).is_err(), "1000 < 1600 trips the guard");
+}
+
+/// The streaming keyless-`LIMIT` path (`pull_capped_stream` -> `pull_body`) is guarded
+/// too: one source whose two-hop body explodes within a single block trips before the
+/// block completes, even though `LIMIT 1` keeps only one row.
+#[test]
+fn intermediate_guard_covers_the_streaming_path() {
+    let mut st = guard_hub(50, 50); // A0 -> 50 B -> 2500 (b,c) rows for the one source
+    st.set_limit(crate::store::ConfigId::LimitsIntermediate, 500);
+    let err = guard_try(
+        &st,
+        "MATCH (a:A)-[:R]->(b:B)-[:R2]->(c:C) RETURN a.i LIMIT 1",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("E_RESOURCE_EXHAUSTED"),
+        "streaming path guarded: {err}"
+    );
+}

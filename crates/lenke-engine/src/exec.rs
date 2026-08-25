@@ -935,15 +935,18 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             edge_label,
             bind_edge,
             double_loops,
-        } => expand(
-            &pull(input, store, track)?,
+        } => guard_intermediate(
+            expand(
+                &pull(input, store, track)?,
+                store,
+                *from,
+                *dir,
+                edge_label,
+                *bind_edge,
+                *double_loops,
+            ),
             store,
-            *from,
-            *dir,
-            edge_label,
-            *bind_edge,
-            *double_loops,
-        ),
+        )?,
         Plan::OptionalExpand {
             input,
             from,
@@ -2021,6 +2024,31 @@ fn join_key(batch: &Batch, slots: impl Iterator<Item = usize>, row: usize) -> Ve
         value::group_key_into(&batch.slot(s).value_at(row), &mut k);
     }
     k
+}
+
+/// Anti-runaway guard on a materialized frontier. A multi-segment fixed-length MATCH
+/// (or a hash join) can fan out to a graph-wide product that only the trailing
+/// WHERE/LIMIT prunes back down; the interim batch is what a later `read_property` or
+/// gather must allocate, and on the 32-bit wasm build that allocation aborts the whole
+/// module (`rust_oom`) instead of failing cleanly. Trip `E_RESOURCE_EXHAUSTED` at the
+/// declared `intermediate` ceiling so the failure is a catchable error, identical on
+/// every target (row count is the portable unit — column data is fixed-width u32/f64/i64
+/// on both 32- and 64-bit), rather than an OOM the CLI cannot survive.
+fn guard_intermediate(batch: Batch, store: &Store) -> Result<Batch, String> {
+    let cap = store.limits().intermediate;
+    let rows = batch.rows() as u64;
+    if std::env::var_os("LENKE_DEBUG_FRONTIER").is_some() {
+        eprintln!("frontier: {rows} rows (cap {cap})");
+    }
+    if rows > cap {
+        return Err(format!(
+            "E_RESOURCE_EXHAUSTED: an intermediate frontier of {rows} rows exceeded the limit \
+             of {cap}. A multi-segment pattern is materializing a large cross-product before it \
+             is filtered — add a more selective anchor, reorder the pattern so the selective hop \
+             comes first, or raise the intermediate limit."
+        ));
+    }
+    Ok(batch)
 }
 
 fn hash_join(lb: &Batch, rb: &Batch, on: &[(usize, usize)]) -> Batch {
@@ -3993,15 +4021,18 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             edge_label,
             bind_edge,
             double_loops,
-        } => expand(
-            &pull_body(input, store, seed)?,
+        } => guard_intermediate(
+            expand(
+                &pull_body(input, store, seed)?,
+                store,
+                *from,
+                *dir,
+                edge_label,
+                *bind_edge,
+                *double_loops,
+            ),
             store,
-            *from,
-            *dir,
-            edge_label,
-            *bind_edge,
-            *double_loops,
-        ),
+        )?,
         // Edge frontier → endpoint vertex (`inV`/`outV`/`otherV` off a bound edge) —
         // the streamable twin of the main EdgeVertex arm; appends the endpoint slot
         // (Both fans out to two rows). Lineage-free (streaming is `!track`).
