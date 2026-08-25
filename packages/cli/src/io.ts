@@ -5,6 +5,17 @@ import { graphFromFormat, graphFromNdjson, type RustGraph } from '@lenke/native'
 // The backend type, taken from the loader so we needn't import it by name.
 export type Backend = Parameters<typeof graphFromNdjson>[0];
 
+// The CLI runs the wasm engine, whose 32-bit linear memory (~2 GB) cannot hold the
+// multi-hundred-million-row intermediate a wide multi-segment MATCH can materialize
+// before its WHERE/LIMIT prunes it — an allocation the native engine (64-bit, no such
+// ceiling) survives. Left unbounded, that allocation aborts the whole wasm module,
+// killing the REPL. Cap the intermediate frontier low enough to fit, so the engine
+// trips a catchable `E_RESOURCE_EXHAUSTED` the shell can report instead. (The default
+// is 50M; this is not a semantics change — `intermediate` is an anti-runaway bound,
+// so a query under it behaves identically. Raise it with a bigger native build.)
+const WASM_INTERMEDIATE_CAP = 10_000_000;
+const CLI_LIMITS = { limits: { intermediate: WASM_INTERMEDIATE_CAP } } as const;
+
 export const FORMATS = ['ndjson', 'csv', 'graphson', 'pg-json', 'pg-text'] as const;
 export type Format = (typeof FORMATS)[number];
 
@@ -45,12 +56,12 @@ export const formatFor = (file: string, override?: string): Format => {
 };
 
 export const emptyGraph = (backend: Backend): RustGraph =>
-  graphFromNdjson(backend, new Uint8Array());
+  graphFromNdjson(backend, new Uint8Array(), CLI_LIMITS);
 
 export const loadGraph = (backend: Backend, bytes: Uint8Array, format: Format): RustGraph =>
   format === 'ndjson'
-    ? graphFromNdjson(backend, bytes)
-    : graphFromFormat(backend, bytes, { format });
+    ? graphFromNdjson(backend, bytes, CLI_LIMITS)
+    : graphFromFormat(backend, bytes, { format, ...CLI_LIMITS });
 
 export const saveGraph = (graph: RustGraph, format: Format): Uint8Array =>
   format === 'ndjson' ? graph.toNdjson() : new TextEncoder().encode(graph.serialize(format));
