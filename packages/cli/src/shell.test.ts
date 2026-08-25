@@ -2,7 +2,16 @@ import { describe, expect, test } from 'bun:test';
 
 import { openBackend } from './engine.js';
 import { emptyGraph } from './io.js';
-import { isBalanced, makeState, runMeta, runStatement, type State } from './shell.js';
+import {
+  awaitingClause,
+  endsWithTerminator,
+  isBalanced,
+  makeState,
+  runMeta,
+  runStatement,
+  stripTerminator,
+  type State,
+} from './shell.js';
 
 const backend = await openBackend();
 
@@ -24,6 +33,41 @@ describe('isBalanced', () => {
   test('an open bracket or quote is incomplete', () => {
     expect(isBalanced('MATCH (p:Person')).toBe(false);
     expect(isBalanced("RETURN 'unterminated")).toBe(false);
+  });
+});
+
+describe('multi-line input', () => {
+  test('a GQL query that has opened but not reached RETURN keeps reading', () => {
+    // brackets balance the instant the pattern closes — but the query is not done
+    expect(awaitingClause('MATCH (p:Person {name: \'x\'})-[:R]->(q)', 'gql')).toBe(true);
+    expect(awaitingClause('MATCH (p:Person)\nWHERE p.age > 30', 'gql')).toBe(true);
+  });
+
+  test('a GQL query with an ending clause is complete', () => {
+    expect(awaitingClause('MATCH (p:Person) RETURN p', 'gql')).toBe(false);
+    expect(awaitingClause('MATCH (p:Person) SET p.seen = true', 'gql')).toBe(false);
+    expect(awaitingClause('INSERT (n:Person {name: \'x\'})', 'gql')).toBe(false);
+    expect(awaitingClause('CALL pagerank() YIELD node RETURN node', 'gql')).toBe(false);
+  });
+
+  test('a clause keyword inside a string does not count as complete', () => {
+    expect(awaitingClause("MATCH (n {note: 'please return soon'})", 'gql')).toBe(true);
+  });
+
+  test('Gremlin and JS never wait on a clause (balance decides)', () => {
+    expect(awaitingClause('g.V().hasLabel(\'Person\')', 'gremlin')).toBe(false);
+    expect(awaitingClause('_.map(r => r.name)', 'js')).toBe(false);
+  });
+});
+
+describe('trailing semicolon', () => {
+  test('a trailing ; is detected and stripped', () => {
+    expect(endsWithTerminator('MATCH (n) RETURN n;')).toBe(true);
+    expect(endsWithTerminator('MATCH (n) RETURN n ; ')).toBe(true);
+    expect(endsWithTerminator('MATCH (n) RETURN n')).toBe(false);
+    expect(stripTerminator('MATCH (n) RETURN n;')).toBe('MATCH (n) RETURN n');
+    expect(stripTerminator('MATCH (n) RETURN n ;  ')).toBe('MATCH (n) RETURN n');
+    expect(stripTerminator('MATCH (n) RETURN n')).toBe('MATCH (n) RETURN n');
   });
 });
 

@@ -166,7 +166,34 @@ export const isBalanced = (text: string): boolean => {
   }
 
   return depth <= 0 && quote === '';
+}
+
+// Blank out quoted spans so keyword sniffing never fires on a string literal.
+const withoutStrings = (s: string): string =>
+  s.replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`\\]|\\.)*`/g, "''");
+
+const OPENS_QUERY = /^\s*(match|optional|with|let|unwind)\b/i;
+const CLOSES_QUERY = /\b(return|finish|insert|set|remove|merge|delete|detach|call|create|drop)\b/i;
+
+// A GQL read-query opens with MATCH/WITH/… and only completes at a clause that can end
+// it (RETURN, or a write verb). Brackets balance the moment `MATCH (a)-[:R]->(b)` closes
+// — long before RETURN — so balance alone would run a half-written query. In GQL mode,
+// treat "opened but no ending clause yet" as still-being-typed, so a query authored
+// across lines keeps reading (like psql) instead of executing prematurely.
+export const awaitingClause = (buffer: string, mode: Mode): boolean => {
+  if (mode !== 'gql') {
+    return false;
+  }
+
+  const s = withoutStrings(buffer);
+
+  return OPENS_QUERY.test(s) && !CLOSES_QUERY.test(s);
 };
+
+// A trailing `;` is an explicit "run it now" (psql muscle memory), stripped before the
+// statement reaches the engine — which has no use for the terminator.
+export const endsWithTerminator = (line: string): boolean => /;\s*$/.test(line);
+export const stripTerminator = (stmt: string): string => stmt.replace(/;\s*$/, '').trimEnd();;
 
 const HISTORY_FILE = path.join(homedir(), '.lenke_history');
 
@@ -506,14 +533,23 @@ export const runShell = async (ctx: ShellContext): Promise<void> => {
 
     buffer = buffer ? `${buffer}\n${piece}` : piece;
 
-    if (cont || (trimmed !== '' && !isBalanced(buffer))) {
+    // A trailing `;` forces execution now; otherwise keep reading while the line
+    // continues (trailing `\`), brackets are open, or a GQL query has opened but not
+    // yet reached a clause that ends it.
+    const forced = endsWithTerminator(piece);
+
+    if (
+      !forced &&
+      (cont ||
+        (trimmed !== '' && (!isBalanced(buffer) || awaitingClause(buffer, state.mode))))
+    ) {
       setPrompt();
       rl.prompt();
 
       return;
     }
 
-    const stmt = buffer.trim();
+    const stmt = stripTerminator(buffer.trim());
 
     buffer = '';
 
