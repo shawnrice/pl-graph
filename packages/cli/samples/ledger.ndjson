@@ -1,10 +1,10 @@
-{"type":"node","id":"cash","labels":["Account"],"properties":{"name":"Cash","type":"Asset"}}
-{"type":"node","id":"ar","labels":["Account"],"properties":{"name":"Accounts Receivable","type":"Asset"}}
-{"type":"node","id":"equity","labels":["Account"],"properties":{"name":"Owner's Equity","type":"Equity"}}
-{"type":"node","id":"revenue","labels":["Account"],"properties":{"name":"Service Revenue","type":"Revenue"}}
-{"type":"node","id":"rent","labels":["Account"],"properties":{"name":"Rent Expense","type":"Expense"}}
-{"type":"node","id":"payroll","labels":["Account"],"properties":{"name":"Wages Expense","type":"Expense"}}
-{"type":"node","id":"supplies","labels":["Account"],"properties":{"name":"Supplies Expense","type":"Expense"}}
+{"type":"node","id":"cash","labels":["Account"],"properties":{"code":"1000","name":"Cash","type":"Asset"}}
+{"type":"node","id":"ar","labels":["Account"],"properties":{"code":"1100","name":"Accounts Receivable","type":"Asset"}}
+{"type":"node","id":"equity","labels":["Account"],"properties":{"code":"3000","name":"Owner's Equity","type":"Equity"}}
+{"type":"node","id":"revenue","labels":["Account"],"properties":{"code":"4000","name":"Service Revenue","type":"Revenue"}}
+{"type":"node","id":"rent","labels":["Account"],"properties":{"code":"5000","name":"Rent Expense","type":"Expense"}}
+{"type":"node","id":"payroll","labels":["Account"],"properties":{"code":"5100","name":"Wages Expense","type":"Expense"}}
+{"type":"node","id":"supplies","labels":["Account"],"properties":{"code":"5200","name":"Supplies Expense","type":"Expense"}}
 {"type":"edge","id":"p1","from":"equity","to":"cash","labels":["POSTING"],"properties":{"amount":50000,"effective":{"@date":"2025-01-01"},"booked":{"@date":"2025-01-01"},"memo":"Owner investment"}}
 {"type":"edge","id":"p2","from":"cash","to":"rent","labels":["POSTING"],"properties":{"amount":2000,"effective":{"@date":"2025-01-01"},"booked":{"@date":"2025-01-03"},"memo":"January rent"}}
 {"type":"edge","id":"p3","from":"cash","to":"supplies","labels":["POSTING"],"properties":{"amount":800,"effective":{"@date":"2025-01-05"},"booked":{"@date":"2025-01-05"},"memo":"Office supplies"}}
