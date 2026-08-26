@@ -1,0 +1,20 @@
+{"type":"node","id":"cash","labels":["Account"],"properties":{"name":"Cash","type":"Asset"}}
+{"type":"node","id":"ar","labels":["Account"],"properties":{"name":"Accounts Receivable","type":"Asset"}}
+{"type":"node","id":"equity","labels":["Account"],"properties":{"name":"Owner's Equity","type":"Equity"}}
+{"type":"node","id":"revenue","labels":["Account"],"properties":{"name":"Service Revenue","type":"Revenue"}}
+{"type":"node","id":"rent","labels":["Account"],"properties":{"name":"Rent Expense","type":"Expense"}}
+{"type":"node","id":"payroll","labels":["Account"],"properties":{"name":"Wages Expense","type":"Expense"}}
+{"type":"node","id":"supplies","labels":["Account"],"properties":{"name":"Supplies Expense","type":"Expense"}}
+{"type":"edge","id":"p1","from":"equity","to":"cash","labels":["POSTING"],"properties":{"amount":50000,"effective":{"@date":"2025-01-01"},"booked":{"@date":"2025-01-01"},"memo":"Owner investment"}}
+{"type":"edge","id":"p2","from":"cash","to":"rent","labels":["POSTING"],"properties":{"amount":2000,"effective":{"@date":"2025-01-01"},"booked":{"@date":"2025-01-03"},"memo":"January rent"}}
+{"type":"edge","id":"p3","from":"cash","to":"supplies","labels":["POSTING"],"properties":{"amount":800,"effective":{"@date":"2025-01-05"},"booked":{"@date":"2025-01-05"},"memo":"Office supplies"}}
+{"type":"edge","id":"p4","from":"revenue","to":"ar","labels":["POSTING"],"properties":{"amount":12000,"effective":{"@date":"2025-01-15"},"booked":{"@date":"2025-01-15"},"memo":"Invoice #1001 (Acme)"}}
+{"type":"edge","id":"p5","from":"cash","to":"payroll","labels":["POSTING"],"properties":{"amount":6000,"effective":{"@date":"2025-01-31"},"booked":{"@date":"2025-01-31"},"memo":"January payroll"}}
+{"type":"edge","id":"p6","from":"ar","to":"cash","labels":["POSTING"],"properties":{"amount":12000,"effective":{"@date":"2025-02-05"},"booked":{"@date":"2025-02-05"},"memo":"Acme pays #1001"}}
+{"type":"edge","id":"p7","from":"cash","to":"rent","labels":["POSTING"],"properties":{"amount":2000,"effective":{"@date":"2025-02-01"},"booked":{"@date":"2025-02-03"},"memo":"February rent"}}
+{"type":"edge","id":"p8","from":"cash","to":"rent","labels":["POSTING"],"properties":{"amount":500,"effective":{"@date":"2025-01-01"},"booked":{"@date":"2025-02-10"},"memo":"Correction: January rent underbooked $500"}}
+{"type":"edge","id":"p9","from":"revenue","to":"ar","labels":["POSTING"],"properties":{"amount":8000,"effective":{"@date":"2025-02-20"},"booked":{"@date":"2025-02-20"},"memo":"Invoice #1002 (Globex)"}}
+{"type":"edge","id":"p10","from":"cash","to":"payroll","labels":["POSTING"],"properties":{"amount":6000,"effective":{"@date":"2025-02-28"},"booked":{"@date":"2025-02-28"},"memo":"February payroll"}}
+{"type":"edge","id":"p11","from":"cash","to":"rent","labels":["POSTING"],"properties":{"amount":2000,"effective":{"@date":"2025-03-01"},"booked":{"@date":"2025-03-03"},"memo":"March rent"}}
+{"type":"edge","id":"p12","from":"revenue","to":"ar","labels":["POSTING"],"properties":{"amount":5000,"effective":{"@date":"2025-03-28"},"booked":{"@date":"2025-04-05"},"memo":"Late invoice #1003 (delivered Mar 28)"}}
+{"type":"edge","id":"p13","from":"cash","to":"payroll","labels":["POSTING"],"properties":{"amount":6000,"effective":{"@date":"2025-03-31"},"booked":{"@date":"2025-03-31"},"memo":"March payroll"}}

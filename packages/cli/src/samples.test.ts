@@ -7,7 +7,13 @@ const backend = await openBackend();
 
 describe('samples', () => {
   test('the registry lists the bundled samples', () => {
-    expect(SAMPLES.map((s) => s.name)).toEqual(['modern', 'dunder', 'hillvalley', 'primer']);
+    expect(SAMPLES.map((s) => s.name)).toEqual([
+      'modern',
+      'dunder',
+      'ledger',
+      'hillvalley',
+      'primer',
+    ]);
   });
 
   test('findSample resolves by name, else undefined', () => {
@@ -54,6 +60,55 @@ describe('samples', () => {
 
     expect(vpEndAsRecorded('2008-06-01')).toEqual(['2099-12-31']);
     expect(vpEndAsRecorded('2009-06-01')).toEqual(['2008-11-01']);
+    g.free();
+  });
+
+  test('ledger: the restatement and the append-only correction (bitemporal)', () => {
+    const g = loadSample(backend, findSample('ledger')!);
+
+    // Q1 revenue (effective in Q1) as the books were closed on Apr 1 vs as they stand
+    // now — a late invoice, effective Mar 28 but booked Apr 5, is the whole difference.
+    const total = (rows: readonly Record<string, unknown>[]): number => Number(rows[0].total);
+    const q1Revenue = (bookedBy?: string) =>
+      total(
+        g.query(
+          `MATCH (:Account {name:'Service Revenue'})-[p:POSTING]->(:Account)
+           WHERE p.effective <= date('2025-03-31')
+             ${bookedBy ? `AND p.booked <= date('${bookedBy}')` : ''}
+           RETURN sum(p.amount) AS total`,
+        ),
+      );
+
+    expect(q1Revenue('2025-04-01')).toBe(20000); // as reported at quarter close
+    expect(q1Revenue()).toBe(25000); // as it stands now
+
+    // The January-rent correction is a NEW posting, not an edit: the effective-dated
+    // truth is $2,500, but the books on Jan 31 still showed $2,000.
+    const janRent = (bookedBy?: string) =>
+      total(
+        g.query(
+          `MATCH (:Account)-[p:POSTING]->(:Account {name:'Rent Expense'})
+           WHERE p.effective <= date('2025-01-31')
+             ${bookedBy ? `AND p.booked <= date('${bookedBy}')` : ''}
+           RETURN sum(p.amount) AS total`,
+        ),
+      );
+
+    expect(janRent()).toBe(2500); // the effective-dated truth
+    expect(janRent('2025-01-31')).toBe(2000); // what the books showed at month end
+
+    // Double-entry invariant: the whole ledger nets to zero.
+    const zero = Number(
+      g.query(
+        `MATCH (a:Account)
+         CALL (a) { MATCH (a)<-[p:POSTING]-() RETURN sum(p.amount) AS d }
+         CALL (a) { MATCH (a)-[p:POSTING]->() RETURN sum(p.amount) AS c }
+         WITH a, d - c AS bal
+         RETURN sum(bal) AS z`,
+      )[0].z,
+    );
+
+    expect(zero).toBe(0);
     g.free();
   });
 

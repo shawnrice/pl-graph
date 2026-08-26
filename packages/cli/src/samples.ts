@@ -23,6 +23,12 @@ export const SAMPLES: readonly Sample[] = [
     file: 'dunder.ndjson',
   },
   {
+    name: 'ledger',
+    description:
+      "A small business's Q1 general ledger — an append-only book of record, on a graph that forgets everything when you close it. Valid time = a posting's effective date, transaction time = when it was booked; corrections are new postings, never edits. Ask for Q1 revenue as reported on Apr 1 ($20k) vs as it stands now ($25k, after a late invoice).",
+    file: 'ledger.ndjson',
+  },
+  {
     name: 'hillvalley',
     description:
       'Back to the Future — Hill Valley across rewritten timelines. Facts carry BOTH valid time (vf/vt, when true in-story) and transaction time (tf/tt, which version of history recorded it), so a time-travel edit is a bitemporal correction. Ask what was true in 1985 "as of" the original vs the restored timeline.',
