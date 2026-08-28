@@ -425,11 +425,114 @@ pub fn serialize(store: &Store, format: &str) -> Result<String, CodecError> {
     }
 }
 
-/// Deserialize `input` in the named format into a fresh store.
+/// A borrowed decoded value ([`lenke_codec::DecVal`]) as an engine [`Value`] — the
+/// streaming-decode twin of [`value_from_neutral`], building the store's value
+/// directly from the parsed tree with no intermediate `CValue`.
+fn decval_to_value(v: &lenke_codec::DecVal, on_err: TemporalOnErr) -> Result<Value, CodecError> {
+    use lenke_codec::DecVal;
+    Ok(match v {
+        DecVal::Null => Value::Null,
+        DecVal::Bool(b) => Value::Bool(*b),
+        DecVal::Num(x) => Value::Num(*x),
+        DecVal::Str(s) => Value::Str(GStr::from(*s)),
+        DecVal::Temporal { tag, iso } => match Temporal::parse(tag, iso) {
+            Ok(t) => Value::Temporal(t),
+            Err(e) => match on_err {
+                TemporalOnErr::Error => return Err(CodecError::new(codes::INVALID_VALUE, e)),
+                TemporalOnErr::StringIso => Value::Str(GStr::from(*iso)),
+                TemporalOnErr::TagToken => Value::Str(GStr::from(format!("@{tag}:{iso}"))),
+            },
+        },
+        DecVal::List(a) => Value::List(
+            a.iter()
+                .map(|e| decval_to_value(e, on_err))
+                .collect::<Result<_, _>>()?,
+        ),
+        DecVal::Map(pairs) => {
+            let fields = pairs
+                .iter()
+                .map(|(k, val)| Ok((GStr::from(*k), decval_to_value(val, on_err)?)))
+                .collect::<Result<Vec<_>, CodecError>>()?;
+            make_record(fields)
+        }
+    })
+}
+
+/// A [`GraphSink`](lenke_codec::GraphSink) that inserts decoded elements straight
+/// into a `Store` — no owned `GraphData` between the parse and the graph. Post-decode
+/// finalization (CSR/edge-num/dict-encode) happens in [`deserialize`] once the sink
+/// has seen every element.
+struct StoreSink {
+    store: Store,
+    strict: bool,
+    on_err: TemporalOnErr,
+}
+
+impl lenke_codec::GraphSink for StoreSink {
+    fn node(
+        &mut self,
+        id: &str,
+        labels: &[&str],
+        props: &[(&str, lenke_codec::DecVal<'_>)],
+    ) -> Result<(), CodecError> {
+        let props: Vec<(&str, Value)> = props
+            .iter()
+            .map(|(k, v)| Ok((*k, decval_to_value(v, self.on_err)?)))
+            .collect::<Result<_, CodecError>>()?;
+        self.store.add_node_with_id(&Arc::from(id), labels, &props);
+        Ok(())
+    }
+
+    fn edge(
+        &mut self,
+        id: Option<&str>,
+        from: &str,
+        to: &str,
+        labels: &[&str],
+        props: &[(&str, lenke_codec::DecVal<'_>)],
+    ) -> Result<(), CodecError> {
+        let from = endpoint(&mut self.store, from, self.strict)?;
+        let to = endpoint(&mut self.store, to, self.strict)?;
+        // First label is the edge type; the rest are secondary (multi-label edges).
+        let mut labels = labels.iter();
+        let etype = labels.next().copied().unwrap_or("");
+        let eid = match id {
+            Some(id) => self.store.add_edge_with_id(&Arc::from(id), from, to, etype),
+            None => self.store.add_edge(from, to, etype),
+        };
+        let extra: Vec<&str> = labels.copied().collect();
+        if !extra.is_empty() {
+            self.store.set_edge_extra_labels(eid, &extra);
+        }
+        for (k, v) in props {
+            self.store
+                .set_edge_prop(eid, k, decval_to_value(v, self.on_err)?);
+        }
+        Ok(())
+    }
+}
+
+/// Deserialize `input` in the named format into a fresh store. A format with a
+/// streaming decoder (pg-json) builds the store directly through [`StoreSink`],
+/// skipping the owned `GraphData`; the rest bridge through the neutral model.
 pub fn deserialize(input: &str, format: &str) -> Result<Store, CodecError> {
-    let data = lenke_codec::deserialize(input, format)?;
     let (strict, on_err) = policy(format);
-    from_graph_data(data, strict, on_err)
+    let mut sink = StoreSink {
+        store: Store::default(),
+        strict,
+        on_err,
+    };
+    match lenke_codec::deserialize_into(input, format, &mut sink) {
+        Some(result) => {
+            result?;
+            let mut store = sink.store;
+            store.rebuild_csr();
+            store.rebuild_edge_num();
+            store.dict_encode_columns();
+            Ok(store)
+        }
+        None => from_graph_data(lenke_codec::deserialize(input, format)?, strict, on_err),
+    }
 }
 
 #[cfg(test)]
@@ -506,6 +609,24 @@ mod tests {
             serialize_graphson(&store),
             lenke_codec::serialize(&gd, "graphson").unwrap()
         );
+    }
+
+    #[test]
+    fn streaming_pg_json_decode_builds_the_same_store_as_the_graphdata_path() {
+        // The `StoreSink` decode must build a store structurally identical to
+        // `from_graph_data(deserialize(..))` — same nodes, labels, values, edges,
+        // including a temporal, a nested list/map, an escaped string, a numeric id,
+        // and a multi-label edge.
+        let doc = r#"{"nodes":[{"id":"a","labels":["P","Q"],"properties":{"name":"an\"n","born":{"@date":"2024-01-15"},"tags":["x",1],"meta":{"k":2}}},{"id":7,"labels":[],"properties":{}}],"edges":[{"id":"e0","from":"a","to":7,"labels":["KNOWS","BFF"],"properties":{"since":2020}}]}"#;
+        let via_sink = deserialize(doc, "pg-json").unwrap();
+        let (strict, on_err) = policy("pg-json");
+        let via_graphdata = from_graph_data(
+            lenke_codec::deserialize(doc, "pg-json").unwrap(),
+            strict,
+            on_err,
+        )
+        .unwrap();
+        assert_eq!(shape(&via_sink), shape(&via_graphdata));
     }
 
     #[test]

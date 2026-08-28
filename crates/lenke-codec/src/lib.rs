@@ -9,6 +9,7 @@
 //! `E_INVALID_SHAPE`, `E_INVALID_VALUE`, `E_UNKNOWN_FORMAT`, `E_UNSUPPORTED`).
 
 mod csv;
+mod decstream;
 mod graphson;
 mod json;
 mod jsonfmt;
@@ -17,6 +18,7 @@ mod pg_json;
 mod pg_text;
 mod stream;
 
+pub use decstream::{deserialize_into, DecVal, GraphSink};
 pub use jsonfmt::{js_number, push_json_str, push_num, push_value};
 pub use model::{Edge, GraphData, Node, Value};
 pub use graphson::{EProps, GraphsonSink, LabelJoin, VProps};

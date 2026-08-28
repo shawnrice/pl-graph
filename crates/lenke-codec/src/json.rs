@@ -81,12 +81,21 @@ impl<'a> Json<'a> {
 /// it turns the neutral `Value::Temporal` back into its own `Value`), matching the
 /// neutral model's boundary contract.
 pub(crate) fn temporal_from_pairs(pairs: &[(Cow<'_, str>, Json<'_>)]) -> Option<(String, String)> {
+    let (tag, iso) = temporal_from_pairs_ref(pairs)?;
+    Some((tag.to_string(), iso.to_string()))
+}
+
+/// Borrowed twin of [`temporal_from_pairs`]: the `(tag, iso)` slices point into the
+/// parsed tree, for the streaming decode path that never owns the strings.
+pub(crate) fn temporal_from_pairs_ref<'a>(
+    pairs: &'a [(Cow<'a, str>, Json<'a>)],
+) -> Option<(&'a str, &'a str)> {
     let [(k, v)] = pairs else { return None };
     let tag = k.strip_prefix('@')?;
     if !crate::model::is_temporal_tag(tag) {
         return None;
     }
-    Some((tag.to_string(), v.as_str()?.to_string()))
+    Some((tag, v.as_str()?))
 }
 
 const MAX_DEPTH: usize = 128;

@@ -74,6 +74,121 @@ pub fn encode(g: &GraphData) -> String {
     out
 }
 
+/// Streaming decode: walk a PG-JSON string and push each element to `sink` as
+/// borrowed views, skipping the owned `GraphData`. Same strict shape and same
+/// element/property order as [`decode`], so the built graph is identical.
+pub fn decode_into(input: &str, sink: &mut dyn crate::GraphSink) -> CodeResult<()> {
+    use crate::decstream::json_to_decval;
+    let j = crate::parse_json(input, "pg-json")?;
+    if j.as_object().is_none() {
+        return Err(CodecError::new(
+            E_INVALID_SHAPE,
+            "pg-json: expected a top-level object",
+        ));
+    }
+    let shape = |msg: &str| CodecError::new(E_INVALID_SHAPE, format!("pg-json: {msg}"));
+
+    let nodes_json = j
+        .get("nodes")
+        .and_then(Json::as_array)
+        .ok_or_else(|| shape("'nodes' must be an array"))?;
+    for o in nodes_json {
+        if o.as_object().is_none() {
+            return Err(shape("each node must be an object"));
+        }
+        if !is_id_value(o.get("id")) {
+            return Err(shape("node 'id' must be a string or number"));
+        }
+        if !is_string_array(o.get("labels")) {
+            return Err(shape("node 'labels' must be an array of strings"));
+        }
+        if !is_object_field(o.get("properties")) {
+            return Err(shape("node 'properties' must be an object"));
+        }
+        let id_num;
+        let id: &str = match o.get("id") {
+            Some(Json::Str(s)) => s.as_ref(),
+            other => {
+                id_num = other.map(json_id).unwrap_or_default();
+                &id_num
+            }
+        };
+        let labels = borrowed_str_array(o.get("labels"));
+        let props = borrowed_props(o.get("properties"), json_to_decval);
+        sink.node(id, &labels, &props)?;
+    }
+
+    match j.get("edges") {
+        None => {}
+        Some(Json::Arr(edges_json)) => {
+            for o in edges_json {
+                if o.as_object().is_none() {
+                    return Err(shape("each edge must be an object"));
+                }
+                if !is_string_array(o.get("labels")) {
+                    return Err(shape("edge 'labels' must be an array of strings"));
+                }
+                if !is_object_field(o.get("properties")) {
+                    return Err(shape("edge 'properties' must be an object"));
+                }
+                if !matches!(o.get("id"), None | Some(Json::Str(_)) | Some(Json::Num(_))) {
+                    return Err(shape("edge 'id' must be a string or number"));
+                }
+                let id_num;
+                let id: Option<&str> = match o.get("id") {
+                    None => None,
+                    Some(Json::Str(s)) => Some(s.as_ref()),
+                    other => {
+                        id_num = other.map(json_id).unwrap_or_default();
+                        Some(&id_num)
+                    }
+                };
+                let from_num;
+                let from: &str = match o.get("from") {
+                    Some(Json::Str(s)) => s.as_ref(),
+                    other => {
+                        from_num = other.map(json_id).unwrap_or_default();
+                        &from_num
+                    }
+                };
+                let to_num;
+                let to: &str = match o.get("to") {
+                    Some(Json::Str(s)) => s.as_ref(),
+                    other => {
+                        to_num = other.map(json_id).unwrap_or_default();
+                        &to_num
+                    }
+                };
+                let labels = borrowed_str_array(o.get("labels"));
+                let props = borrowed_props(o.get("properties"), json_to_decval);
+                sink.edge(id, from, to, &labels, &props)?;
+            }
+        }
+        Some(_) => return Err(shape("'edges' must be an array")),
+    }
+    Ok(())
+}
+
+/// A JSON string array as borrowed `&str` (non-string elements dropped) — the
+/// borrowed twin of [`json_str_array`](crate::json_str_array).
+fn borrowed_str_array<'a>(field: Option<&'a Json<'a>>) -> Vec<&'a str> {
+    field
+        .and_then(Json::as_array)
+        .map(|a| a.iter().filter_map(Json::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// A JSON object field as borrowed `(key, DecVal)` pairs via `conv`.
+fn borrowed_props<'a>(
+    field: Option<&'a Json<'a>>,
+    conv: impl Fn(&'a Json<'a>) -> crate::decstream::DecVal<'a>,
+) -> Vec<(&'a str, crate::decstream::DecVal<'a>)> {
+    field
+        .and_then(Json::as_object)
+        .map(|m| m.iter().map(|(k, v)| (k.as_ref(), conv(v))).collect())
+        .unwrap_or_default()
+}
+
 /// Deserialize a PG-JSON string into neutral graph data (strict shape).
 pub fn decode(input: &str) -> CodeResult<GraphData> {
     let j = crate::parse_json(input, "pg-json")?;
