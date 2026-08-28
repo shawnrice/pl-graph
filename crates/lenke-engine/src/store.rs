@@ -1877,6 +1877,34 @@ impl Store {
         self.node_ext.get(id as usize).cloned()
     }
 
+    /// A node's external id BORROWED (`&str`), skipping the `GStr` clone — for the
+    /// streaming codecs, which write it straight to the output buffer.
+    #[must_use]
+    pub fn node_ext_id_ref(&self, id: u32) -> Option<&str> {
+        self.node_ext.get(id as usize).map(|g| &**g)
+    }
+
+    /// An edge's external id BORROWED (`&str`). See [`node_ext_id_ref`](Self::node_ext_id_ref).
+    #[must_use]
+    pub fn edge_ext_id_ref(&self, eid: u32) -> Option<&str> {
+        self.edge_ext.get(eid as usize).map(|g| &**g)
+    }
+
+    /// A node's labels in canonical (sorted) order, BORROWED as `&str` — the
+    /// allocation-light twin of [`labels_of`](Self::labels_of) (a small `Vec<&str>`
+    /// of pointers, no per-label `String` clone) for the streaming codecs.
+    #[must_use]
+    pub fn labels_of_refs(&self, id: u32) -> Vec<&str> {
+        let mut ls: Vec<&str> = self
+            .by_label
+            .iter()
+            .filter(|(_, ids)| ids.binary_search(&id).is_ok())
+            .map(|(l, _)| l.as_str())
+            .collect();
+        ls.sort_unstable();
+        ls
+    }
+
     /// The `(src, dst)` node ids of edge `eid`, or `None` if the eid is unknown.
     #[must_use]
     pub fn edge_endpoints(&self, eid: u32) -> Option<(u32, u32)> {

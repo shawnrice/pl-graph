@@ -15,9 +15,11 @@ mod jsonfmt;
 mod model;
 mod pg_json;
 mod pg_text;
+mod stream;
 
 pub use jsonfmt::{js_number, push_json_str, push_num, push_value};
 pub use model::{Edge, GraphData, Node, Value};
+pub use stream::{push_value_ref, Labels, PgJsonSink, Props, ValueRef};
 
 use json::Json;
 
