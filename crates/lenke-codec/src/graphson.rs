@@ -9,9 +9,207 @@
 use crate::json::Json;
 use crate::jsonfmt::{push_json_str, push_num};
 use crate::model::{graphson_tag, graphson_type, Edge, GraphData, Node, Value};
+use crate::stream::ValueRef;
 use crate::{is_intish, json_id, CodeResult, CodecError, E_INVALID_SHAPE, E_INVALID_VALUE};
 
 const LABEL_SEP: &str = "::";
+
+/// Accumulates a vertex/edge's labels into a single `::`-joined string (GraphSON
+/// carries the label SET as one `label` string). The host pushes borrowed `&str`
+/// labels in canonical order; the sink escapes the finished join once.
+pub struct LabelJoin<'a> {
+    buf: &'a mut String,
+    any: bool,
+}
+impl LabelJoin<'_> {
+    pub fn push(&mut self, label: &str) {
+        if self.any {
+            self.buf.push_str(LABEL_SEP);
+        }
+        self.any = true;
+        self.buf.push_str(label);
+    }
+}
+
+/// Emit a BORROWED value as a GraphSON v3 typed value — the streaming twin of
+/// [`push_typed`]; both funnel scalars through the same writers, so the bytes match.
+/// A nested list/record/map arrives as an owned [`Value`] and defers to `push_typed`.
+fn push_typed_ref(out: &mut String, v: ValueRef) {
+    match v {
+        ValueRef::Null => out.push_str("null"),
+        ValueRef::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+        ValueRef::Str(s) => push_json_str(out, s),
+        ValueRef::Num(x) => {
+            out.push_str(if is_intish(x) {
+                "{\"@type\":\"g:Int64\",\"@value\":"
+            } else {
+                "{\"@type\":\"g:Double\",\"@value\":"
+            });
+            push_num(out, x);
+            out.push('}');
+        }
+        ValueRef::Temporal { tag, iso } => {
+            out.push_str("{\"@type\":\"");
+            out.push_str(graphson_type(tag).unwrap_or("gx:LocalDate"));
+            out.push_str("\",\"@value\":");
+            push_json_str(out, iso);
+            out.push('}');
+        }
+        ValueRef::Nested(v) => push_typed(out, v),
+    }
+}
+
+/// A streaming GraphSON v3 encoder — the byte-identical twin of [`encode`] that
+/// pulls each element from the host instead of an owned [`GraphData`]. Order of use
+/// mirrors [`PgJsonSink`](crate::PgJsonSink): construct, `vertex` per node,
+/// `begin_edges`, `edge` per edge, `finish`.
+pub struct GraphsonSink {
+    out: String,
+    label_buf: String,
+    any: bool,
+}
+
+impl GraphsonSink {
+    #[must_use]
+    pub fn new(nodes: usize, edges: usize) -> Self {
+        let mut out = String::with_capacity(nodes * 96 + edges * 96 + 16);
+        out.push_str("{\"vertices\":[");
+        Self {
+            out,
+            label_buf: String::new(),
+            any: false,
+        }
+    }
+
+    fn sep(&mut self) {
+        if self.any {
+            self.out.push(',');
+        }
+        self.any = true;
+    }
+
+    /// Build the `::`-joined label string into the reusable buffer, then emit it as
+    /// one escaped JSON string (join-then-escape, matching [`encode`]).
+    fn write_labels(&mut self, labels: impl FnOnce(&mut LabelJoin)) {
+        self.label_buf.clear();
+        labels(&mut LabelJoin {
+            buf: &mut self.label_buf,
+            any: false,
+        });
+        push_json_str(&mut self.out, &self.label_buf);
+    }
+
+    /// Emit one vertex. `props` writes each present property with its `g:VertexProperty`
+    /// wrapper (whose id is `"<vertex-id>/<key>"`).
+    pub fn vertex(
+        &mut self,
+        id: &str,
+        labels: impl FnOnce(&mut LabelJoin),
+        props: impl FnOnce(&mut VProps),
+    ) {
+        self.sep();
+        self.out.push_str("{\"@type\":\"g:Vertex\",\"@value\":{\"id\":");
+        push_json_str(&mut self.out, id);
+        self.out.push_str(",\"label\":");
+        self.write_labels(labels);
+        self.out.push_str(",\"properties\":{");
+        props(&mut VProps {
+            out: &mut self.out,
+            id,
+            any: false,
+        });
+        self.out.push_str("}}}");
+    }
+
+    pub fn begin_edges(&mut self) {
+        self.out.push_str("],\"edges\":[");
+        self.any = false;
+    }
+
+    /// Emit one edge. `props` writes each property with its `g:Property` wrapper.
+    pub fn edge(
+        &mut self,
+        id: &str,
+        from: &str,
+        to: &str,
+        labels: impl FnOnce(&mut LabelJoin),
+        props: impl FnOnce(&mut EProps),
+    ) {
+        self.sep();
+        self.out.push_str("{\"@type\":\"g:Edge\",\"@value\":{\"id\":");
+        push_json_str(&mut self.out, id);
+        self.out.push_str(",\"label\":");
+        self.write_labels(labels);
+        self.out.push_str(",\"inV\":");
+        push_json_str(&mut self.out, to);
+        self.out.push_str(",\"outV\":");
+        push_json_str(&mut self.out, from);
+        self.out.push_str(",\"properties\":{");
+        props(&mut EProps {
+            out: &mut self.out,
+            any: false,
+        });
+        self.out.push_str("}}}");
+    }
+
+    #[must_use]
+    pub fn finish(mut self) -> String {
+        self.out.push_str("]}");
+        self.out
+    }
+}
+
+/// The vertex-property cursor: each entry is a single-element array of a
+/// `g:VertexProperty` whose id is `"<vertex-id>/<key>"`.
+pub struct VProps<'a> {
+    out: &'a mut String,
+    id: &'a str,
+    any: bool,
+}
+impl VProps<'_> {
+    pub fn push(&mut self, key: &str, value: ValueRef) {
+        if self.any {
+            self.out.push(',');
+        }
+        self.any = true;
+        push_json_str(self.out, key);
+        self.out
+            .push_str(":[{\"@type\":\"g:VertexProperty\",\"@value\":{\"id\":");
+        // Composite id "<vertex-id>/<key>" — the one small per-property allocation,
+        // inherent to the format (the TS encoder builds the same string).
+        let mut vpid = String::with_capacity(self.id.len() + 1 + key.len());
+        vpid.push_str(self.id);
+        vpid.push('/');
+        vpid.push_str(key);
+        push_json_str(self.out, &vpid);
+        self.out.push_str(",\"value\":");
+        push_typed_ref(self.out, value);
+        self.out.push_str(",\"label\":");
+        push_json_str(self.out, key);
+        self.out.push_str("}}]");
+    }
+}
+
+/// The edge-property cursor: each entry is a `g:Property` wrapper.
+pub struct EProps<'a> {
+    out: &'a mut String,
+    any: bool,
+}
+impl EProps<'_> {
+    pub fn push(&mut self, key: &str, value: ValueRef) {
+        if self.any {
+            self.out.push(',');
+        }
+        self.any = true;
+        push_json_str(self.out, key);
+        self.out
+            .push_str(":{\"@type\":\"g:Property\",\"@value\":{\"key\":");
+        push_json_str(self.out, key);
+        self.out.push_str(",\"value\":");
+        push_typed_ref(self.out, value);
+        self.out.push_str("}}");
+    }
+}
 
 /// Emit one neutral [`Value`] as a GraphSON v3 typed value.
 fn push_typed(out: &mut String, v: &Value) {

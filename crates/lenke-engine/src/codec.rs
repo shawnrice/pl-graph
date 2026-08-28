@@ -248,21 +248,23 @@ fn endpoint(store: &mut Store, ext: &str, strict: bool) -> Result<u32, CodecErro
 
 // --------------------------------------------------------------- dispatch ---
 
-/// Push one present property onto a streaming [`lenke_codec::Props`] cursor,
-/// BORROWING the engine value where possible. A scalar (`Str`/`Num`/`Bool`/`Null`)
-/// allocates nothing on the codec side (a `GStr` derefs straight to `&str`); a
-/// temporal holds its formatted ISO in a local for the single push; a nested
-/// list/record/map is rare and falls back to the owned neutral value.
-fn push_prop(p: &mut lenke_codec::Props, key: &str, v: &Value) {
+/// Present one property to a streaming codec cursor as a [`lenke_codec::ValueRef`],
+/// BORROWING the engine value where possible, then hand it to `emit` (the cursor's
+/// `push`). A scalar (`Str`/`Num`/`Bool`/`Null`) allocates nothing on the codec side
+/// (a `GStr` derefs straight to `&str`); a temporal holds its formatted ISO in a
+/// local for the single call; a nested list/record/map is rare and falls back to the
+/// owned neutral value. Cursor-agnostic so pg-json (`Props`) and graphson
+/// (`VProps`/`EProps`) share it.
+fn emit_prop(key: &str, v: &Value, emit: &mut dyn FnMut(&str, lenke_codec::ValueRef)) {
     use lenke_codec::ValueRef;
     match v {
-        Value::Null => p.push(key, ValueRef::Null),
-        Value::Bool(b) => p.push(key, ValueRef::Bool(*b)),
-        Value::Num(x) => p.push(key, ValueRef::Num(*x)),
-        Value::Str(s) => p.push(key, ValueRef::Str(s)),
+        Value::Null => emit(key, ValueRef::Null),
+        Value::Bool(b) => emit(key, ValueRef::Bool(*b)),
+        Value::Num(x) => emit(key, ValueRef::Num(*x)),
+        Value::Str(s) => emit(key, ValueRef::Str(s)),
         Value::Temporal(t) => {
             let iso = t.format();
-            p.push(
+            emit(
                 key,
                 ValueRef::Temporal {
                     tag: t.tag(),
@@ -272,7 +274,7 @@ fn push_prop(p: &mut lenke_codec::Props, key: &str, v: &Value) {
         }
         Value::List(_) | Value::Record(_) | Value::Map(_) => {
             let cv = value_to_neutral(v);
-            p.push(key, ValueRef::Nested(&cv));
+            emit(key, ValueRef::Nested(&cv));
         }
         Value::Node(_) | Value::Edge(_) => {
             unreachable!("element ref is never a stored property value")
@@ -305,7 +307,7 @@ fn serialize_pg_json(store: &Store) -> String {
             |p| {
                 for k in &node_keys {
                     if store.has_prop(id, k) {
-                        push_prop(p, k, &store.prop(id, k));
+                        emit_prop(k, &store.prop(id, k), &mut |k, vr| p.push(k, vr));
                     }
                 }
             },
@@ -333,7 +335,67 @@ fn serialize_pg_json(store: &Store) -> String {
                 |p| {
                     for k in &edge_keys {
                         if store.has_edge_prop(eid, k) {
-                            push_prop(p, k, &store.edge_prop(eid, k));
+                            emit_prop(k, &store.edge_prop(eid, k), &mut |k, vr| p.push(k, vr));
+                        }
+                    }
+                },
+            );
+        }
+    }
+    sink.finish()
+}
+
+/// Stream a store directly to a GraphSON v3 string — the graphson twin of
+/// [`serialize_pg_json`], same order, byte-identical to the `GraphData` path.
+fn serialize_graphson(store: &Store) -> String {
+    let node_keys = store.prop_keys();
+    let edge_keys = store.edge_prop_keys();
+    let count = u32::try_from(store.node_count()).unwrap_or(u32::MAX);
+    let mut sink = lenke_codec::GraphsonSink::new(store.node_count(), store.edge_count());
+
+    for id in 0..count {
+        if !store.is_alive(id) {
+            continue;
+        }
+        sink.vertex(
+            store.node_ext_id_ref(id).unwrap_or(""),
+            |l| {
+                for name in store.labels_of_refs(id) {
+                    l.push(name);
+                }
+            },
+            |p| {
+                for k in &node_keys {
+                    if store.has_prop(id, k) {
+                        emit_prop(k, &store.prop(id, k), &mut |k, vr| p.push(k, vr));
+                    }
+                }
+            },
+        );
+    }
+
+    sink.begin_edges();
+    for from in 0..count {
+        if !store.is_alive(from) {
+            continue;
+        }
+        let from_ext = store.node_ext_id_ref(from).unwrap_or("");
+        for a in store.out(from) {
+            let eid = a.eid;
+            let labels = store.edge_labels_of(eid);
+            sink.edge(
+                store.edge_ext_id_ref(eid).unwrap_or(""),
+                from_ext,
+                store.node_ext_id_ref(a.nbr).unwrap_or(""),
+                |l| {
+                    for name in &labels {
+                        l.push(name);
+                    }
+                },
+                |p| {
+                    for k in &edge_keys {
+                        if store.has_edge_prop(eid, k) {
+                            emit_prop(k, &store.edge_prop(eid, k), &mut |k, vr| p.push(k, vr));
                         }
                     }
                 },
@@ -350,6 +412,7 @@ pub fn serialize(store: &Store, format: &str) -> Result<String, CodecError> {
     // formats still bridge through the neutral model until they gain a streaming path.
     match format {
         "pg-json" => Ok(serialize_pg_json(store)),
+        "graphson" => Ok(serialize_graphson(store)),
         _ => lenke_codec::serialize(&to_graph_data(store), format),
     }
 }
@@ -426,9 +489,15 @@ mod tests {
             r#"{"id":"e0","from":"a","to":"b","labels":["KNOWS","BFF"],"props":{"since":2020}}"#,
         );
         let store = crate::ndjson::from_ndjson(src).unwrap();
-        let streamed = serialize_pg_json(&store);
-        let via_graphdata = lenke_codec::serialize(&to_graph_data(&store), "pg-json").unwrap();
-        assert_eq!(streamed, via_graphdata);
+        let gd = to_graph_data(&store);
+        assert_eq!(
+            serialize_pg_json(&store),
+            lenke_codec::serialize(&gd, "pg-json").unwrap()
+        );
+        assert_eq!(
+            serialize_graphson(&store),
+            lenke_codec::serialize(&gd, "graphson").unwrap()
+        );
     }
 
     #[test]
