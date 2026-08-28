@@ -1,4 +1,5 @@
 use super::*;
+use crate::gstr::GStr;
 use crate::value::{self, Value};
 
 /// Dispatch a scalar function over its already-evaluated argument row. Arity is
@@ -360,11 +361,7 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             Value::List(_) => args[0].clone(),
             Value::Str(s) => Value::List(
                 s.encode_utf16()
-                    .map(|u| {
-                        Value::Str(std::sync::Arc::from(
-                            String::from_utf16_lossy(&[u]).as_str(),
-                        ))
-                    })
+                    .map(|u| Value::Str(GStr::from(String::from_utf16_lossy(&[u]).as_str())))
                     .collect(),
             ),
             Value::Num(n) if !n.is_finite() => Value::Null,

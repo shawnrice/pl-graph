@@ -1,10 +1,9 @@
 use crate::exec::{run, Rows};
 use crate::store::{Builder, Store};
 use crate::value::Value;
-use std::sync::Arc;
 
 fn s(x: &str) -> Value {
-    Value::Str(Arc::from(x))
+    Value::Str(x.into())
 }
 fn n(x: f64) -> Value {
     Value::Num(x)

@@ -481,7 +481,7 @@ pub(super) fn typed_col_from_values(out: Vec<Value>) -> Col {
             out.into_iter()
                 .map(|v| {
                     if let Value::Str(s) = v {
-                        s
+                        std::sync::Arc::from(s.as_str())
                     } else {
                         unreachable!()
                     }
@@ -527,7 +527,7 @@ pub(super) fn try_eval_dict_scalar(expr: &Expr, store: &Store, batch: &Batch) ->
     };
     let mut per_code = Vec::with_capacity(dict.len());
     for dv in dict.iter() {
-        per_code.push(ev(&Value::Str(dv.clone()))?);
+        per_code.push(ev(&Value::Str(dv.clone().into()))?);
     }
     let null_val = ev(&Value::Null)?;
     Some(Col::Gen(
@@ -571,7 +571,7 @@ pub(super) fn try_filter_keep_dict(
             pred,
             slot,
             &key,
-            &Value::Str(dv.clone()),
+            &Value::Str(dv.clone().into()),
             store,
         )?);
     }
@@ -656,7 +656,7 @@ pub(super) fn try_stream_dict_pred_count(
     };
     let mut matches = Vec::with_capacity(dict.len());
     for dv in dict.iter() {
-        matches.push(eval_const(&Value::Str(dv.clone()))?);
+        matches.push(eval_const(&Value::Str(dv.clone().into()))?);
     }
     let null_match = eval_const(&Value::Null)?;
     let mut count = 0u64;
@@ -1643,7 +1643,7 @@ pub(super) fn try_varlen_agg(
                     });
                 }
             });
-            best.map_or(Value::Null, |v| Value::Str(data[v as usize].clone()))
+            best.map_or(Value::Null, |v| Value::Str(data[v as usize].clone().into()))
         }
         (
             AggFn::Min | AggFn::Max,
@@ -1674,7 +1674,7 @@ pub(super) fn try_varlen_agg(
                 }
             });
             best.map_or(Value::Null, |v| {
-                Value::Str(dict[codes[v as usize] as usize].clone())
+                Value::Str(dict[codes[v as usize] as usize].clone().into())
             })
         }
         (AggFn::Min | AggFn::Max, _) => return None, // Temporal/Bool/Gen → general path
@@ -2091,7 +2091,7 @@ pub(super) fn try_scan_dict_count(
             key_col.push(Value::Null);
             cnt_col.push(Value::Num(null_count as f64));
         } else {
-            key_col.push(Value::Str(dict[code as usize].clone()));
+            key_col.push(Value::Str(dict[code as usize].clone().into()));
             cnt_col.push(Value::Num(counts[code as usize] as f64));
         }
     }
@@ -2163,7 +2163,7 @@ pub(super) fn try_frontier_dict_count(
             key_col.push(Value::Null);
             cnt_col.push(Value::Num(null_count as f64));
         } else {
-            key_col.push(Value::Str(dict[code as usize].clone()));
+            key_col.push(Value::Str(dict[code as usize].clone().into()));
             cnt_col.push(Value::Num(counts[code as usize] as f64));
         }
     }
@@ -2284,7 +2284,7 @@ pub(super) fn try_scan_group_agg(
             run!(
                 present,
                 |i: usize| data[i].as_ref(),
-                |i: usize| Value::Str(data[i].clone()),
+                |i: usize| Value::Str(data[i].clone().into()),
                 ()
             );
         }
@@ -2306,7 +2306,7 @@ pub(super) fn try_scan_group_agg(
                     if code_to_group[c] == u32::MAX {
                         let g = group_keys.len() as u32;
                         code_to_group[c] = g;
-                        group_keys.push(Value::Str(dict[c].clone()));
+                        group_keys.push(Value::Str(dict[c].clone().into()));
                         acc.push(GroupAcc {
                             rows: 0,
                             aggs: vec![(0.0, 0, None); na],
@@ -3007,7 +3007,9 @@ impl GremlinTree {
 /// `connectedComponent`/`peerPressure` write (`Value::Str(vid.arc(root))`). A root
 /// with no external id (never, for a loaded node) reads back NULL.
 pub(super) fn root_ext_id(store: &Store, root: u32) -> Value {
-    store.node_ext_id(root).map_or(Value::Null, Value::Str)
+    store
+        .node_ext_id(root)
+        .map_or(Value::Null, |s| Value::Str(s.into()))
 }
 
 /// Collapse a node-id multiset to (distinct ids in first-seen order, their

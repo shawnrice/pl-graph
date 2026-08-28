@@ -23,6 +23,7 @@
 //! it does not know rather than mis-decoding older/newer data. Decode funnels
 //! through the shared [`crate::ndjson::build_store`], so fidelity matches NDJSON.
 
+use crate::gstr::GStr;
 use crate::ndjson::{build_store, StagedNdjson};
 use crate::schema_op::SchemaError;
 use crate::store::Store;
@@ -181,7 +182,7 @@ impl<'a> Reader<'a> {
             0 => Value::Null,
             1 => Value::Bool(self.u8()? != 0),
             2 => Value::Num(self.f64()?),
-            3 => Value::Str(Arc::from(self.str()?.as_str())),
+            3 => Value::Str(GStr::from(self.str()?.as_str())),
             4 => {
                 let n = self.count()?;
                 Value::List((0..n).map(|_| self.value()).collect::<Result<_, _>>()?)

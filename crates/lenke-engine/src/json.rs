@@ -156,8 +156,8 @@ mod tests {
         // A Value::Map renders in the pair order it holds — key order is significant
         // for the value-level compare, so the serializer must not reorder.
         let m = Value::Map(Arc::new(vec![
-            (Value::Str(Arc::from("n")), Value::Num(1.0)),
-            (Value::Str(Arc::from("s")), Value::Str(Arc::from("x"))),
+            (Value::Str("n".into()), Value::Num(1.0)),
+            (Value::Str("s".into()), Value::Str("x".into())),
         ]));
         let mut s = String::new();
         write_value(&mut s, &m);
@@ -189,7 +189,7 @@ mod tests {
         let r = rows(
             &["a", "b"],
             vec![
-                vec![Value::Num(1.0), Value::Str(Arc::from("x"))],
+                vec![Value::Num(1.0), Value::Str("x".into())],
                 vec![Value::Num(2.0), Value::Null],
             ],
         );

@@ -1,6 +1,7 @@
 use super::scalar::*;
 use super::*;
 use crate::batch::{Batch, Col};
+use crate::gstr::GStr;
 use crate::ir::Expr;
 use crate::store::{Column, Store};
 use crate::value::{self, Value};
@@ -213,7 +214,7 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                 Value::Record(fields) => match icol.value_at(i) {
                     Value::Str(k) => fields
                         .iter()
-                        .find(|(fk, _)| *fk == k)
+                        .find(|(fk, _)| fk.as_ref() == k.as_str())
                         .map_or(Value::Null, |(_, v)| v.clone()),
                     _ => Value::Null,
                 },
@@ -523,15 +524,19 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                 let n = batch.rows();
                 let out: Vec<Value> = (0..n)
                     .map(|i| match arg.value_at(i) {
-                        Value::Num(id) if matches!(arg, Col::Nodes(_)) => {
-                            store.node_ext_id(id as u32).map_or(Value::Null, Value::Str)
-                        }
+                        Value::Num(id) if matches!(arg, Col::Nodes(_)) => store
+                            .node_ext_id(id as u32)
+                            .map_or(Value::Null, |s| Value::Str(s.into())),
                         Value::Num(eid) if matches!(arg, Col::Edges(_)) => store
                             .edge_ext_id(eid as u32)
-                            .map_or(Value::Null, Value::Str),
+                            .map_or(Value::Null, |s| Value::Str(s.into())),
                         // A branch/mixed frontier carries elements UNBOXED in a Gen column.
-                        Value::Node(id) => store.node_ext_id(id).map_or(Value::Null, Value::Str),
-                        Value::Edge(e) => store.edge_ext_id(e).map_or(Value::Null, Value::Str),
+                        Value::Node(id) => store
+                            .node_ext_id(id)
+                            .map_or(Value::Null, |s| Value::Str(s.into())),
+                        Value::Edge(e) => store
+                            .edge_ext_id(e)
+                            .map_or(Value::Null, |s| Value::Str(s.into())),
                         _ => Value::Null,
                     })
                     .collect();
@@ -594,7 +599,9 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                         let out: Vec<Value> = ids
                             .iter()
                             .map(|&id| match code_of.get(id as usize) {
-                                Some(&c) if c != u32::MAX => Value::Str(names[c as usize].clone()),
+                                Some(&c) if c != u32::MAX => {
+                                    Value::Str(names[c as usize].clone().into())
+                                }
                                 _ => Value::Null,
                             })
                             .collect();
@@ -618,7 +625,7 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                                             a
                                         }
                                     };
-                                    Value::Str(arc)
+                                    Value::Str(arc.into())
                                 }
                                 None => Value::Null,
                             }
@@ -661,7 +668,11 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                         .next()
                         .map_or(Value::Null, |l| Value::Str(l.into()))
                 };
-                let node_id = |id: u32| store.node_ext_id(id).map_or(Value::Null, Value::Str);
+                let node_id = |id: u32| {
+                    store
+                        .node_ext_id(id)
+                        .map_or(Value::Null, |s| Value::Str(s.into()))
+                };
                 let arg = eval(&args[0], store, batch)?;
                 let n = batch.rows();
                 // Resolve the node columns ONCE (sorted, present-filtered per node below)
@@ -678,7 +689,8 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                                 entries.push((Value::Str("label".into()), node_label(id)));
                                 for (k, col) in &node_cols {
                                     if col.present_at(ni) {
-                                        entries.push((Value::Str(Arc::clone(k)), col.read(ni)));
+                                        entries
+                                            .push((Value::Str(Arc::clone(k).into()), col.read(ni)));
                                     }
                                 }
                             }
@@ -686,7 +698,9 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                                 let eid = eid as u32;
                                 entries.push((
                                     Value::Str("id".into()),
-                                    store.edge_ext_id(eid).map_or(Value::Null, Value::Str),
+                                    store
+                                        .edge_ext_id(eid)
+                                        .map_or(Value::Null, |s| Value::Str(s.into())),
                                 ));
                                 entries.push((
                                     Value::Str("label".into()),
@@ -767,7 +781,7 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                                         .map(|(k, col)| {
                                             let v = col.read(ni);
                                             let v = if wrap { Value::List(vec![v]) } else { v };
-                                            (Value::Str(Arc::clone(k)), v)
+                                            (Value::Str(Arc::clone(k).into()), v)
                                         })
                                         .collect();
                                     Value::Map(Arc::new(entries))
@@ -833,7 +847,9 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                 // Sentinel keys from `path().by(id|label)`: the element's ext-id / label.
                 let map_elem = |id: u32| -> Value {
                     match key.as_ref() {
-                        "\u{0}id" => store.node_ext_id(id).map_or(Value::Null, Value::Str),
+                        "\u{0}id" => store
+                            .node_ext_id(id)
+                            .map_or(Value::Null, |s| Value::Str(s.into())),
                         "\u{0}label" => store
                             .labels_of(id)
                             .into_iter()
@@ -1205,7 +1221,7 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                             .iter()
                             .zip(&cols)
                             .map(|((k, _), c)| {
-                                (Value::Str(Arc::from(k.as_str())), render_cell(c, i, store))
+                                (Value::Str(GStr::from(k.as_str())), render_cell(c, i, store))
                             })
                             .collect();
                         Value::Map(Arc::new(pairs))

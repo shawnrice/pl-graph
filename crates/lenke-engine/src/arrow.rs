@@ -1086,9 +1086,7 @@ mod tests {
                         T_UTF8 => {
                             let lo = u32_at(blob, b1 + i * 4) as usize;
                             let hi = u32_at(blob, b1 + (i + 1) * 4) as usize;
-                            Value::Str(Arc::from(
-                                std::str::from_utf8(&blob[b2 + lo..b2 + hi]).unwrap(),
-                            ))
+                            Value::Str(std::str::from_utf8(&blob[b2 + lo..b2 + hi]).unwrap().into())
                         }
                         other => panic!("unexpected tag {other}"),
                     }
@@ -1103,7 +1101,7 @@ mod tests {
         Value::Num(x)
     }
     fn s(x: &str) -> Value {
-        Value::Str(Arc::from(x))
+        Value::Str(x.into())
     }
 
     #[test]

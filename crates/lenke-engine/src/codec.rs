@@ -7,6 +7,7 @@
 //! (and the TS engine) emit byte-identical bytes from identical data. NDJSON keeps its
 //! own native module ([`crate::ndjson`]); binary is the engine's own format.
 
+use crate::gstr::GStr;
 use std::sync::Arc;
 
 use lenke_codec::{codes, CodecError, Edge as CEdge, GraphData, Node as CNode, Value as CValue};
@@ -92,13 +93,13 @@ fn value_from_neutral(v: &CValue, on_err: TemporalOnErr) -> Result<Value, CodecE
         CValue::Null => Value::Null,
         CValue::Bool(b) => Value::Bool(*b),
         CValue::Num(x) => Value::Num(*x),
-        CValue::Str(s) => Value::Str(Arc::from(s.as_str())),
+        CValue::Str(s) => Value::Str(GStr::from(s.as_str())),
         CValue::Temporal { tag, iso } => match Temporal::parse(tag, iso) {
             Ok(t) => Value::Temporal(t),
             Err(e) => match on_err {
                 TemporalOnErr::Error => return Err(CodecError::new(codes::INVALID_VALUE, e)),
-                TemporalOnErr::StringIso => Value::Str(Arc::from(iso.as_str())),
-                TemporalOnErr::TagToken => Value::Str(Arc::from(format!("@{tag}:{iso}"))),
+                TemporalOnErr::StringIso => Value::Str(GStr::from(iso.as_str())),
+                TemporalOnErr::TagToken => Value::Str(GStr::from(format!("@{tag}:{iso}"))),
             },
         },
         CValue::List(a) => Value::List(

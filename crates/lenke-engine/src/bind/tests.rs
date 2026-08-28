@@ -2,10 +2,9 @@ use super::*;
 use crate::exec::run;
 use crate::gql::{parse_prepared, parse_with_params};
 use crate::store::{Builder, Store};
-use std::sync::Arc;
 
 fn s(x: &str) -> Value {
-    Value::Str(Arc::from(x))
+    Value::Str(x.into())
 }
 fn n(x: f64) -> Value {
     Value::Num(x)

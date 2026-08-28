@@ -60,7 +60,7 @@ impl Col {
             Self::Nodes(v) | Self::Edges(v) => Value::Num(f64::from(v[i])),
             Self::Num(v) => Value::Num(v[i]),
             Self::Bool(v) => Value::Bool(v[i]),
-            Self::Str(v) => Value::Str(v[i].clone()),
+            Self::Str(v) => Value::Str(v[i].clone().into()),
             Self::Gen(v) => v[i].clone(),
         }
     }

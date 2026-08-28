@@ -180,13 +180,13 @@ impl Column {
         let idx = i;
         match self {
             Self::Num { data, present, .. } if present[idx] => Value::Num(data[idx]),
-            Self::Str { data, present, .. } if present[idx] => Value::Str(data[idx].clone()),
+            Self::Str { data, present, .. } if present[idx] => Value::Str(data[idx].clone().into()),
             Self::Dict {
                 dict,
                 codes,
                 present,
                 ..
-            } if present[idx] => Value::Str(dict[codes[idx] as usize].clone()),
+            } if present[idx] => Value::Str(dict[codes[idx] as usize].clone().into()),
             Self::Bool { data, present, .. } if present[idx] => Value::Bool(data[idx]),
             Self::Temporal { data, present, .. } if present[idx] => Value::Temporal(data[idx]),
             Self::Gen { data, present } if present[idx] => data[idx].clone(),
@@ -460,7 +460,7 @@ impl Column {
                 },
                 Value::Str(s),
             ) => {
-                data[i] = s;
+                data[i] = std::sync::Arc::from(s.as_str());
                 present[i] = true;
                 nulls[i] = false;
             }
@@ -4283,7 +4283,7 @@ fn materialize(pairs: Vec<(u32, Value)>, n: usize) -> Column {
         let mut present = vec![false; n];
         for (i, v) in pairs {
             if let Value::Str(s) = v {
-                data[i as usize] = s;
+                data[i as usize] = std::sync::Arc::from(s.as_str());
                 present[i as usize] = true;
             }
         }

@@ -417,12 +417,12 @@ fn element_col_to_ext_id(col: Col, store: &Store) -> Col {
     let node_key = |id: u32| {
         store
             .node_ext_id(id)
-            .map_or(Value::Num(f64::from(id)), Value::Str)
+            .map_or(Value::Num(f64::from(id)), |s| Value::Str(s.into()))
     };
     let edge_key = |eid: u32| {
         store
             .edge_ext_id(eid)
-            .map_or(Value::Num(f64::from(eid)), Value::Str)
+            .map_or(Value::Num(f64::from(eid)), |s| Value::Str(s.into()))
     };
     match col {
         Col::Nodes(ids) => Col::Gen(ids.iter().map(|&id| node_key(id)).collect()),

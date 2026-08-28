@@ -19,6 +19,7 @@
 //!   front-end makes; `cmp_total` itself is total and never fails, because sorts
 //!   and grouping need a deterministic order over any mix.
 
+use crate::gstr::GStr;
 use crate::temporal::Temporal;
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -31,7 +32,7 @@ pub enum Value {
     Null,
     Bool(bool),
     Num(f64),
-    Str(Arc<str>),
+    Str(GStr),
     /// An ISO temporal value (`DATE`/`LOCAL TIME`/`LOCAL DATETIME`). Ordering and
     /// equality delegate to [`Temporal`], keeping the rules there; this contract
     /// only decides where temporals sit in the CROSS-type order (see `rank`).
@@ -272,7 +273,7 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
                 Ok(Value::Num(n))
             }
         }
-        CastTarget::String => Ok(Value::Str(Arc::from(
+        CastTarget::String => Ok(Value::Str(GStr::from(
             match v {
                 Value::Str(s) => return Ok(Value::Str(s.clone())),
                 // Numbers render exactly as they do on JSON egress — JS `Number.toString`
@@ -305,7 +306,7 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
             Value::List(_) => Ok(v.clone()),
             Value::Str(s) => Ok(Value::List(
                 s.encode_utf16()
-                    .map(|u| Value::Str(Arc::from(String::from_utf16_lossy(&[u]).as_str())))
+                    .map(|u| Value::Str(GStr::from(String::from_utf16_lossy(&[u]).as_str())))
                     .collect(),
             )),
             other => Ok(Value::List(vec![other.clone()])),

@@ -4,7 +4,7 @@ fn n(x: f64) -> Value {
     Value::Num(x)
 }
 fn s(x: &str) -> Value {
-    Value::Str(Arc::from(x))
+    Value::Str(x.into())
 }
 
 #[test]

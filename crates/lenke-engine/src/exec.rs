@@ -322,7 +322,7 @@ fn resolve_elem(v: Value, store: &Store) -> Value {
 
 fn col_into_values(col: Col, store: &Store) -> Vec<Value> {
     match col {
-        Col::Str(data) => data.into_iter().map(Value::Str).collect(),
+        Col::Str(data) => data.into_iter().map(|s| Value::Str(s.into())).collect(),
         Col::Num(data) => data.into_iter().map(Value::Num).collect(),
         Col::Bool(data) => data.into_iter().map(Value::Bool).collect(),
         Col::Gen(data) => data.into_iter().map(|v| resolve_elem(v, store)).collect(),
@@ -346,7 +346,7 @@ fn render_col_into(col: Col, store: &Store, out: &mut [Value], c: usize, ncols: 
     match col {
         Col::Str(data) => {
             for (i, s) in data.into_iter().enumerate() {
-                out[i * ncols + c] = Value::Str(s);
+                out[i * ncols + c] = Value::Str(s.into());
             }
         }
         Col::Num(data) => {
@@ -1177,7 +1177,11 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                     }
                     let ids: Vec<Value> = path
                         .into_iter()
-                        .map(|v| store.node_ext_id(v).map_or(Value::Null, Value::Str))
+                        .map(|v| {
+                            store
+                                .node_ext_id(v)
+                                .map_or(Value::Null, |s| Value::Str(s.into()))
+                        })
                         .collect();
                     out.push(Value::List(ids));
                 }
@@ -5088,7 +5092,7 @@ fn broadcast(v: Value, n: usize) -> Col {
     match v {
         Value::Num(x) => Col::Num(vec![x; n]),
         Value::Bool(b) => Col::Bool(vec![b; n]),
-        Value::Str(s) => Col::Str(vec![s; n]),
+        Value::Str(s) => Col::Str(vec![std::sync::Arc::from(s.as_str()); n]),
         // Null and List have no unboxed column form.
         other => Col::Gen(vec![other; n]),
     }

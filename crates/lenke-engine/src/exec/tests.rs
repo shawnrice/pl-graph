@@ -1,7 +1,6 @@
 use super::*;
 use crate::ir::Plan;
 use crate::store::Builder;
-use std::sync::Arc;
 
 /// The iterative `varlen_walk` must emit the exact same paths, in the exact same
 /// order, as the recursive `varlen_dfs` it replaced — over every mode/direction/bound
@@ -298,7 +297,7 @@ fn n(x: f64) -> Value {
     Value::Num(x)
 }
 fn s(x: &str) -> Value {
-    Value::Str(Arc::from(x))
+    Value::Str(x.into())
 }
 fn prop(slot: usize, key: &str) -> Expr {
     Expr::Prop {
@@ -6328,7 +6327,6 @@ mod perf {
     use crate::opt::optimize;
     use crate::store::{Builder, Store};
     use crate::value::Value;
-    use std::sync::Arc;
     use std::time::Instant;
 
     fn build(nodes: usize, deg: usize) -> Store {
@@ -6337,7 +6335,7 @@ mod perf {
             b.node(
                 &["Person"],
                 &[
-                    ("name", Value::Str(Arc::from(format!("n{i}").as_str()))),
+                    ("name", Value::Str(format!("n{i}").as_str().into())),
                     ("age", Value::Num((i % 100) as f64)),
                 ],
             );

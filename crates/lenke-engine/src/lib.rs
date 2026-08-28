@@ -59,4 +59,4 @@ pub mod store;
 // cache independently of the query layers. Re-exported here so `crate::{value, batch,
 // temporal, error_codes}` and `lenke_engine::{…}` paths are unchanged. `error_codes`
 // keeps its @generated sync-with-@lenke/errors contract (drift test targets core now).
-pub use lenke_engine_core::{batch, error_codes, temporal, value};
+pub use lenke_engine_core::{batch, error_codes, gstr, temporal, value};

@@ -179,7 +179,7 @@ pub(super) fn frontier_group_by(
                     } else {
                         let g = key_out.len() as u32;
                         seen.insert(s, g);
-                        key_out.push(Value::Str(data[node as usize].clone()));
+                        key_out.push(Value::Str(data[node as usize].clone().into()));
                         g
                     }
                 } else {
@@ -200,7 +200,7 @@ pub(super) fn frontier_group_by(
                     let c = codes[node as usize] as usize;
                     if code_to_group[c] == u32::MAX {
                         code_to_group[c] = key_out.len() as u32;
-                        key_out.push(Value::Str(dict[c].clone()));
+                        key_out.push(Value::Str(dict[c].clone().into()));
                     }
                     code_to_group[c]
                 } else {
@@ -432,7 +432,7 @@ fn try_dict_grouping(
             if code_to_group[c] == u32::MAX {
                 code_to_group[c] = first_row.len() as u32;
                 first_row.push(i);
-                key_vals.push(Value::Str(dict[c].clone()));
+                key_vals.push(Value::Str(dict[c].clone().into()));
             }
             code_to_group[c]
         } else {

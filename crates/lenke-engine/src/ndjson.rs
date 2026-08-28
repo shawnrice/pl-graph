@@ -19,6 +19,7 @@
 //! no JSON form and is written as `null`, consistent with the engine's
 //! NaN/Inf→null policy.
 
+use crate::gstr::GStr;
 use std::sync::Arc;
 
 use crate::store::Store;
@@ -570,7 +571,7 @@ fn json_value(j: &Json) -> Result<Value, String> {
         Json::Null => Value::Null,
         Json::Bool(b) => Value::Bool(*b),
         Json::Num(x) => Value::Num(*x),
-        Json::Str(s) => Value::Str(Arc::from(s.as_str())),
+        Json::Str(s) => Value::Str(GStr::from(s.as_str())),
         Json::Arr(items) => Value::List(items.iter().map(json_value).collect::<Result<_, _>>()?),
         // A single-key `{"@<tag>":"<iso>"}` object is a tagged temporal — the
         // inverse of the egress in `encode_value`. Any other object shape is not a
@@ -807,7 +808,7 @@ mod tests {
     use std::sync::Arc;
 
     fn s(x: &str) -> Value {
-        Value::Str(Arc::from(x))
+        Value::Str(x.into())
     }
 
     #[test]

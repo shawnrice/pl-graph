@@ -90,7 +90,7 @@ fn csr_overlay_matches_and_invalidates_on_write() {
 }
 
 fn s(x: &str) -> Value {
-    Value::Str(Arc::from(x))
+    Value::Str(x.into())
 }
 fn n(x: f64) -> Value {
     Value::Num(x)
@@ -1214,13 +1214,12 @@ fn record_type_name_round_trips() {
 
 #[test]
 fn dict_max_distinct_knob_gates_high_cardinality_encoding() {
-    use std::sync::Arc;
     let mk = || {
         // 5000 distinct city values, each appearing 3× (15000 rows): repeats heavily,
         // but distinct > the default 4096 dict cap.
         let mut s = Store::default();
         for i in 0..15_000u32 {
-            let v = Value::Str(Arc::from(format!("city-{:05}", i % 5000).as_str()));
+            let v = Value::Str(format!("city-{:05}", i % 5000).as_str().into());
             s.add_node(&["P"], &[("city", v)]);
         }
         s
@@ -1248,7 +1247,7 @@ fn dict_max_distinct_knob_gates_high_cardinality_encoding() {
     for i in 0..10_000u32 {
         c.add_node(
             &["P"],
-            &[("uid", Value::Str(Arc::from(format!("uid-{i}").as_str())))],
+            &[("uid", Value::Str(format!("uid-{i}").as_str().into()))],
         );
     }
     c.set_limit(ConfigId::LimitsDictMaxDistinct, 1_000_000);

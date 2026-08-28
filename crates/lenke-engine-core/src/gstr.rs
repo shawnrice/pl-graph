@@ -200,10 +200,10 @@ impl Borrow<str> for GStr {
 impl PartialEq for GStr {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        // Reject on length and the 4-byte prefix before touching the heap.
-        self.len == other.len
-            && self.prefix == other.prefix
-            && (self.is_inline() || self.as_bytes() == other.as_bytes())
+        // Reject on length and the 4-byte prefix (a cheap early-out, and for long
+        // strings it avoids a deref), then confirm on the full bytes — the prefix alone
+        // is NOT sufficient for an inline string, whose bytes run past it.
+        self.len == other.len && self.prefix == other.prefix && self.as_bytes() == other.as_bytes()
     }
 }
 impl Eq for GStr {}
@@ -335,6 +335,11 @@ mod tests {
             "abcdefghijklZ",
             "zzz",
             "z",
+            // Same length AND same 4-byte prefix, differing only PAST the prefix — the
+            // inline case a prefix-only compare would wrongly call equal.
+            "key0005",
+            "key0006",
+            "key0999",
         ];
         for &a in &samples {
             for &b in &samples {
