@@ -8,7 +8,6 @@
 //! own native module ([`crate::ndjson`]); binary is the engine's own format.
 
 use crate::gstr::GStr;
-use std::sync::Arc;
 
 use lenke_codec::{codes, CodecError, Edge as CEdge, GraphData, Node as CNode, Value as CValue};
 
@@ -203,7 +202,7 @@ fn from_graph_data(
             .iter()
             .map(|(k, v)| Ok((k.as_str(), value_from_neutral(v, on_err)?)))
             .collect::<Result<Vec<_>, CodecError>>()?;
-        store.add_node_with_id(&Arc::from(n.id.as_str()), &lrefs, &props);
+        store.add_node_with_id(&n.id, &lrefs, &props);
     }
 
     for e in data.edges {
@@ -213,7 +212,7 @@ fn from_graph_data(
         let mut labels = e.labels.iter();
         let etype = labels.next().map(String::as_str).unwrap_or("");
         let eid = match &e.id {
-            Some(id) => store.add_edge_with_id(&Arc::from(id.as_str()), from, to, etype),
+            Some(id) => store.add_edge_with_id(id, from, to, etype),
             None => store.add_edge(from, to, etype),
         };
         let extra: Vec<&str> = labels.map(String::as_str).collect();
@@ -243,7 +242,7 @@ fn endpoint(store: &mut Store, ext: &str, strict: bool) -> Result<u32, CodecErro
             format!("edge references unknown node id {ext}"),
         ));
     }
-    Ok(store.add_node_with_id(&Arc::from(ext), &[], &[]))
+    Ok(store.add_node_with_id(ext, &[], &[]))
 }
 
 // --------------------------------------------------------------- dispatch ---
@@ -542,7 +541,7 @@ impl lenke_codec::GraphSink for StoreSink {
             .iter()
             .map(|(k, v)| Ok((*k, decval_to_value(v, self.on_err)?)))
             .collect::<Result<_, CodecError>>()?;
-        self.store.add_node_with_id(&Arc::from(id), labels, &props);
+        self.store.add_node_bulk(id, labels, &props);
         Ok(())
     }
 
@@ -560,7 +559,7 @@ impl lenke_codec::GraphSink for StoreSink {
         let mut labels = labels.iter();
         let etype = labels.next().copied().unwrap_or("");
         let eid = match id {
-            Some(id) => self.store.add_edge_with_id(&Arc::from(id), from, to, etype),
+            Some(id) => self.store.add_edge_with_id(id, from, to, etype),
             None => self.store.add_edge(from, to, etype),
         };
         let extra: Vec<&str> = labels.copied().collect();

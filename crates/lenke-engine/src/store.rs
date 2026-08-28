@@ -7,7 +7,9 @@
 //! the whole point of the columnar model, present from the first slice rather
 //! than retrofitted.
 
+use crate::exec::fnv::Map as FnvMap;
 use crate::gstr::GStr;
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -299,6 +301,66 @@ impl Column {
             Self::Gen { data, present } => {
                 data.push(Value::Null);
                 present.push(false);
+            }
+        }
+    }
+
+    /// Append `v` as a NEW present cell — the bulk-load append that skips the
+    /// `push_absent` + `set` two-step (which grows the column then overwrites the
+    /// slot). Produces exactly the same column state; a present-null and a temporal
+    /// take the grow-then-`set` path so their (fiddly) logic stays in one place, and
+    /// a type mismatch promotes to `Gen` first, just like `set`.
+    fn push_value(&mut self, v: Value) {
+        self.decode_dict();
+        if !self.accepts(&v) {
+            *self = self.to_gen();
+        }
+        match (&mut *self, v) {
+            (
+                Self::Num {
+                    data,
+                    present,
+                    nulls,
+                },
+                Value::Num(x),
+            ) => {
+                data.push(x);
+                present.push(true);
+                nulls.push(false);
+            }
+            (
+                Self::Str {
+                    data,
+                    present,
+                    nulls,
+                },
+                Value::Str(s),
+            ) => {
+                data.push(s);
+                present.push(true);
+                nulls.push(false);
+            }
+            (
+                Self::Bool {
+                    data,
+                    present,
+                    nulls,
+                },
+                Value::Bool(b),
+            ) => {
+                data.push(b);
+                present.push(true);
+                nulls.push(false);
+            }
+            (Self::Gen { data, present }, val) => {
+                data.push(val);
+                present.push(true);
+            }
+            (col, val) => {
+                // Present-null / temporal: grow then set — reuses `set`'s logic.
+                col.push_absent();
+                let i = col.len() - 1;
+                col.set(i, val);
             }
         }
     }
@@ -1051,9 +1113,9 @@ pub struct Store {
     /// Resource ceilings (default [`GraphLimits::default`]); set via [`Store::set_limit`].
     limits: GraphLimits,
     /// label name -> the sorted node ids carrying it (the scan seed).
-    by_label: HashMap<String, Vec<u32>>,
+    by_label: FnvMap<String, Vec<u32>>,
     /// property name -> its typed column (length == node_count).
-    props: HashMap<String, Column>,
+    props: FnvMap<String, Column>,
     /// Cached SORTED property-key list for element-map materialization. Property keys
     /// are only ever ADDED to `props` (a removed value keeps its column), so `props.len()`
     /// changing is exactly the key SET changing — the cache self-invalidates on a length
@@ -1067,7 +1129,7 @@ pub struct Store {
     min_label_cache:
         std::sync::RwLock<Option<(usize, std::sync::Arc<(Vec<std::sync::Arc<str>>, Vec<u32>)>)>>,
     /// edge-type name -> interned id, and the reverse.
-    etype_ids: HashMap<String, u32>,
+    etype_ids: FnvMap<String, u32>,
     /// per-node outgoing / incoming adjacency, indexed by node id.
     out_adj: Vec<Vec<Adj>>,
     in_adj: Vec<Vec<Adj>>,
@@ -1104,7 +1166,7 @@ pub struct Store {
     edge_ext: Vec<GStr>,
     /// external node id → dense id, for resolving edge endpoints on ingest and
     /// looking a node up by its stable id. A tombstoned node keeps its entry.
-    ext_to_node: HashMap<GStr, u32>,
+    ext_to_node: FnvMap<GStr, u32>,
     /// tombstones, indexed by node id. A deleted node keeps its id slot (ids are
     /// dense and never reused) but is skipped by every scan and carries no edges
     /// or properties. `deleted.len() == node_count`.
@@ -1151,7 +1213,7 @@ pub struct Store {
     /// less hot path than node scans, and eids are sparse after deletes. A deleted
     /// edge's props are left behind (eids are never reused, so a dead eid is never
     /// read); reclaiming them is a later tidy.
-    edge_props: HashMap<String, EdgeMap>,
+    edge_props: FnvMap<String, EdgeMap>,
     /// hash indexes on a node property `key`: value's group-key bytes -> node ids
     /// (any label; the seek intersects with the label). Maintained on writes
     /// through the primitives, so a transaction rollback (which replays the
@@ -1231,7 +1293,7 @@ pub struct Store {
     /// invalidation signal behind global `version` — a React subscription watches
     /// only the tokens its query reads, so an unrelated mutation does not
     /// re-render it. Also metadata (never in a result), read via [`Store::epoch`].
-    epochs: HashMap<String, u64>,
+    epochs: FnvMap<String, u64>,
 }
 
 // Store holds two derived caches behind `RwLock` (which is not `Clone`), so `Clone`
@@ -2526,12 +2588,75 @@ impl Store {
 
     /// Add a node carrying an explicit external id (used by ingest, which preserves
     /// the id from the file). Returns the dense id.
-    pub fn add_node_with_id(
-        &mut self,
-        ext: &Arc<str>,
-        labels: &[&str],
-        props: &[(&str, Value)],
-    ) -> u32 {
+    /// Bulk-load node insert. A single pass over the columns gives each ONE push
+    /// (the node's value, or absent) — no per-property hashmap lookup and no
+    /// push-absent-then-overwrite that [`add_node_with_id`] pays. Skips per-property
+    /// index upkeep, so it delegates to [`add_node_with_id`] when any index exists (a
+    /// fresh decode has none). Byte-identical result to `add_node_with_id`.
+    pub fn add_node_bulk(&mut self, ext: &str, labels: &[&str], props: &[(&str, Value)]) -> u32 {
+        // The fast path assumes no index to maintain and a small property set.
+        if !self.indexes.is_empty() || props.len() > 64 {
+            return self.add_node_with_id(ext, labels, props);
+        }
+        self.touch();
+        for l in labels {
+            self.bump_epoch(l);
+        }
+        for (k, _) in props {
+            self.bump_epoch(k);
+        }
+        self.invalidate_csr();
+        let id = self.node_count as u32;
+        self.node_count += 1;
+        let gid = GStr::from(ext);
+        self.node_ext.push(gid.clone());
+        self.ext_to_node.insert(gid, id);
+        // One pass over existing columns: push this node's value, or absent — no
+        // per-property hashmap lookup, no overwrite. `matched` marks props that landed
+        // in an existing column so the rest can create theirs.
+        let mut matched: u64 = 0;
+        for (key, col) in &mut self.props {
+            if let Some(pos) = props.iter().position(|(k, _)| *k == key.as_str()) {
+                col.push_value(props[pos].1.clone());
+                matched |= 1u64 << pos;
+            } else {
+                col.push_absent();
+            }
+        }
+        // Props with no column yet: create it, absent for the `id` prior nodes.
+        for (i, (k, v)) in props.iter().enumerate() {
+            if matched & (1u64 << i) == 0 {
+                let mut col = Column::new_absent(v, id as usize);
+                col.push_value((*v).clone());
+                self.props.insert((*k).to_string(), col);
+            }
+        }
+        self.out_adj.push(Vec::new());
+        self.in_adj.push(Vec::new());
+        if self.edge_type_index {
+            self.out_type_idx.push(U32Map::default());
+            self.in_type_idx.push(U32Map::default());
+        }
+        if let Some(ix) = &mut self.interval {
+            ix.by_lo.push(Vec::new());
+            ix.by_hi.push(Vec::new());
+        }
+        self.deleted.push(false);
+        for l in labels {
+            if let Some(bucket) = self.by_label.get_mut(*l) {
+                bucket.push(id);
+            } else {
+                self.by_label.entry((*l).to_string()).or_default().push(id);
+            }
+        }
+        if let Some(log) = &mut self.undo {
+            log.push(Undo::AddNode);
+        }
+        self.record_change(Change::NodeAdded(id));
+        id
+    }
+
+    pub fn add_node_with_id(&mut self, ext: &str, labels: &[&str], props: &[(&str, Value)]) -> u32 {
         self.touch();
         for l in labels {
             self.bump_epoch(l);
@@ -2542,8 +2667,11 @@ impl Store {
         self.invalidate_csr(); // a new node changes the adjacency shape
         let id = self.node_count as u32;
         self.node_count += 1;
-        self.node_ext.push(GStr::from(ext.as_ref()));
-        self.ext_to_node.insert(GStr::from(ext.as_ref()), id);
+        // Build the id's `GStr` ONCE and share it between the dense array and the
+        // reverse map (a long id would otherwise allocate twice).
+        let gid = GStr::from(ext);
+        self.node_ext.push(gid.clone());
+        self.ext_to_node.insert(gid, id);
         // Keep every existing column the same length as the node set.
         for col in self.props.values_mut() {
             col.push_absent();
@@ -2561,7 +2689,13 @@ impl Store {
         self.deleted.push(false);
         for l in labels {
             // ids are handed out increasing, so appending keeps the bucket sorted.
-            self.by_label.entry((*l).to_string()).or_default().push(id);
+            // Borrow-lookup first so an EXISTING label bucket costs no key alloc
+            // (the label repeats across most nodes; `entry` would alloc every time).
+            if let Some(bucket) = self.by_label.get_mut(*l) {
+                bucket.push(id);
+            } else {
+                self.by_label.entry((*l).to_string()).or_default().push(id);
+            }
         }
         for (k, v) in props {
             // Apply the initial props directly; the single AddNode undo (which
@@ -2587,7 +2721,7 @@ impl Store {
 
     /// Add an edge carrying an explicit external id (used by ingest). Returns the
     /// eid.
-    pub fn add_edge_with_id(&mut self, ext: &Arc<str>, from: u32, to: u32, label: &str) -> u32 {
+    pub fn add_edge_with_id(&mut self, ext: &str, from: u32, to: u32, label: &str) -> u32 {
         self.touch();
         self.bump_epoch(label);
         self.invalidate_csr();
@@ -2609,7 +2743,7 @@ impl Store {
         self.edge_has_extra.push(false); // no secondary labels until set_edge_extra_labels
         self.edge_ends.push((from, to));
         debug_assert_eq!(self.edge_ext.len() as u32, eid, "edge_ext indexed by eid");
-        self.edge_ext.push(GStr::from(ext.as_ref()));
+        self.edge_ext.push(GStr::from(ext));
         self.out_adj[from as usize].push(Adj {
             nbr: to,
             etype,
@@ -4105,11 +4239,11 @@ impl Store {
 #[derive(Default)]
 pub struct Builder {
     node_count: usize,
-    by_label: HashMap<String, Vec<u32>>,
+    by_label: FnvMap<String, Vec<u32>>,
     // Collected as (node, value) pairs per key, materialized into typed columns
     // at `build()` — so the builder stays simple and the store stays typed.
     props: HashMap<String, Vec<(u32, Value)>>,
-    etype_ids: HashMap<String, u32>,
+    etype_ids: FnvMap<String, u32>,
     edges: Vec<(u32, u32, u32)>, // (from, to, etype)
 }
 
@@ -4151,7 +4285,7 @@ impl Builder {
         // Builder-created elements mint external ids (dense id string for nodes,
         // `e<eid>` for edges) — the same scheme `add_node`/`add_edge` use.
         let node_ext: Vec<GStr> = (0..n).map(|i| GStr::from(i.to_string().as_str())).collect();
-        let ext_to_node: HashMap<GStr, u32> = node_ext
+        let ext_to_node: FnvMap<GStr, u32> = node_ext
             .iter()
             .enumerate()
             .map(|(i, e)| (e.clone(), i as u32))
@@ -4211,7 +4345,7 @@ impl Builder {
             cardinality: Vec::new(),
             validators: Vec::new(),
             invariants: Vec::new(),
-            edge_props: HashMap::new(),
+            edge_props: FnvMap::default(),
             indexes: Vec::new(),
             ranges: Vec::new(),
             // The edge-type index is opt-in; bulk build never turns it on (the
@@ -4231,7 +4365,7 @@ impl Builder {
             edge_num: HashMap::new(),
             edge_num_fresh: false,
             version: 0,
-            epochs: HashMap::new(),
+            epochs: FnvMap::default(),
         };
         // Flatten the freshly-built adjacency into the CSR read overlay, and densify
         // the numeric edge properties into the typed read overlay.
