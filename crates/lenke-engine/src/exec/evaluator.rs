@@ -582,11 +582,13 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                         // typed `Col::Str` — no per-row `Value::Str` box, and the JSON
                         // writer takes its string fast path. A single unlabelled node
                         // (needs a NULL, which `Col::Str` cannot hold) falls to `Col::Gen`.
-                        let mut labels: Vec<std::sync::Arc<str>> = Vec::with_capacity(ids.len());
+                        let mut labels: Vec<GStr> = Vec::with_capacity(ids.len());
                         let mut all_labelled = true;
                         for &id in ids {
                             match code_of.get(id as usize) {
-                                Some(&c) if c != u32::MAX => labels.push(names[c as usize].clone()),
+                                Some(&c) if c != u32::MAX => {
+                                    labels.push(names[c as usize].clone().into())
+                                }
                                 _ => {
                                     all_labelled = false;
                                     break;

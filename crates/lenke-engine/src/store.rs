@@ -7,6 +7,7 @@
 //! the whole point of the columnar model, present from the first slice rather
 //! than retrofitted.
 
+use crate::gstr::GStr;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -125,7 +126,7 @@ pub enum Column {
         nulls: Vec<bool>,
     },
     Str {
-        data: Vec<Arc<str>>,
+        data: Vec<GStr>,
         present: Vec<bool>,
         nulls: Vec<bool>,
     },
@@ -138,7 +139,7 @@ pub enum Column {
     /// `Value::Str` as an equivalent `Str` column, and any typed write decodes it
     /// back to `Str` first (writes are the cold path), so it is a pure read encoding.
     Dict {
-        dict: Vec<Arc<str>>,
+        dict: Vec<GStr>,
         codes: Vec<u32>,
         present: Vec<bool>,
         nulls: Vec<bool>,
@@ -180,13 +181,13 @@ impl Column {
         let idx = i;
         match self {
             Self::Num { data, present, .. } if present[idx] => Value::Num(data[idx]),
-            Self::Str { data, present, .. } if present[idx] => Value::Str(data[idx].clone().into()),
+            Self::Str { data, present, .. } if present[idx] => Value::Str(data[idx].clone()),
             Self::Dict {
                 dict,
                 codes,
                 present,
                 ..
-            } if present[idx] => Value::Str(dict[codes[idx] as usize].clone().into()),
+            } if present[idx] => Value::Str(dict[codes[idx] as usize].clone()),
             Self::Bool { data, present, .. } if present[idx] => Value::Bool(data[idx]),
             Self::Temporal { data, present, .. } if present[idx] => Value::Temporal(data[idx]),
             Self::Gen { data, present } if present[idx] => data[idx].clone(),
@@ -216,7 +217,7 @@ impl Column {
                 nulls: vec![false; n],
             },
             Value::Str(_) => Self::Str {
-                data: vec![Arc::from(""); n],
+                data: vec![GStr::from(""); n],
                 present: vec![false; n],
                 nulls: vec![false; n],
             },
@@ -262,7 +263,7 @@ impl Column {
                 present,
                 nulls,
             } => {
-                data.push(Arc::from(""));
+                data.push(GStr::from(""));
                 present.push(false);
                 nulls.push(false);
             }
@@ -367,14 +368,14 @@ impl Column {
         let codes = std::mem::take(codes);
         let present = std::mem::take(present);
         let nulls = std::mem::take(nulls);
-        let data: Vec<Arc<str>> = codes
+        let data: Vec<GStr> = codes
             .iter()
             .zip(&present)
             .map(|(&c, &p)| {
                 if p {
                     dict[c as usize].clone()
                 } else {
-                    Arc::from("")
+                    GStr::from("")
                 }
             })
             .collect();
@@ -460,7 +461,7 @@ impl Column {
                 },
                 Value::Str(s),
             ) => {
-                data[i] = std::sync::Arc::from(s.as_str());
+                data[i] = s;
                 present[i] = true;
                 nulls[i] = false;
             }
@@ -4220,16 +4221,16 @@ impl Builder {
 /// high-cardinality column costs only the capped prefix, not a full scan.
 #[allow(clippy::type_complexity)]
 fn dict_encode(
-    data: Vec<Arc<str>>,
+    data: Vec<GStr>,
     present: Vec<bool>,
     nulls: Vec<bool>,
     cap: usize,
-) -> Result<Column, (Vec<Arc<str>>, Vec<bool>, Vec<bool>)> {
+) -> Result<Column, (Vec<GStr>, Vec<bool>, Vec<bool>)> {
     // FNV over the string bytes — the build-time distinct-count lookup is the whole
     // cost of encoding, so the hasher matters; std's SipHash is DoS-hardened overkill
     // for interning our own ingested values.
-    let mut dict: Vec<Arc<str>> = Vec::new();
-    let mut lookup: crate::exec::fnv::Map<Arc<str>, u32> = crate::exec::fnv::Map::default();
+    let mut dict: Vec<GStr> = Vec::new();
+    let mut lookup: crate::exec::fnv::Map<GStr, u32> = crate::exec::fnv::Map::default();
     let mut codes = vec![0u32; data.len()];
     for (i, s) in data.iter().enumerate() {
         if !present[i] {
@@ -4279,11 +4280,11 @@ fn materialize(pairs: Vec<(u32, Value)>, n: usize) -> Column {
         }
         col
     } else if all(&|v| matches!(v, Value::Str(_))) {
-        let mut data: Vec<Arc<str>> = vec![Arc::from(""); n];
+        let mut data: Vec<GStr> = vec![GStr::from(""); n];
         let mut present = vec![false; n];
         for (i, v) in pairs {
             if let Value::Str(s) = v {
-                data[i as usize] = std::sync::Arc::from(s.as_str());
+                data[i as usize] = s;
                 present[i as usize] = true;
             }
         }

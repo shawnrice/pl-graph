@@ -2,6 +2,7 @@ use super::evaluator::*;
 use super::order::FRONTIER_FOLD_MIN;
 use super::*;
 use crate::batch::{Batch, Col};
+use crate::gstr::GStr;
 use crate::ir::{Agg, AggFn};
 use crate::store::{Column, Store};
 use crate::value::{self, Value};
@@ -179,7 +180,7 @@ pub(super) fn frontier_group_by(
                     } else {
                         let g = key_out.len() as u32;
                         seen.insert(s, g);
-                        key_out.push(Value::Str(data[node as usize].clone().into()));
+                        key_out.push(Value::Str(data[node as usize].clone()));
                         g
                     }
                 } else {
@@ -200,7 +201,7 @@ pub(super) fn frontier_group_by(
                     let c = codes[node as usize] as usize;
                     if code_to_group[c] == u32::MAX {
                         code_to_group[c] = key_out.len() as u32;
-                        key_out.push(Value::Str(dict[c].clone().into()));
+                        key_out.push(Value::Str(dict[c].clone()));
                     }
                     code_to_group[c]
                 } else {
@@ -432,7 +433,7 @@ fn try_dict_grouping(
             if code_to_group[c] == u32::MAX {
                 code_to_group[c] = first_row.len() as u32;
                 first_row.push(i);
-                key_vals.push(Value::Str(dict[c].clone().into()));
+                key_vals.push(Value::Str(dict[c].clone()));
             }
             code_to_group[c]
         } else {
@@ -519,10 +520,10 @@ fn group_by<K: std::hash::Hash + Eq>(
 /// allocated `Box<str>` — so a million distinct strings cost a million refcount
 /// bumps, not a million heap allocations + copies. Lookups borrow `&str`, so a
 /// repeated string never touches the allocator.
-fn group_by_arc(keys: &[Arc<str>]) -> (Vec<u32>, Vec<usize>) {
+fn group_by_arc(keys: &[GStr]) -> (Vec<u32>, Vec<usize>) {
     // Pre-size for the worst case (all-distinct) so the map never rehashes while
     // filling — the rehash chain dominated an all-unique million-key merge.
-    let mut of: FnvMap<Arc<str>, u32> =
+    let mut of: FnvMap<GStr, u32> =
         FnvMap::with_capacity_and_hasher(keys.len(), Default::default());
     let mut group_of = Vec::with_capacity(keys.len());
     let mut first_row = Vec::new();
@@ -531,7 +532,7 @@ fn group_by_arc(keys: &[Arc<str>]) -> (Vec<u32>, Vec<usize>) {
             Some(&g) => g,
             None => {
                 let g = first_row.len() as u32;
-                of.insert(Arc::clone(k), g);
+                of.insert(k.clone(), g);
                 first_row.push(i);
                 g
             }

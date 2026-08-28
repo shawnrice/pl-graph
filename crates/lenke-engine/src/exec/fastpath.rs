@@ -2,6 +2,7 @@ use super::aggregation::*;
 use super::evaluator::*;
 use super::*;
 use crate::batch::{Batch, Col};
+use crate::gstr::GStr;
 use crate::ir::{Expr, Plan};
 use crate::store::{Column, Store};
 use crate::value::{self, Value};
@@ -481,7 +482,7 @@ pub(super) fn typed_col_from_values(out: Vec<Value>) -> Col {
             out.into_iter()
                 .map(|v| {
                     if let Value::Str(s) = v {
-                        std::sync::Arc::from(s.as_str())
+                        s
                     } else {
                         unreachable!()
                     }
@@ -527,7 +528,7 @@ pub(super) fn try_eval_dict_scalar(expr: &Expr, store: &Store, batch: &Batch) ->
     };
     let mut per_code = Vec::with_capacity(dict.len());
     for dv in dict.iter() {
-        per_code.push(ev(&Value::Str(dv.clone().into()))?);
+        per_code.push(ev(&Value::Str(dv.clone()))?);
     }
     let null_val = ev(&Value::Null)?;
     Some(Col::Gen(
@@ -571,7 +572,7 @@ pub(super) fn try_filter_keep_dict(
             pred,
             slot,
             &key,
-            &Value::Str(dv.clone().into()),
+            &Value::Str(dv.clone()),
             store,
         )?);
     }
@@ -656,7 +657,7 @@ pub(super) fn try_stream_dict_pred_count(
     };
     let mut matches = Vec::with_capacity(dict.len());
     for dv in dict.iter() {
-        matches.push(eval_const(&Value::Str(dv.clone().into()))?);
+        matches.push(eval_const(&Value::Str(dv.clone()))?);
     }
     let null_match = eval_const(&Value::Null)?;
     let mut count = 0u64;
@@ -752,7 +753,7 @@ pub(super) fn try_distinct_dict_col(input: &Plan, store: &Store) -> Option<Batch
         return None;
     };
     let mut seen = vec![false; dict.len()];
-    let mut out: Vec<Arc<str>> = Vec::new();
+    let mut out: Vec<GStr> = Vec::new();
     for &id in ids {
         if id == u32::MAX {
             return None; // a NULL value in the dedup — let the general path handle it
@@ -1643,7 +1644,7 @@ pub(super) fn try_varlen_agg(
                     });
                 }
             });
-            best.map_or(Value::Null, |v| Value::Str(data[v as usize].clone().into()))
+            best.map_or(Value::Null, |v| Value::Str(data[v as usize].clone()))
         }
         (
             AggFn::Min | AggFn::Max,
@@ -1674,7 +1675,7 @@ pub(super) fn try_varlen_agg(
                 }
             });
             best.map_or(Value::Null, |v| {
-                Value::Str(dict[codes[v as usize] as usize].clone().into())
+                Value::Str(dict[codes[v as usize] as usize].clone())
             })
         }
         (AggFn::Min | AggFn::Max, _) => return None, // Temporal/Bool/Gen → general path
@@ -2091,7 +2092,7 @@ pub(super) fn try_scan_dict_count(
             key_col.push(Value::Null);
             cnt_col.push(Value::Num(null_count as f64));
         } else {
-            key_col.push(Value::Str(dict[code as usize].clone().into()));
+            key_col.push(Value::Str(dict[code as usize].clone()));
             cnt_col.push(Value::Num(counts[code as usize] as f64));
         }
     }
@@ -2163,7 +2164,7 @@ pub(super) fn try_frontier_dict_count(
             key_col.push(Value::Null);
             cnt_col.push(Value::Num(null_count as f64));
         } else {
-            key_col.push(Value::Str(dict[code as usize].clone().into()));
+            key_col.push(Value::Str(dict[code as usize].clone()));
             cnt_col.push(Value::Num(counts[code as usize] as f64));
         }
     }
@@ -2284,7 +2285,7 @@ pub(super) fn try_scan_group_agg(
             run!(
                 present,
                 |i: usize| data[i].as_ref(),
-                |i: usize| Value::Str(data[i].clone().into()),
+                |i: usize| Value::Str(data[i].clone()),
                 ()
             );
         }
@@ -2306,7 +2307,7 @@ pub(super) fn try_scan_group_agg(
                     if code_to_group[c] == u32::MAX {
                         let g = group_keys.len() as u32;
                         code_to_group[c] = g;
-                        group_keys.push(Value::Str(dict[c].clone().into()));
+                        group_keys.push(Value::Str(dict[c].clone()));
                         acc.push(GroupAcc {
                             rows: 0,
                             aggs: vec![(0.0, 0, None); na],

@@ -1,6 +1,7 @@
 use super::varlen::{run_varlen, DistinctEndpointEmit};
 use super::*;
 use crate::batch::{Batch, Col};
+use crate::gstr::GStr;
 use crate::ir::Expr;
 use crate::store::{Column, Store};
 use crate::value::{self, Value};
@@ -25,7 +26,7 @@ enum KeyPart<'a> {
 
 enum ColKeyer<'a> {
     Dict {
-        dict: &'a [std::sync::Arc<str>],
+        dict: &'a [GStr],
         codes: &'a [u32],
         present: &'a [bool],
     },
@@ -34,7 +35,7 @@ enum ColKeyer<'a> {
         present: &'a [bool],
     },
     Str {
-        data: &'a [std::sync::Arc<str>],
+        data: &'a [GStr],
         present: &'a [bool],
     },
     Bool {
@@ -162,14 +163,14 @@ impl<'a> ColKeyer<'a> {
                 present,
             } => {
                 if present[i] {
-                    Value::Str(dict[codes[i] as usize].clone().into())
+                    Value::Str(dict[codes[i] as usize].clone())
                 } else {
                     Value::Null
                 }
             }
             Self::Str { data, present } => {
                 if present[i] {
-                    Value::Str(data[i].clone().into())
+                    Value::Str(data[i].clone())
                 } else {
                     Value::Null
                 }
@@ -507,7 +508,7 @@ pub(super) fn try_distinct_frontier_prop(input: &Plan, store: &Store) -> Option<
                         continue; // duplicate endpoint node — already accounted for
                     }
                     if seen.insert(data[i].as_ref()) {
-                        out.push(Value::Str(data[i].clone().into()));
+                        out.push(Value::Str(data[i].clone()));
                     }
                 } else {
                     null_once(&mut out, &mut saw_null);
@@ -525,7 +526,7 @@ pub(super) fn try_distinct_frontier_prop(input: &Plan, store: &Store) -> Option<
                 if node != u32::MAX && present[node as usize] {
                     let c = codes[node as usize] as usize;
                     if !std::mem::replace(&mut seen[c], true) {
-                        out.push(Value::Str(dict[c].clone().into()));
+                        out.push(Value::Str(dict[c].clone()));
                     }
                 } else {
                     null_once(&mut out, &mut saw_null);
@@ -744,7 +745,7 @@ pub(super) fn try_distinct_scan_prop(input: &Plan, store: &Store) -> Option<Batc
             scan_visit(store, label, |i| {
                 if present[i] {
                     if seen.insert(data[i].as_ref()) {
-                        out.push(Value::Str(data[i].clone().into()));
+                        out.push(Value::Str(data[i].clone()));
                     }
                 } else if !saw_null {
                     saw_null = true;
@@ -766,7 +767,7 @@ pub(super) fn try_distinct_scan_prop(input: &Plan, store: &Store) -> Option<Batc
                 if present[i] {
                     let c = codes[i] as usize;
                     if !std::mem::replace(&mut seen[c], true) {
-                        out.push(Value::Str(dict[c].clone().into()));
+                        out.push(Value::Str(dict[c].clone()));
                     }
                 } else if !saw_null {
                     saw_null = true;

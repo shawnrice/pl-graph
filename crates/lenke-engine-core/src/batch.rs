@@ -7,7 +7,7 @@
 //! lineage-free, so the sidecar is scaffolded but always `None` here — the shape
 //! is in place for the operators that will carry it.
 
-use std::sync::Arc;
+use crate::gstr::GStr;
 
 use crate::value::Value;
 
@@ -22,7 +22,7 @@ pub enum Col {
     Edges(Vec<u32>),
     Num(Vec<f64>),
     Bool(Vec<bool>),
-    Str(Vec<Arc<str>>),
+    Str(Vec<GStr>),
     /// Mixed or otherwise unboxable values.
     Gen(Vec<Value>),
 }
@@ -60,7 +60,7 @@ impl Col {
             Self::Nodes(v) | Self::Edges(v) => Value::Num(f64::from(v[i])),
             Self::Num(v) => Value::Num(v[i]),
             Self::Bool(v) => Value::Bool(v[i]),
-            Self::Str(v) => Value::Str(v[i].clone().into()),
+            Self::Str(v) => Value::Str(v[i].clone()),
             Self::Gen(v) => v[i].clone(),
         }
     }
