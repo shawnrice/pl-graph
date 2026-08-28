@@ -249,13 +249,19 @@ fn temporal_equality_and_order_in_the_contract() {
 #[test]
 fn record_canonicalizes_and_compares_by_contents() {
     // make_record sorts keys and collapses duplicates (last write wins).
-    let r1 = make_record(vec![(crate::gstr::GStr::from("b"), n(2.0)), (crate::gstr::GStr::from("a"), n(1.0))]);
+    let r1 = make_record(vec![
+        (crate::gstr::GStr::from("b"), n(2.0)),
+        (crate::gstr::GStr::from("a"), n(1.0)),
+    ]);
     let Value::Record(f) = &r1 else {
         panic!("not a record")
     };
     assert_eq!(f[0].0.as_ref(), "a");
     assert_eq!(f[1].0.as_ref(), "b");
-    let dedup = make_record(vec![(crate::gstr::GStr::from("k"), n(1.0)), (crate::gstr::GStr::from("k"), n(2.0))]);
+    let dedup = make_record(vec![
+        (crate::gstr::GStr::from("k"), n(1.0)),
+        (crate::gstr::GStr::from("k"), n(2.0)),
+    ]);
     let Value::Record(g) = &dedup else {
         panic!("not a record")
     };
@@ -263,11 +269,17 @@ fn record_canonicalizes_and_compares_by_contents() {
     assert!(equals(&g[0].1, &n(2.0))); // last wins
 
     // Equality / grouping are independent of insertion order (both canonical).
-    let r2 = make_record(vec![(crate::gstr::GStr::from("a"), n(1.0)), (crate::gstr::GStr::from("b"), n(2.0))]);
+    let r2 = make_record(vec![
+        (crate::gstr::GStr::from("a"), n(1.0)),
+        (crate::gstr::GStr::from("b"), n(2.0)),
+    ]);
     assert!(equals(&r1, &r2));
     assert_eq!(group_key(&r1), group_key(&r2));
     // A different value → not equal, different group.
-    let r3 = make_record(vec![(crate::gstr::GStr::from("a"), n(9.0)), (crate::gstr::GStr::from("b"), n(2.0))]);
+    let r3 = make_record(vec![
+        (crate::gstr::GStr::from("a"), n(9.0)),
+        (crate::gstr::GStr::from("b"), n(2.0)),
+    ]);
     assert!(!equals(&r1, &r3));
     assert_ne!(group_key(&r1), group_key(&r3));
 
