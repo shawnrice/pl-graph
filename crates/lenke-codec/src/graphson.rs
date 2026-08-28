@@ -9,6 +9,7 @@
 use crate::json::Json;
 use crate::jsonfmt::{push_json_str, push_num};
 use crate::model::{graphson_tag, graphson_type, Edge, GraphData, Node, Value};
+use crate::decstream::DecVal;
 use crate::stream::ValueRef;
 use crate::{is_intish, json_id, CodeResult, CodecError, E_INVALID_SHAPE, E_INVALID_VALUE};
 
@@ -320,6 +321,174 @@ fn decode_typed(node: &Json) -> CodeResult<Value> {
             }
         }
     })
+}
+
+/// Decode a GraphSON v3 typed value to a BORROWED [`DecVal`] — the streaming twin
+/// of [`decode_typed`], mirroring it arm for arm so the built value is identical.
+fn decode_typed_ref<'a>(node: &'a Json<'a>) -> CodeResult<DecVal<'a>> {
+    let shape = |m: &str| CodecError::new(E_INVALID_SHAPE, format!("graphson: {m}"));
+    Ok(match node {
+        Json::Null => DecVal::Null,
+        Json::Bool(b) => DecVal::Bool(*b),
+        Json::Str(s) => DecVal::Str(s.as_ref()),
+        Json::Num(n) => DecVal::Num(*n),
+        Json::Arr(a) => DecVal::List(a.iter().map(decode_typed_ref).collect::<CodeResult<_>>()?),
+        Json::Obj(_) => {
+            let value = node.get("@value");
+            match node.get("@type").and_then(Json::as_str) {
+                Some("g:Int64" | "g:Int32" | "g:Double" | "g:Float") => DecVal::Num(
+                    value
+                        .and_then(Json::as_f64)
+                        .ok_or_else(|| shape("numeric typed value must be a number"))?,
+                ),
+                Some("g:List") => DecVal::List(
+                    value
+                        .and_then(Json::as_array)
+                        .ok_or_else(|| shape("g:List value must be an array"))?
+                        .iter()
+                        .map(decode_typed_ref)
+                        .collect::<CodeResult<_>>()?,
+                ),
+                Some("g:Map") => {
+                    let arr = value
+                        .and_then(Json::as_array)
+                        .ok_or_else(|| shape("g:Map value must be an array"))?;
+                    if arr.len() % 2 != 0 {
+                        return Err(shape("g:Map value must have an even number of entries"));
+                    }
+                    let mut pairs = Vec::with_capacity(arr.len() / 2);
+                    for ch in arr.chunks_exact(2) {
+                        let key = match decode_typed_ref(&ch[0])? {
+                            DecVal::Str(s) => s,
+                            _ => return Err(shape("a stored g:Map key must be a string")),
+                        };
+                        pairs.push((key, decode_typed_ref(&ch[1])?));
+                    }
+                    DecVal::Map(pairs)
+                }
+                Some(ty) if graphson_tag(ty).is_some() => {
+                    let tag = graphson_tag(ty).unwrap_or("");
+                    let iso = value
+                        .and_then(Json::as_str)
+                        .ok_or_else(|| shape("temporal @value must be a string"))?;
+                    if iso.is_empty() {
+                        return Err(CodecError::new(
+                            E_INVALID_VALUE,
+                            "graphson: empty temporal value",
+                        ));
+                    }
+                    DecVal::Temporal { tag, iso }
+                }
+                _ => return Err(shape("unknown or missing typed-value wrapper")),
+            }
+        }
+    })
+}
+
+/// A `::`-joined label string as borrowed labels (empty string → no labels) — the
+/// borrowed twin of [`split_labels`].
+fn split_labels_ref(s: &str) -> Vec<&str> {
+    if s.is_empty() {
+        Vec::new()
+    } else {
+        s.split(LABEL_SEP).collect()
+    }
+}
+
+/// Streaming decode: walk a GraphSON v3 string and push each element to `sink` as
+/// borrowed views. Same strict shape and element/property order as [`decode`].
+pub fn decode_into(input: &str, sink: &mut dyn crate::GraphSink) -> CodeResult<()> {
+    let j = crate::parse_json(input, "graphson")?;
+    if j.as_object().is_none() {
+        return Err(CodecError::new(
+            E_INVALID_SHAPE,
+            "graphson: expected a top-level object",
+        ));
+    }
+    let shape = |m: &str| CodecError::new(E_INVALID_SHAPE, format!("graphson: {m}"));
+
+    if let Some(vertices) = j.get("vertices").and_then(Json::as_array) {
+        for wrapper in vertices {
+            let v = wrapper
+                .get("@value")
+                .filter(|x| x.as_object().is_some())
+                .ok_or_else(|| shape("each vertex must have an @value object"))?;
+            if !matches!(v.get("id"), Some(Json::Str(_)) | Some(Json::Num(_))) {
+                return Err(shape("vertex @value.id must be a string or number"));
+            }
+            let labels = match v.get("label") {
+                Some(Json::Str(s)) => split_labels_ref(s),
+                _ => return Err(shape("vertex @value.label must be a string")),
+            };
+            let mut props: Vec<(&str, DecVal)> = Vec::new();
+            if let Some(pmap) = v.get("properties").and_then(Json::as_object) {
+                for (k, entries) in pmap {
+                    if let Some(first) = entries.as_array().and_then(<[Json]>::first) {
+                        if let Some(val) = inner_value(first) {
+                            props.push((k.as_ref(), decode_typed_ref(val)?));
+                        }
+                    }
+                }
+            }
+            let id_num;
+            let id: &str = match v.get("id") {
+                Some(Json::Str(s)) => s.as_ref(),
+                other => {
+                    id_num = other.map(json_id).unwrap_or_default();
+                    &id_num
+                }
+            };
+            sink.node(id, &labels, &props)?;
+        }
+    }
+
+    if let Some(edges_json) = j.get("edges").and_then(Json::as_array) {
+        for wrapper in edges_json {
+            let e = wrapper
+                .get("@value")
+                .filter(|x| x.as_object().is_some())
+                .ok_or_else(|| shape("each edge must have an @value object"))?;
+            let Some(Json::Str(label)) = e.get("label") else {
+                return Err(shape("edge @value.label must be a string"));
+            };
+            let mut props: Vec<(&str, DecVal)> = Vec::new();
+            if let Some(pmap) = e.get("properties").and_then(Json::as_object) {
+                for (k, entry) in pmap {
+                    if let Some(val) = inner_value(entry) {
+                        props.push((k.as_ref(), decode_typed_ref(val)?));
+                    }
+                }
+            }
+            let labels = split_labels_ref(label);
+            let id_num;
+            let id: Option<&str> = match e.get("id") {
+                None => None,
+                Some(Json::Str(s)) => Some(s.as_ref()),
+                other => {
+                    id_num = other.map(json_id).unwrap_or_default();
+                    Some(&id_num)
+                }
+            };
+            let from_num;
+            let from: &str = match e.get("outV") {
+                Some(Json::Str(s)) => s.as_ref(),
+                other => {
+                    from_num = other.map(json_id).unwrap_or_default();
+                    &from_num
+                }
+            };
+            let to_num;
+            let to: &str = match e.get("inV") {
+                Some(Json::Str(s)) => s.as_ref(),
+                other => {
+                    to_num = other.map(json_id).unwrap_or_default();
+                    &to_num
+                }
+            };
+            sink.edge(id, from, to, &labels, &props)?;
+        }
+    }
+    Ok(())
 }
 
 /// Serialize neutral graph data to a GraphSON v3 string.

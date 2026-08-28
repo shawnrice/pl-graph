@@ -618,15 +618,24 @@ mod tests {
         // including a temporal, a nested list/map, an escaped string, a numeric id,
         // and a multi-label edge.
         let doc = r#"{"nodes":[{"id":"a","labels":["P","Q"],"properties":{"name":"an\"n","born":{"@date":"2024-01-15"},"tags":["x",1],"meta":{"k":2}}},{"id":7,"labels":[],"properties":{}}],"edges":[{"id":"e0","from":"a","to":7,"labels":["KNOWS","BFF"],"properties":{"since":2020}}]}"#;
-        let via_sink = deserialize(doc, "pg-json").unwrap();
-        let (strict, on_err) = policy("pg-json");
-        let via_graphdata = from_graph_data(
-            lenke_codec::deserialize(doc, "pg-json").unwrap(),
-            strict,
-            on_err,
-        )
+        let base = crate::ndjson::from_ndjson(&crate::ndjson::to_ndjson(
+            &deserialize(doc, "pg-json").unwrap(),
+        ))
         .unwrap();
-        assert_eq!(shape(&via_sink), shape(&via_graphdata));
+        // Both structured formats decode through StoreSink — re-encode the base store
+        // into each, then decode both ways and compare the built stores.
+        for fmt in ["pg-json", "graphson"] {
+            let encoded = serialize(&base, fmt).unwrap();
+            let via_sink = deserialize(&encoded, fmt).unwrap();
+            let (strict, on_err) = policy(fmt);
+            let via_graphdata = from_graph_data(
+                lenke_codec::deserialize(&encoded, fmt).unwrap(),
+                strict,
+                on_err,
+            )
+            .unwrap();
+            assert_eq!(shape(&via_sink), shape(&via_graphdata), "{fmt}");
+        }
     }
 
     #[test]

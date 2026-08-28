@@ -81,6 +81,7 @@ pub fn deserialize_into(
 ) -> Option<CodeResult<()>> {
     match format {
         "pg-json" => Some(crate::pg_json::decode_into(input, sink)),
+        "graphson" => Some(crate::graphson::decode_into(input, sink)),
         _ => None,
     }
 }
