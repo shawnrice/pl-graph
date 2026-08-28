@@ -14,6 +14,7 @@
 
 pub mod batch;
 pub mod error_codes;
+pub mod gstr;
 pub mod json_fmt;
 pub mod temporal;
 pub mod value;
