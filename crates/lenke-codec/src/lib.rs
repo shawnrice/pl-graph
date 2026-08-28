@@ -22,6 +22,7 @@ pub use decstream::{deserialize_into, DecVal, GraphSink};
 pub use jsonfmt::{js_number, push_json_str, push_num, push_value};
 pub use model::{Edge, GraphData, Node, Value};
 pub use graphson::{EProps, GraphsonSink, LabelJoin, VProps};
+pub use pg_text::PgTextSink;
 pub use stream::{push_value_ref, Labels, PgJsonSink, Props, ValueRef};
 
 use json::Json;

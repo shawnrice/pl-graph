@@ -16,6 +16,7 @@
 //! id (the host re-derives the canonical `e{index}`).
 
 use crate::model::{is_temporal_tag, Edge, GraphData, Node, Value};
+use crate::{CodeResult, CodecError};
 
 // ---------------------------------------------------------------------------
 // Encode
@@ -125,6 +126,154 @@ fn id_token(s: &str) -> String {
         quote_escaped(s)
     } else {
         s.to_string()
+    }
+}
+
+/// Render a scalar value from a BORROWED [`ValueRef`] — the streaming twin of
+/// [`scalar_token`], same bytes. A nested list/map is never a `ValueRef` scalar
+/// (the sink handles those), so it is unreachable here.
+fn scalar_token_ref(out: &mut String, v: crate::ValueRef) {
+    use crate::ValueRef;
+    match v {
+        ValueRef::Null => out.push_str("null"),
+        ValueRef::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+        ValueRef::Num(x) => {
+            if x.is_finite() {
+                out.push_str(&crate::js_number(x));
+            } else {
+                out.push_str("null");
+            }
+        }
+        ValueRef::Temporal { tag, iso } => {
+            out.push('@');
+            out.push_str(tag);
+            out.push(':');
+            out.push_str(iso);
+        }
+        ValueRef::Str(s) => write_quote_body(out, s),
+        ValueRef::Nested(_) => unreachable!("the sink expands a list/map, never a scalar token"),
+    }
+}
+
+/// Write the escaped, double-quoted body of a string (shared by the token writers).
+fn write_quote_body(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Write an id token, quoting/escaping when needed (buffer twin of [`id_token`]).
+fn write_id_token(out: &mut String, s: &str) {
+    let needs_quote = s.is_empty()
+        || s.chars()
+            .any(|c| matches!(c, ':' | ' ' | '\t' | '\n' | '\r' | '"' | '\\'));
+    if needs_quote {
+        write_quote_body(out, s);
+    } else {
+        out.push_str(s);
+    }
+}
+
+/// Write a `:label` token (buffer twin of `format!(":{}", label_token(l))`).
+fn write_label_token(out: &mut String, s: &str) {
+    out.push(':');
+    if s.chars()
+        .any(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '"' | '\\'))
+    {
+        write_quote_body(out, s);
+    } else {
+        out.push_str(s);
+    }
+}
+
+/// A streaming PG-text encoder — the byte-identical twin of [`encode`] that writes
+/// each element's line from borrowed data instead of an owned [`GraphData`]. The
+/// host calls [`begin`](Self::begin) (leading ids), then [`label`](Self::label) /
+/// [`prop`](Self::prop) per token, and [`finish`](Self::finish). A map/record
+/// property has no flat form, so `prop` returns `Err(UNSUPPORTED)` — the same
+/// rejection `serialize`'s up-front `has_map_property` check makes.
+pub struct PgTextSink {
+    out: String,
+    first: bool,
+    any: bool,
+}
+
+impl PgTextSink {
+    #[must_use]
+    pub fn new(elements: usize) -> Self {
+        Self {
+            out: String::with_capacity(elements * 48),
+            first: true,
+            any: false,
+        }
+    }
+
+    fn sep(&mut self) {
+        if self.any {
+            self.out.push(' ');
+        }
+        self.any = true;
+    }
+
+    /// Start a new element line (a node has one leading id; an edge has two).
+    pub fn begin(&mut self, leading: &[&str]) {
+        if !self.first {
+            self.out.push('\n');
+        }
+        self.first = false;
+        self.any = false;
+        for l in leading {
+            self.sep();
+            write_id_token(&mut self.out, l);
+        }
+    }
+
+    /// Append a `:label` token.
+    pub fn label(&mut self, l: &str) {
+        self.sep();
+        write_label_token(&mut self.out, l);
+    }
+
+    /// Append a property token (a list expands to one `key:value` per element).
+    pub fn prop(&mut self, key: &str, v: crate::ValueRef) -> CodeResult<()> {
+        match v {
+            crate::ValueRef::Nested(Value::List(elems)) => {
+                for el in elems {
+                    self.sep();
+                    write_id_token(&mut self.out, key);
+                    self.out.push(':');
+                    scalar_token(&mut self.out, el);
+                }
+            }
+            crate::ValueRef::Nested(_) => {
+                return Err(CodecError::new(
+                    crate::codes::UNSUPPORTED,
+                    "a map/record property can't be serialized to a flat format (pg-text/csv); \
+                     use a structured format: ndjson, graphson, or pg-json",
+                ));
+            }
+            scalar => {
+                self.sep();
+                write_id_token(&mut self.out, key);
+                self.out.push(':');
+                scalar_token_ref(&mut self.out, scalar);
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn finish(self) -> String {
+        self.out
     }
 }
 

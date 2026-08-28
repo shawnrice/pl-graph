@@ -421,8 +421,71 @@ pub fn serialize(store: &Store, format: &str) -> Result<String, CodecError> {
     match format {
         "pg-json" => Ok(serialize_pg_json(store)),
         "graphson" => Ok(serialize_graphson(store)),
+        "pg-text" => serialize_pg_text(store),
         _ => lenke_codec::serialize(&to_graph_data(store), format),
     }
+}
+
+/// Stream a store directly to PG-text. Returns `E_UNSUPPORTED` on a map/record
+/// property (a flat format can't carry one) — the same rejection the `GraphData`
+/// path made up front. Byte-identical order to [`to_graph_data`].
+fn serialize_pg_text(store: &Store) -> Result<String, CodecError> {
+    let node_keys = store.prop_keys();
+    let edge_keys = store.edge_prop_keys();
+    let count = u32::try_from(store.node_count()).unwrap_or(u32::MAX);
+    let node_cols: Vec<(&str, &crate::store::Column)> = node_keys
+        .iter()
+        .filter_map(|k| store.column(k).map(|c| (k.as_str(), c)))
+        .collect();
+    let mut sink = lenke_codec::PgTextSink::new(store.node_count() + store.edge_count());
+
+    for id in 0..count {
+        if !store.is_alive(id) {
+            continue;
+        }
+        sink.begin(&[store.node_ext_id_ref(id).unwrap_or("")]);
+        for name in store.labels_of_refs(id) {
+            sink.label(name);
+        }
+        for (k, col) in &node_cols {
+            if col.present_at(id as usize) {
+                let mut res = Ok(());
+                emit_prop(k, &col.read(id as usize), &mut |k, vr| {
+                    if res.is_ok() {
+                        res = sink.prop(k, vr);
+                    }
+                });
+                res?;
+            }
+        }
+    }
+
+    for from in 0..count {
+        if !store.is_alive(from) {
+            continue;
+        }
+        let from_ext = store.node_ext_id_ref(from).unwrap_or("");
+        for a in store.out(from) {
+            let eid = a.eid;
+            let labels = store.edge_labels_of(eid);
+            sink.begin(&[from_ext, store.node_ext_id_ref(a.nbr).unwrap_or("")]);
+            for name in &labels {
+                sink.label(name);
+            }
+            for k in &edge_keys {
+                if store.has_edge_prop(eid, k) {
+                    let mut res = Ok(());
+                    emit_prop(k, &store.edge_prop(eid, k), &mut |k, vr| {
+                        if res.is_ok() {
+                            res = sink.prop(k, vr);
+                        }
+                    });
+                    res?;
+                }
+            }
+        }
+    }
+    Ok(sink.finish())
 }
 
 /// A borrowed decoded value ([`lenke_codec::DecVal`]) as an engine [`Value`] — the
@@ -608,6 +671,31 @@ mod tests {
         assert_eq!(
             serialize_graphson(&store),
             lenke_codec::serialize(&gd, "graphson").unwrap()
+        );
+    }
+
+    #[test]
+    fn streaming_pg_text_matches_the_graphdata_path_and_rejects_maps() {
+        // A map-free store: pg-text carries scalars, a list (repeated keys), a
+        // temporal, an escaped id, and a multi-label edge — must be byte-identical.
+        let src = concat!(
+            r#"{"id":"a b","labels":["P","Q"],"props":{"name":"an\"n","born":{"@date":"2024-01-15"},"tags":["x","y"]}}"#,
+            "\n",
+            r#"{"id":"b","labels":["P"],"props":{}}"#,
+            "\n",
+            r#"{"id":"e0","from":"a b","to":"b","labels":["KNOWS","BFF"],"props":{"since":2020}}"#,
+        );
+        let store = crate::ndjson::from_ndjson(src).unwrap();
+        assert_eq!(
+            serialize_pg_text(&store).unwrap(),
+            lenke_codec::serialize(&to_graph_data(&store), "pg-text").unwrap()
+        );
+        // A map property is unsupported in a flat format — same rejection either way.
+        let with_map =
+            crate::ndjson::from_ndjson(r#"{"id":"a","labels":[],"props":{"m":{"k":1}}}"#).unwrap();
+        assert_eq!(
+            serialize_pg_text(&with_map).unwrap_err().code,
+            codes::UNSUPPORTED
         );
     }
 
