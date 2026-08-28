@@ -166,7 +166,7 @@ export const isBalanced = (text: string): boolean => {
   }
 
   return depth <= 0 && quote === '';
-}
+};
 
 // Blank out quoted spans so keyword sniffing never fires on a string literal.
 const withoutStrings = (s: string): string =>
@@ -193,7 +193,7 @@ export const awaitingClause = (buffer: string, mode: Mode): boolean => {
 // A trailing `;` is an explicit "run it now" (psql muscle memory), stripped before the
 // statement reaches the engine — which has no use for the terminator.
 export const endsWithTerminator = (line: string): boolean => /;\s*$/.test(line);
-export const stripTerminator = (stmt: string): string => stmt.replace(/;\s*$/, '').trimEnd();;
+export const stripTerminator = (stmt: string): string => stmt.replace(/;\s*$/, '').trimEnd();
 
 const HISTORY_FILE = path.join(homedir(), '.lenke_history');
 
@@ -540,8 +540,7 @@ export const runShell = async (ctx: ShellContext): Promise<void> => {
 
     if (
       !forced &&
-      (cont ||
-        (trimmed !== '' && (!isBalanced(buffer) || awaitingClause(buffer, state.mode))))
+      (cont || (trimmed !== '' && (!isBalanced(buffer) || awaitingClause(buffer, state.mode))))
     ) {
       setPrompt();
       rl.prompt();

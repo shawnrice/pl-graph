@@ -39,14 +39,14 @@ describe('isBalanced', () => {
 describe('multi-line input', () => {
   test('a GQL query that has opened but not reached RETURN keeps reading', () => {
     // brackets balance the instant the pattern closes — but the query is not done
-    expect(awaitingClause('MATCH (p:Person {name: \'x\'})-[:R]->(q)', 'gql')).toBe(true);
+    expect(awaitingClause("MATCH (p:Person {name: 'x'})-[:R]->(q)", 'gql')).toBe(true);
     expect(awaitingClause('MATCH (p:Person)\nWHERE p.age > 30', 'gql')).toBe(true);
   });
 
   test('a GQL query with an ending clause is complete', () => {
     expect(awaitingClause('MATCH (p:Person) RETURN p', 'gql')).toBe(false);
     expect(awaitingClause('MATCH (p:Person) SET p.seen = true', 'gql')).toBe(false);
-    expect(awaitingClause('INSERT (n:Person {name: \'x\'})', 'gql')).toBe(false);
+    expect(awaitingClause("INSERT (n:Person {name: 'x'})", 'gql')).toBe(false);
     expect(awaitingClause('CALL pagerank() YIELD node RETURN node', 'gql')).toBe(false);
   });
 
@@ -55,7 +55,7 @@ describe('multi-line input', () => {
   });
 
   test('Gremlin and JS never wait on a clause (balance decides)', () => {
-    expect(awaitingClause('g.V().hasLabel(\'Person\')', 'gremlin')).toBe(false);
+    expect(awaitingClause("g.V().hasLabel('Person')", 'gremlin')).toBe(false);
     expect(awaitingClause('_.map(r => r.name)', 'js')).toBe(false);
   });
 });
