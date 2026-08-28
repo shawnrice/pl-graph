@@ -1211,3 +1211,50 @@ fn record_type_name_round_trips() {
         "dumped: {dumped}"
     );
 }
+
+#[test]
+fn dict_max_distinct_knob_gates_high_cardinality_encoding() {
+    use std::sync::Arc;
+    let mk = || {
+        // 5000 distinct city values, each appearing 3× (15000 rows): repeats heavily,
+        // but distinct > the default 4096 dict cap.
+        let mut s = Store::default();
+        for i in 0..15_000u32 {
+            let v = Value::Str(Arc::from(format!("city-{:05}", i % 5000).as_str()));
+            s.add_node(&["P"], &[("city", v)]);
+        }
+        s
+    };
+    // Default cap (4096): too many distinct → stays a plain Str column.
+    let mut a = mk();
+    a.dict_encode_columns();
+    assert!(
+        matches!(a.column("city"), Some(Column::Str { .. })),
+        "default cap leaves it Str"
+    );
+
+    // Raised cap: the genuinely-repeating column now dictionary-encodes.
+    let mut b = mk();
+    b.set_limit(ConfigId::LimitsDictMaxDistinct, 8192);
+    b.dict_encode_columns();
+    assert!(
+        matches!(b.column("city"), Some(Column::Dict { .. })),
+        "raised cap admits the repeated column"
+    );
+
+    // A truly-unique column is NEVER encoded, even with a huge cap — the ≥2× repetition
+    // guard protects against the user forcing the pathological case.
+    let mut c = Store::default();
+    for i in 0..10_000u32 {
+        c.add_node(
+            &["P"],
+            &[("uid", Value::Str(Arc::from(format!("uid-{i}").as_str())))],
+        );
+    }
+    c.set_limit(ConfigId::LimitsDictMaxDistinct, 1_000_000);
+    c.dict_encode_columns();
+    assert!(
+        matches!(c.column("uid"), Some(Column::Str { .. })),
+        "unique column stays Str despite the cap"
+    );
+}

@@ -392,7 +392,7 @@ impl Column {
     /// columns; a bulk loader runs this once so categorical columns get the same
     /// code-based encoding the `materialize` path already gives, which turns GROUP BY
     /// / DISTINCT / equality over them into `u32`-code work instead of string hashing.
-    fn try_dict_encode(&mut self) {
+    fn try_dict_encode(&mut self, cap: usize) {
         if let Self::Str {
             data,
             present,
@@ -402,13 +402,14 @@ impl Column {
             let data = std::mem::take(data);
             let present = std::mem::take(present);
             let nulls = std::mem::take(nulls);
-            *self = dict_encode(data, present, nulls).unwrap_or_else(|(data, present, nulls)| {
-                Self::Str {
-                    data,
-                    present,
-                    nulls,
-                }
-            });
+            *self =
+                dict_encode(data, present, nulls, cap).unwrap_or_else(|(data, present, nulls)| {
+                    Self::Str {
+                        data,
+                        present,
+                        nulls,
+                    }
+                });
         }
     }
 
@@ -993,6 +994,13 @@ pub struct GraphLimits {
     pub intermediate: u64,
     /// Ceiling on operator-chain length (parser-applied; `E_SYNTAX` when tripped).
     pub operator_chain: u64,
+    /// Max DISTINCT values a string property column may hold and still be
+    /// dictionary-encoded (interned to `u32` codes). A performance/memory knob, not a
+    /// semantic one: encoded and plain columns read byte-identically. Raise it when you
+    /// KNOW a high-cardinality column still repeats heavily (e.g. 50k cities over 10M
+    /// rows) so it earns the encoding the default 4096 ceiling would skip; the ≥2×
+    /// repetition guard still protects a genuinely-unique column from encoding.
+    pub dict_max_distinct: u64,
 }
 
 impl Default for GraphLimits {
@@ -1002,6 +1010,7 @@ impl Default for GraphLimits {
             trail: 1_000_000,
             intermediate: 50_000_000,
             operator_chain: 10_000,
+            dict_max_distinct: 4096,
         }
     }
 }
@@ -1016,6 +1025,7 @@ pub enum ConfigId {
     LimitsTrail = 1,
     LimitsIntermediate = 2,
     LimitsOperatorChain = 3,
+    LimitsDictMaxDistinct = 4,
 }
 
 impl ConfigId {
@@ -1026,6 +1036,7 @@ impl ConfigId {
             1 => Some(Self::LimitsTrail),
             2 => Some(Self::LimitsIntermediate),
             3 => Some(Self::LimitsOperatorChain),
+            4 => Some(Self::LimitsDictMaxDistinct),
             _ => None,
         }
     }
@@ -1397,6 +1408,7 @@ impl Store {
             ConfigId::LimitsTrail => self.limits.trail = value,
             ConfigId::LimitsIntermediate => self.limits.intermediate = value,
             ConfigId::LimitsOperatorChain => self.limits.operator_chain = value,
+            ConfigId::LimitsDictMaxDistinct => self.limits.dict_max_distinct = value,
         }
     }
 
@@ -2467,8 +2479,9 @@ impl Store {
     /// DISTINCT / equality match on a `u32` code instead of hashing string content. A
     /// high-cardinality column (`name`, an id) is left as `Str` by `dict_encode`'s cap.
     pub fn dict_encode_columns(&mut self) {
+        let cap = self.limits.dict_max_distinct as usize;
         for col in self.props.values_mut() {
-            col.try_dict_encode();
+            col.try_dict_encode(cap);
         }
     }
 
@@ -4210,10 +4223,13 @@ fn dict_encode(
     data: Vec<Arc<str>>,
     present: Vec<bool>,
     nulls: Vec<bool>,
+    cap: usize,
 ) -> Result<Column, (Vec<Arc<str>>, Vec<bool>, Vec<bool>)> {
-    const CAP: usize = 4096;
+    // FNV over the string bytes — the build-time distinct-count lookup is the whole
+    // cost of encoding, so the hasher matters; std's SipHash is DoS-hardened overkill
+    // for interning our own ingested values.
     let mut dict: Vec<Arc<str>> = Vec::new();
-    let mut lookup: HashMap<Arc<str>, u32> = HashMap::new();
+    let mut lookup: crate::exec::fnv::Map<Arc<str>, u32> = crate::exec::fnv::Map::default();
     let mut codes = vec![0u32; data.len()];
     for (i, s) in data.iter().enumerate() {
         if !present[i] {
@@ -4222,7 +4238,7 @@ fn dict_encode(
         let code = if let Some(&c) = lookup.get(s) {
             c
         } else {
-            if dict.len() >= CAP {
+            if dict.len() >= cap {
                 return Err((data, present, nulls));
             }
             let c = dict.len() as u32;
@@ -4271,7 +4287,9 @@ fn materialize(pairs: Vec<(u32, Value)>, n: usize) -> Column {
                 present[i as usize] = true;
             }
         }
-        dict_encode(data, present, vec![false; n]).unwrap_or_else(|(data, present, nulls)| {
+        // The config knob governs the bulk-load re-encode (`dict_encode_columns`); this
+        // query-time build path uses the default ceiling.
+        dict_encode(data, present, vec![false; n], 4096).unwrap_or_else(|(data, present, nulls)| {
             Column::Str {
                 data,
                 present,
