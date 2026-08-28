@@ -598,7 +598,7 @@ fn json_value(j: &Json) -> Result<Value, String> {
             // canonicalize (sorted, last-wins) via the value contract.
             let pairs = fields
                 .iter()
-                .map(|(k, v)| json_value(v).map(|v| (Arc::from(k.as_str()), v)))
+                .map(|(k, v)| json_value(v).map(|v| (GStr::from(k.as_str()), v)))
                 .collect::<Result<Vec<_>, _>>()?;
             crate::value::make_record(pairs)
         }
@@ -805,7 +805,6 @@ mod tests {
     use super::{from_ndjson, merge_ndjson, snapshot, to_ndjson};
     use crate::store::Builder;
     use crate::value::Value;
-    use std::sync::Arc;
 
     fn s(x: &str) -> Value {
         Value::Str(x.into())
@@ -969,7 +968,10 @@ mod tests {
             &["P"],
             &[(
                 "meta",
-                make_record(vec![(Arc::from("y"), s("hi")), (Arc::from("x"), n(1.0))]),
+                make_record(vec![
+                    (crate::gstr::GStr::from("y"), s("hi")),
+                    (crate::gstr::GStr::from("x"), n(1.0)),
+                ]),
             )],
         );
         let text = to_ndjson(&st);

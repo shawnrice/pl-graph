@@ -280,7 +280,7 @@ fn required_constraint_declared_and_checked() {
 #[test]
 fn dotted_path_index_maintained_through_mutations() {
     use crate::value::make_record;
-    let city = |c: &str| make_record(vec![(Arc::from("city"), s(c))]);
+    let city = |c: &str| make_record(vec![(crate::gstr::GStr::from("city"), s(c))]);
     let mut st = Builder::default().build();
     let a = st.add_node(&["P"], &[("meta", city("NYC"))]);
     let b = st.add_node(&["P"], &[("meta", city("LA"))]);

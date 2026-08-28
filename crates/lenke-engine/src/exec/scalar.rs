@@ -184,7 +184,7 @@ fn scalar_is_typed(category: &str, v: &Value) -> bool {
 /// typed or absent-and-nullable; a null field value is allowed only when nullable;
 /// a `record`-category field recurses into its nested schema (or, for an open
 /// `RECORD` with no schema, only checks the value is a record).
-fn record_matches_schema(v: &Value, schema: &[(std::sync::Arc<str>, Value)]) -> bool {
+fn record_matches_schema(v: &Value, schema: &[(GStr, Value)]) -> bool {
     let Value::Record(fields) = v else {
         return false;
     };

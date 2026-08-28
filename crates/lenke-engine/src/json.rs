@@ -168,8 +168,8 @@ mod tests {
     fn record_renders_as_object_in_field_order() {
         let r = Value::Record(Arc::from(
             vec![
-                (Arc::from("b"), Value::Num(2.0)),
-                (Arc::from("a"), Value::Num(1.0)),
+                (crate::gstr::GStr::from("b"), Value::Num(2.0)),
+                (crate::gstr::GStr::from("a"), Value::Num(1.0)),
             ]
             .into_boxed_slice(),
         ));

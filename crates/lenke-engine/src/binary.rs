@@ -189,8 +189,8 @@ impl<'a> Reader<'a> {
             }
             5 => {
                 let n = self.count()?;
-                let pairs: Vec<(Arc<str>, Value)> = (0..n)
-                    .map(|_| Ok((Arc::from(self.str()?.as_str()), self.value()?)))
+                let pairs: Vec<(GStr, Value)> = (0..n)
+                    .map(|_| Ok((GStr::from(self.str()?.as_str()), self.value()?)))
                     .collect::<Result<_, String>>()?;
                 make_record(pairs)
             }

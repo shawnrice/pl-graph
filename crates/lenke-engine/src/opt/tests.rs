@@ -98,21 +98,26 @@ fn scan_filter_eq_seeds_index_both_spellings() {
 #[test]
 fn dotted_field_eq_seeds_index_both_spellings() {
     use crate::value::make_record;
-    use std::sync::Arc;
     let build = || {
         let mut b = Builder::default();
         b.node(
             &["Person"],
             &[
                 ("name", s("alice")),
-                ("meta", make_record(vec![(Arc::from("city"), s("NYC"))])),
+                (
+                    "meta",
+                    make_record(vec![(crate::gstr::GStr::from("city"), s("NYC"))]),
+                ),
             ],
         );
         b.node(
             &["Person"],
             &[
                 ("name", s("bob")),
-                ("meta", make_record(vec![(Arc::from("city"), s("LA"))])),
+                (
+                    "meta",
+                    make_record(vec![(crate::gstr::GStr::from("city"), s("LA"))]),
+                ),
             ],
         );
         b.build()

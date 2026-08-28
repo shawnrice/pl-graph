@@ -1191,7 +1191,7 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                         let pairs = fields
                             .iter()
                             .zip(&cols)
-                            .map(|((k, _), c)| (Arc::from(k.as_str()), c.value_at(i)))
+                            .map(|((k, _), c)| (GStr::from(k.as_str()), c.value_at(i)))
                             .collect();
                         value::make_record(pairs)
                     })

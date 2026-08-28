@@ -44,7 +44,7 @@ pub enum Value {
     /// pairwise slice compare and the wire form is canonical. `Arc`-boxed so a
     /// per-row binding clone is a refcount bump. Build via [`make_record`], which
     /// sorts and de-duplicates keys (last write wins).
-    Record(Arc<[(Arc<str>, Value)]>),
+    Record(Arc<[(GStr, Value)]>),
     /// A TinkerPop map (Gremlin): **any** value as a key, **insertion-ordered** —
     /// `valueMap`/`project`/`select` preserve the order the traversal produced. So
     /// equality and ordering are POSITIONAL (order-sensitive), unlike a `Record`.
@@ -65,8 +65,8 @@ pub enum Value {
 /// are byte-identical and equality is a slice compare. The ONE place a record is
 /// canonicalized.
 #[must_use]
-pub fn make_record(pairs: Vec<(Arc<str>, Value)>) -> Value {
-    let mut out: Vec<(Arc<str>, Value)> = Vec::with_capacity(pairs.len());
+pub fn make_record(pairs: Vec<(GStr, Value)>) -> Value {
+    let mut out: Vec<(GStr, Value)> = Vec::with_capacity(pairs.len());
     for (k, v) in pairs {
         if let Some(slot) = out.iter_mut().find(|(ek, _)| *ek == k) {
             slot.1 = v; // last write wins
@@ -80,7 +80,7 @@ pub fn make_record(pairs: Vec<(Arc<str>, Value)>) -> Value {
 
 /// Look up `key` in a record's sorted fields; `Null` when absent.
 #[must_use]
-pub fn record_field(fields: &[(Arc<str>, Value)], key: &str) -> Value {
+pub fn record_field(fields: &[(GStr, Value)], key: &str) -> Value {
     fields
         .binary_search_by(|(k, _)| k.as_ref().cmp(key))
         .map_or(Value::Null, |i| fields[i].1.clone())

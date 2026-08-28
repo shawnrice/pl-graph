@@ -110,7 +110,7 @@ fn value_from_neutral(v: &CValue, on_err: TemporalOnErr) -> Result<Value, CodecE
         CValue::Map(pairs) => {
             let fields = pairs
                 .iter()
-                .map(|(k, val)| Ok((Arc::from(k.as_str()), value_from_neutral(val, on_err)?)))
+                .map(|(k, val)| Ok((GStr::from(k.as_str()), value_from_neutral(val, on_err)?)))
                 .collect::<Result<Vec<_>, CodecError>>()?;
             make_record(fields)
         }

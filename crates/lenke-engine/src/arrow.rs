@@ -1217,12 +1217,12 @@ mod tests {
             names: vec!["rec".into()],
             rows: Flat::from_rows(vec![
                 vec![make_record(vec![
-                    (Arc::from("z"), s("x")),
-                    (Arc::from("a"), n(1.0)),
+                    (crate::gstr::GStr::from("z"), s("x")),
+                    (crate::gstr::GStr::from("a"), n(1.0)),
                 ])],
                 vec![make_record(vec![
-                    (Arc::from("z"), s("y")),
-                    (Arc::from("a"), n(2.0)),
+                    (crate::gstr::GStr::from("z"), s("y")),
+                    (crate::gstr::GStr::from("a"), n(2.0)),
                 ])],
             ]),
         };
@@ -1255,7 +1255,7 @@ mod tests {
         let rows = Rows {
             names: vec!["rec".into()],
             rows: Flat::from_rows(vec![
-                vec![make_record(vec![(Arc::from("a"), n(1.0))])],
+                vec![make_record(vec![(crate::gstr::GStr::from("a"), n(1.0))])],
                 vec![Value::Null],
             ]),
         };

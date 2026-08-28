@@ -12,6 +12,7 @@
 //! / literal items with optional `AS alias`. Aggregation, ORDER/SKIP/LIMIT,
 //! DISTINCT, comma-joins, and variable-length join in later iterations.
 
+use crate::gstr::GStr;
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::{AggFn, CastTarget, CompareOp, Dir, Expr, PathMode, PathPart, Plan, TxKind};
@@ -2716,7 +2717,7 @@ impl Parser {
         // record non-literal, which `props` then routes to the expression path).
         if self.peek() == Some(&Tok::LBrace) {
             self.bump();
-            let mut fields: Vec<(std::sync::Arc<str>, Value)> = Vec::new();
+            let mut fields: Vec<(GStr, Value)> = Vec::new();
             if !self.eat(&Tok::RBrace) {
                 loop {
                     let key = self.ident()?;
@@ -5664,7 +5665,7 @@ impl Parser {
     /// { … }`. An empty `{}` is a closed record with no fields.
     fn parse_record_schema(&mut self) -> Result<Value, String> {
         self.expect(&Tok::LBrace)?;
-        let mut fields: Vec<(std::sync::Arc<str>, Value)> = Vec::new();
+        let mut fields: Vec<(GStr, Value)> = Vec::new();
         if !matches!(self.peek(), Some(Tok::RBrace)) {
             loop {
                 let name = self.ident()?;
