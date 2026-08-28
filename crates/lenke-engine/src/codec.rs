@@ -291,6 +291,10 @@ fn serialize_pg_json(store: &Store) -> String {
     let node_keys = store.prop_keys();
     let edge_keys = store.edge_prop_keys();
     let count = u32::try_from(store.node_count()).unwrap_or(u32::MAX);
+    let node_cols: Vec<(&str, &crate::store::Column)> = node_keys
+        .iter()
+        .filter_map(|k| store.column(k).map(|c| (k.as_str(), c)))
+        .collect();
     let mut sink = lenke_codec::PgJsonSink::new(store.node_count(), store.edge_count());
 
     for id in 0..count {
@@ -305,9 +309,9 @@ fn serialize_pg_json(store: &Store) -> String {
                 }
             },
             |p| {
-                for k in &node_keys {
-                    if store.has_prop(id, k) {
-                        emit_prop(k, &store.prop(id, k), &mut |k, vr| p.push(k, vr));
+                for (k, col) in &node_cols {
+                    if col.present_at(id as usize) {
+                        emit_prop(k, &col.read(id as usize), &mut |k, vr| p.push(k, vr));
                     }
                 }
             },
@@ -351,6 +355,10 @@ fn serialize_graphson(store: &Store) -> String {
     let node_keys = store.prop_keys();
     let edge_keys = store.edge_prop_keys();
     let count = u32::try_from(store.node_count()).unwrap_or(u32::MAX);
+    let node_cols: Vec<(&str, &crate::store::Column)> = node_keys
+        .iter()
+        .filter_map(|k| store.column(k).map(|c| (k.as_str(), c)))
+        .collect();
     let mut sink = lenke_codec::GraphsonSink::new(store.node_count(), store.edge_count());
 
     for id in 0..count {
@@ -365,9 +373,9 @@ fn serialize_graphson(store: &Store) -> String {
                 }
             },
             |p| {
-                for k in &node_keys {
-                    if store.has_prop(id, k) {
-                        emit_prop(k, &store.prop(id, k), &mut |k, vr| p.push(k, vr));
+                for (k, col) in &node_cols {
+                    if col.present_at(id as usize) {
+                        emit_prop(k, &col.read(id as usize), &mut |k, vr| p.push(k, vr));
                     }
                 }
             },

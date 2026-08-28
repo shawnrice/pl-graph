@@ -9,6 +9,14 @@ use std::fmt::Write as _;
 /// Matches `serde_json` / JS `JSON.stringify`.
 pub fn push_json_str(out: &mut String, s: &str) {
     out.push('"');
+    // Fast path: nothing to escape (ids/names/most values) → one bulk copy, no
+    // per-char match. Only `"`, `\`, and control bytes (< 0x20) escape, and each is a
+    // single byte in UTF-8, so scanning bytes is exact.
+    if s.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\') {
+        out.push_str(s);
+        out.push('"');
+        return;
+    }
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),

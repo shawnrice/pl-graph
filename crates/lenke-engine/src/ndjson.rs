@@ -29,9 +29,16 @@ use crate::value::Value;
 /// trailing newline when non-empty.
 #[must_use]
 pub fn to_ndjson(store: &Store) -> String {
-    let mut out = String::new();
+    // Pre-size so the buffer does not repeatedly reallocate mid-stream (~96 B/element).
+    let mut out = String::with_capacity((store.node_count() + store.edge_count()) * 96);
     let node_keys = store.prop_keys();
     let edge_keys = store.edge_prop_keys();
+    // Resolve each node property column ONCE, in key order — the node loop then reads
+    // cells with no hashmap lookup per node.
+    let node_cols: Vec<(&str, &crate::store::Column)> = node_keys
+        .iter()
+        .filter_map(|k| store.column(k).map(|c| (k.as_str(), c)))
+        .collect();
 
     for id in 0..u32::try_from(store.node_count()).unwrap_or(u32::MAX) {
         if !store.is_alive(id) {
@@ -39,14 +46,14 @@ pub fn to_ndjson(store: &Store) -> String {
         }
         // The SHIPPED shape (lenke-core / @lenke/serialization): a `type`
         // discriminator, `properties` (not `props`), and the PRESERVED external id.
+        // Ids and labels are BORROWED (`&str`) — no per-node `GStr` clone or
+        // `Vec<String>` of cloned labels.
         out.push_str("{\"type\":\"node\",\"id\":");
-        encode_string(&mut out, &store.node_ext_id(id).unwrap_or_default());
+        encode_string(&mut out, store.node_ext_id_ref(id).unwrap_or(""));
         out.push_str(",\"labels\":");
-        encode_str_array(&mut out, &store.labels_of(id));
+        encode_str_array(&mut out, &store.labels_of_refs(id));
         out.push_str(",\"properties\":");
-        encode_object(&mut out, &node_keys, |k| {
-            store.has_prop(id, k).then(|| store.prop(id, k))
-        });
+        encode_object_cols(&mut out, &node_cols, id as usize);
         out.push_str("}\n");
     }
 
@@ -59,11 +66,11 @@ pub fn to_ndjson(store: &Store) -> String {
             // An edge carries a type SET in `labels` (first = primary type), like
             // core — not a single `type` string.
             out.push_str("{\"type\":\"edge\",\"id\":");
-            encode_string(&mut out, &store.edge_ext_id(eid).unwrap_or_default());
+            encode_string(&mut out, store.edge_ext_id_ref(eid).unwrap_or(""));
             out.push_str(",\"from\":");
-            encode_string(&mut out, &store.node_ext_id(from).unwrap_or_default());
+            encode_string(&mut out, store.node_ext_id_ref(from).unwrap_or(""));
             out.push_str(",\"to\":");
-            encode_string(&mut out, &store.node_ext_id(a.nbr).unwrap_or_default());
+            encode_string(&mut out, store.node_ext_id_ref(a.nbr).unwrap_or(""));
             out.push_str(",\"labels\":");
             encode_str_array(&mut out, &store.edge_labels_of(eid));
             out.push_str(",\"properties\":");
@@ -120,6 +127,28 @@ pub fn load_snapshot(text: &str) -> Result<Store, String> {
     from_ndjson(text)
 }
 
+/// Write a node's property object from columns RESOLVED ONCE (outside the node
+/// loop), in `cols` order. Skips the per-node, per-key `props.get(key)` hashmap
+/// lookups the `keys`+closure form pays twice over (a `has_prop` then a `prop`) —
+/// here each column is already in hand, so it is one `present_at` + one `read`.
+fn encode_object_cols(out: &mut String, cols: &[(&str, &crate::store::Column)], row: usize) {
+    out.push('{');
+    let mut first = true;
+    for (k, col) in cols {
+        if !col.present_at(row) {
+            continue;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        encode_string(out, k);
+        out.push(':');
+        encode_value(out, &col.read(row));
+    }
+    out.push('}');
+}
+
 /// Write a JSON object from `keys`, including only those a present value exists
 /// for (via `get`), in `keys` order.
 fn encode_object(out: &mut String, keys: &[String], get: impl Fn(&str) -> Option<Value>) {
@@ -139,13 +168,15 @@ fn encode_object(out: &mut String, keys: &[String], get: impl Fn(&str) -> Option
 }
 
 /// Append a JSON array of strings to `out` (shared with the schema-op vocabulary).
-pub fn encode_str_array(out: &mut String, items: &[String]) {
+/// Generic over the element so a borrowed label slice (`&[&str]`, from
+/// [`Store::labels_of_refs`]) writes without first cloning into `Vec<String>`.
+pub fn encode_str_array<S: AsRef<str>>(out: &mut String, items: &[S]) {
     out.push('[');
     for (i, s) in items.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        encode_string(out, s);
+        encode_string(out, s.as_ref());
     }
     out.push(']');
 }
@@ -223,6 +254,15 @@ pub fn encode_value(out: &mut String, v: &Value) {
 /// Encode a JSON string with the required escapes (shared with the schema-op vocabulary).
 pub fn encode_string(out: &mut String, s: &str) {
     out.push('"');
+    // Fast path: a string with nothing to escape (the overwhelming common case —
+    // ids, names, cities) copies whole, skipping the per-char match. The scan is one
+    // cheap pass; only `"`, `\`, and control bytes (< 0x20) ever need escaping, and
+    // in UTF-8 those are all single bytes, so a byte scan is exact.
+    if s.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\') {
+        out.push_str(s);
+        out.push('"');
+        return;
+    }
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
