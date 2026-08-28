@@ -391,7 +391,7 @@ pub fn merge_ndjson(store: &mut Store, text: &str) -> Result<MergeReport, String
     }
 
     // Edge external id → eid over live edges, so an explicit-id dedup is O(1).
-    let mut ext_to_eid: std::collections::HashMap<Arc<str>, u32> = std::collections::HashMap::new();
+    let mut ext_to_eid: std::collections::HashMap<GStr, u32> = std::collections::HashMap::new();
     for eid in store.all_edges() {
         if let Some(ext) = store.edge_ext_id(eid) {
             ext_to_eid.insert(ext, eid);
@@ -421,7 +421,7 @@ pub fn merge_ndjson(store: &mut Store, text: &str) -> Result<MergeReport, String
             store.set_edge_prop(eid, k, v.clone());
         }
         if let Some(e) = edge_id {
-            ext_to_eid.insert(Arc::from(e.as_str()), eid);
+            ext_to_eid.insert(GStr::from(e.as_str()), eid);
         }
         report.edges_added += 1;
     }

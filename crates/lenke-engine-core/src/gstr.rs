@@ -244,6 +244,14 @@ impl From<&str> for GStr {
         Self::new(s)
     }
 }
+impl Default for GStr {
+    /// The empty string — inline, no allocation. Backs `Option<GStr>::unwrap_or_default`
+    /// on the external-id accessors (a tombstoned/absent id renders as `""`).
+    #[inline]
+    fn default() -> Self {
+        Self::new("")
+    }
+}
 impl From<String> for GStr {
     #[inline]
     fn from(s: String) -> Self {

@@ -3008,9 +3008,7 @@ impl GremlinTree {
 /// `connectedComponent`/`peerPressure` write (`Value::Str(vid.arc(root))`). A root
 /// with no external id (never, for a loaded node) reads back NULL.
 pub(super) fn root_ext_id(store: &Store, root: u32) -> Value {
-    store
-        .node_ext_id(root)
-        .map_or(Value::Null, |s| Value::Str(s.into()))
+    store.node_ext_id(root).map_or(Value::Null, Value::Str)
 }
 
 /// Collapse a node-id multiset to (distinct ids in first-seen order, their

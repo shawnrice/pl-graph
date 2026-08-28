@@ -6,6 +6,7 @@
 //! This is the lineage-FREE strategy; the lineage-preserving strategy for the
 //! same operators lands with the operators (path/tags) that need it.
 
+use crate::gstr::GStr;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -799,8 +800,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // Resolve each external id to a LIVE edge, preserving request order; an
             // unknown/deleted id is dropped. No reverse ext→edge map exists, so build
             // one lazily from the live-edge set (edge id lookups are rare/small).
-            let mut by_ext: std::collections::HashMap<Arc<str>, u32> =
-                std::collections::HashMap::new();
+            let mut by_ext: std::collections::HashMap<GStr, u32> = std::collections::HashMap::new();
             for e in store.all_edges() {
                 if let Some(x) = store.edge_ext_id(e) {
                     by_ext.entry(x).or_insert(e);
@@ -1177,11 +1177,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                     }
                     let ids: Vec<Value> = path
                         .into_iter()
-                        .map(|v| {
-                            store
-                                .node_ext_id(v)
-                                .map_or(Value::Null, |s| Value::Str(s.into()))
-                        })
+                        .map(|v| store.node_ext_id(v).map_or(Value::Null, Value::Str))
                         .collect();
                     out.push(Value::List(ids));
                 }

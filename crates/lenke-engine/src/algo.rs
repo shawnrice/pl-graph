@@ -1683,7 +1683,7 @@ pub fn run_procedure(
                 .into_iter()
                 .map(|(v, x)| {
                     let ext = store.node_ext_id(x as u32).unwrap_or_default();
-                    (v, Value::Str(ext.into()))
+                    (v, Value::Str(ext))
                 })
                 .collect(),
         );

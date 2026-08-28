@@ -1,5 +1,6 @@
 use super::*;
 use crate::batch::Col;
+use crate::gstr::GStr;
 use crate::ir::Plan;
 use crate::store::Store;
 use crate::value::Value;
@@ -127,7 +128,7 @@ pub(super) fn reunfold_elements(elems: &[Value], store: &Store) -> Col {
     }
     // Try edges — build a lazy ext→edge map (no reverse map is stored).
     if elems.iter().all(|v| edge_map_ext_id(v).is_some()) {
-        let mut by_ext: std::collections::HashMap<Arc<str>, u32> = std::collections::HashMap::new();
+        let mut by_ext: std::collections::HashMap<GStr, u32> = std::collections::HashMap::new();
         for e in store.all_edges() {
             if let Some(x) = store.edge_ext_id(e) {
                 by_ext.entry(x).or_insert(e);
@@ -151,12 +152,12 @@ pub(super) fn edge_result_value(store: &Store, eid: u32) -> Value {
     use std::sync::Arc;
     let id = store
         .edge_ext_id(eid)
-        .unwrap_or_else(|| Arc::from(format!("e{eid}")));
+        .unwrap_or_else(|| GStr::from(format!("e{eid}")));
     let (src, dst) = store.edge_endpoints(eid).unwrap_or((0, 0));
     let ext = |n: u32| {
         store
             .node_ext_id(n)
-            .unwrap_or_else(|| Arc::from(n.to_string()))
+            .unwrap_or_else(|| GStr::from(n.to_string()))
     };
     // ALL of the edge's labels, sorted — mirroring `node_result_value`. A
     // multi-label edge (`[KNOWS, CREATED]`) must render its whole label set
@@ -182,9 +183,9 @@ pub(super) fn edge_result_value(store: &Store, eid: u32) -> Value {
             .collect(),
     ));
     Value::Map(Arc::new(vec![
-        (Value::Str("id".into()), Value::Str(id.into())),
-        (Value::Str("from".into()), Value::Str(ext(src).into())),
-        (Value::Str("to".into()), Value::Str(ext(dst).into())),
+        (Value::Str("id".into()), Value::Str(id)),
+        (Value::Str("from".into()), Value::Str(ext(src))),
+        (Value::Str("to".into()), Value::Str(ext(dst))),
         (Value::Str("labels".into()), labels),
         (Value::Str("properties".into()), props_map),
     ]))
@@ -229,7 +230,7 @@ pub(super) fn render_gpath_elem(
             } else {
                 store.node_ext_id(id)
             };
-            ext.map_or(Value::Null, |s| Value::Str(s.into()))
+            ext.map_or(Value::Null, Value::Str)
         }
         GPathBy::Label => {
             if is_edge {
@@ -270,7 +271,7 @@ pub(super) fn render_nodes(store: &Store, ids: &[u32]) -> Vec<Value> {
             let i = id as usize;
             let ext = store
                 .node_ext_id(id)
-                .unwrap_or_else(|| Arc::from(id.to_string()));
+                .unwrap_or_else(|| GStr::from(id.to_string()));
             let mut labels = store.labels_of(id);
             labels.sort_unstable();
             let labels_list =
@@ -281,7 +282,7 @@ pub(super) fn render_nodes(store: &Store, ids: &[u32]) -> Vec<Value> {
                 .map(|(k, c)| (Value::Str(Arc::clone(k).into()), c.read(i)))
                 .collect();
             Value::Map(Arc::new(vec![
-                (Value::Str("id".into()), Value::Str(ext.into())),
+                (Value::Str("id".into()), Value::Str(ext)),
                 (Value::Str("labels".into()), labels_list),
                 (Value::Str("properties".into()), Value::Map(Arc::new(props))),
             ]))
@@ -344,7 +345,7 @@ pub(super) fn node_result_value(store: &Store, id: u32) -> Value {
     use std::sync::Arc;
     let ext = store
         .node_ext_id(id)
-        .unwrap_or_else(|| Arc::from(id.to_string()));
+        .unwrap_or_else(|| GStr::from(id.to_string()));
     let mut labels = store.labels_of(id);
     labels.sort_unstable();
     let labels_list = Value::List(labels.into_iter().map(|l| Value::Str(l.into())).collect());
@@ -363,7 +364,7 @@ pub(super) fn node_result_value(store: &Store, id: u32) -> Value {
             .collect(),
     ));
     Value::Map(Arc::new(vec![
-        (Value::Str("id".into()), Value::Str(ext.into())),
+        (Value::Str("id".into()), Value::Str(ext)),
         (Value::Str("labels".into()), labels_list),
         (Value::Str("properties".into()), props_map),
     ]))
@@ -374,11 +375,7 @@ pub(super) fn node_result_value(store: &Store, id: u32) -> Value {
 /// properties sorted by key).
 pub(super) fn subgraph_edge_value(store: &Store, eid: u32) -> Value {
     use std::sync::Arc;
-    let ext = |id: u32| {
-        store
-            .node_ext_id(id)
-            .map_or(Value::Null, |s| Value::Str(s.into()))
-    };
+    let ext = |id: u32| store.node_ext_id(id).map_or(Value::Null, Value::Str);
     let (src, dst) = store.edge_endpoints(eid).unwrap_or((0, 0));
     let mut keys: Vec<String> = store
         .edge_prop_keys()
@@ -396,9 +393,7 @@ pub(super) fn subgraph_edge_value(store: &Store, eid: u32) -> Value {
     Value::Map(Arc::new(vec![
         (
             Value::Str("id".into()),
-            store
-                .edge_ext_id(eid)
-                .map_or(Value::Null, |s| Value::Str(s.into())),
+            store.edge_ext_id(eid).map_or(Value::Null, Value::Str),
         ),
         (
             Value::Str("label".into()),
