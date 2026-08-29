@@ -1288,6 +1288,9 @@ pub struct Store {
     /// out-of-band metadata for host-side change detection (`useSyncExternalStore`),
     /// so it never affects cross-engine byte-identity. Read via [`Store::version`].
     version: u64,
+    /// True during a bulk load ([`begin_bulk`]/[`end_bulk`]): per-element
+    /// `touch`/`bump_epoch` is deferred and reconciled once at the end.
+    loading: bool,
     /// Per-TOKEN change epochs: a label / edge-type / property-key name → the
     /// [`version`](Store::version) at which a change last touched it. The FINE
     /// invalidation signal behind global `version` — a React subscription watches
@@ -1362,6 +1365,7 @@ impl Clone for Store {
             edge_num: self.edge_num.clone(),
             edge_num_fresh: self.edge_num_fresh,
             version: self.version,
+            loading: self.loading,
             epochs: self.epochs.clone(),
         }
     }
@@ -1370,12 +1374,47 @@ impl Clone for Store {
 impl Store {
     /// Bump the mutation counter. Called by every data-mutation primitive.
     fn touch(&mut self) {
+        if self.loading {
+            return; // deferred; end_bulk() bumps once and reconciles the epochs
+        }
         self.version = self.version.wrapping_add(1);
+    }
+
+    /// Enter bulk-load mode: per-element version/epoch upkeep is deferred (a load
+    /// runs no queries, so nothing needs invalidating mid-load). MUST be paired with
+    /// [`end_bulk`].
+    pub fn begin_bulk(&mut self) {
+        self.loading = true;
+    }
+
+    /// Leave bulk-load mode and reconcile: bump the version ONCE and stamp every
+    /// token a load could have touched (prop keys, labels, edge types, edge-prop
+    /// keys) with it, so a host observing `version`/`epoch` sees the whole load as a
+    /// single change (the host fingerprint is a monotonic SUM of dep epochs, so one
+    /// stamp per token is enough — see packages/native/src/store.ts).
+    pub fn end_bulk(&mut self) {
+        self.loading = false;
+        self.version = self.version.wrapping_add(1);
+        let v = self.version;
+        let tokens: Vec<String> = self
+            .props
+            .keys()
+            .chain(self.by_label.keys())
+            .chain(self.etype_ids.keys())
+            .chain(self.edge_props.keys())
+            .cloned()
+            .collect();
+        for t in tokens {
+            self.epochs.insert(t, v);
+        }
     }
 
     /// Stamp `token`'s change epoch with the current version. Call AFTER `touch`
     /// (so `version` is already bumped) with each token a mutation names.
     fn bump_epoch(&mut self, token: &str) {
+        if self.loading {
+            return; // deferred; end_bulk() stamps every loaded token
+        }
         let v = self.version;
         // Avoid a String alloc when the token is already tracked (the common case).
         if let Some(e) = self.epochs.get_mut(token) {
@@ -2599,11 +2638,13 @@ impl Store {
             return self.add_node_with_id(ext, labels, props);
         }
         self.touch();
-        for l in labels {
-            self.bump_epoch(l);
-        }
-        for (k, _) in props {
-            self.bump_epoch(k);
+        if !self.loading {
+            for l in labels {
+                self.bump_epoch(l);
+            }
+            for (k, _) in props {
+                self.bump_epoch(k);
+            }
         }
         self.invalidate_csr();
         let id = self.node_count as u32;
@@ -4365,6 +4406,7 @@ impl Builder {
             edge_num: HashMap::new(),
             edge_num_fresh: false,
             version: 0,
+            loading: false,
             epochs: FnvMap::default(),
         };
         // Flatten the freshly-built adjacency into the CSR read overlay, and densify

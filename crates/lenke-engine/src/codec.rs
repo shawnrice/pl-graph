@@ -194,6 +194,7 @@ fn from_graph_data(
     on_err: TemporalOnErr,
 ) -> Result<Store, CodecError> {
     let mut store = Store::default();
+    store.begin_bulk();
 
     for n in data.nodes {
         let lrefs: Vec<&str> = n.labels.iter().map(String::as_str).collect();
@@ -224,6 +225,7 @@ fn from_graph_data(
         }
     }
 
+    store.end_bulk();
     store.rebuild_csr();
     store.rebuild_edge_num();
     store.dict_encode_columns();
@@ -584,10 +586,12 @@ pub fn deserialize(input: &str, format: &str) -> Result<Store, CodecError> {
         strict,
         on_err,
     };
+    sink.store.begin_bulk();
     match lenke_codec::deserialize_into(input, format, &mut sink) {
         Some(result) => {
             result?;
             let mut store = sink.store;
+            store.end_bulk();
             store.rebuild_csr();
             store.rebuild_edge_num();
             store.dict_encode_columns();
