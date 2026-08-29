@@ -235,6 +235,7 @@ fn from_graph_data(
 /// Resolve an edge endpoint id to a node. Strict: a missing endpoint is an error;
 /// lenient: it is created as a bare node (matching pg-text's `finalize`).
 fn endpoint(store: &mut Store, ext: &str, strict: bool) -> Result<u32, CodecError> {
+    store.materialize_ext(); // build the reverse map before the first edge resolves
     if let Some(id) = store.node_by_ext(ext) {
         return Ok(id);
     }

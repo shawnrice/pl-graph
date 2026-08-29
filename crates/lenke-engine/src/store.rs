@@ -1291,6 +1291,11 @@ pub struct Store {
     /// True during a bulk load ([`begin_bulk`]/[`end_bulk`]): per-element
     /// `touch`/`bump_epoch` is deferred and reconciled once at the end.
     loading: bool,
+    /// True while `ext_to_node` inserts are deferred (bulk load). The map is rebuilt
+    /// from `node_ext` in one reserved pass by [`materialize_ext`] on the first
+    /// lookup / at `end_bulk` — a big graph's reverse map spills cache, so building it
+    /// once beats insert-by-insert interleaved with the rest of the load.
+    ext_deferred: bool,
     /// Per-TOKEN change epochs: a label / edge-type / property-key name → the
     /// [`version`](Store::version) at which a change last touched it. The FINE
     /// invalidation signal behind global `version` — a React subscription watches
@@ -1366,6 +1371,7 @@ impl Clone for Store {
             edge_num_fresh: self.edge_num_fresh,
             version: self.version,
             loading: self.loading,
+            ext_deferred: self.ext_deferred,
             epochs: self.epochs.clone(),
         }
     }
@@ -1385,6 +1391,7 @@ impl Store {
     /// [`end_bulk`].
     pub fn begin_bulk(&mut self) {
         self.loading = true;
+        self.ext_deferred = true;
     }
 
     /// Leave bulk-load mode and reconcile: bump the version ONCE and stamp every
@@ -1394,6 +1401,7 @@ impl Store {
     /// stamp per token is enough — see packages/native/src/store.ts).
     pub fn end_bulk(&mut self) {
         self.loading = false;
+        self.materialize_ext();
         self.version = self.version.wrapping_add(1);
         let v = self.version;
         let tokens: Vec<String> = self
@@ -2627,6 +2635,24 @@ impl Store {
 
     /// Add a node carrying an explicit external id (used by ingest, which preserves
     /// the id from the file). Returns the dense id.
+    /// Rebuild `ext_to_node` from `node_ext` in one reserved pass if its inserts were
+    /// deferred during a bulk load; a no-op otherwise. Called before any external-id
+    /// lookup and at `end_bulk`.
+    pub fn materialize_ext(&mut self) {
+        if !self.ext_deferred {
+            return;
+        }
+        self.ext_deferred = false;
+        self.ext_to_node.clear();
+        self.ext_to_node.reserve(self.node_ext.len());
+        for i in 0..self.node_ext.len() {
+            if !self.deleted[i] {
+                let g = self.node_ext[i].clone();
+                self.ext_to_node.insert(g, i as u32);
+            }
+        }
+    }
+
     /// Bulk-load node insert. A single pass over the columns gives each ONE push
     /// (the node's value, or absent) — no per-property hashmap lookup and no
     /// push-absent-then-overwrite that [`add_node_with_id`] pays. Skips per-property
@@ -2650,8 +2676,12 @@ impl Store {
         let id = self.node_count as u32;
         self.node_count += 1;
         let gid = GStr::from(ext);
-        self.node_ext.push(gid.clone());
-        self.ext_to_node.insert(gid, id);
+        if self.ext_deferred {
+            self.node_ext.push(gid); // reverse map rebuilt in bulk by materialize_ext
+        } else {
+            self.node_ext.push(gid.clone());
+            self.ext_to_node.insert(gid, id);
+        }
         // One pass over existing columns: push this node's value, or absent — no
         // per-property hashmap lookup, no overwrite. `matched` marks props that landed
         // in an existing column so the rest can create theirs.
@@ -2711,8 +2741,12 @@ impl Store {
         // Build the id's `GStr` ONCE and share it between the dense array and the
         // reverse map (a long id would otherwise allocate twice).
         let gid = GStr::from(ext);
-        self.node_ext.push(gid.clone());
-        self.ext_to_node.insert(gid, id);
+        if self.ext_deferred {
+            self.node_ext.push(gid); // reverse map rebuilt in bulk by materialize_ext
+        } else {
+            self.node_ext.push(gid.clone());
+            self.ext_to_node.insert(gid, id);
+        }
         // Keep every existing column the same length as the node set.
         for col in self.props.values_mut() {
             col.push_absent();
@@ -4407,6 +4441,7 @@ impl Builder {
             edge_num_fresh: false,
             version: 0,
             loading: false,
+            ext_deferred: false,
             epochs: FnvMap::default(),
         };
         // Flatten the freshly-built adjacency into the CSR read overlay, and densify
