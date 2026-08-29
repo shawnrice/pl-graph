@@ -19,7 +19,7 @@ mod pg_text;
 mod stream;
 
 pub use decstream::{deserialize_into, DecVal, GraphSink};
-pub use jsonfmt::{js_number, push_json_str, push_num, push_value};
+pub use jsonfmt::{js_number, push_js_number, push_json_str, push_num, push_value};
 pub use model::{Edge, GraphData, Node, Value};
 pub use graphson::{EProps, GraphsonSink, LabelJoin, VProps};
 pub use pg_text::PgTextSink;
