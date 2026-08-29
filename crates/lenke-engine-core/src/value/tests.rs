@@ -331,3 +331,20 @@ fn total_order_is_total_and_deterministic() {
     assert!(matches!(xs[3], Value::Bool(true)));
     assert!(matches!(xs[4], Value::Null));
 }
+
+#[test]
+fn num_of_collapses_negative_zero() {
+    use crate::value::num_of;
+    // The numeric model has no negative zero: num_of erases the sign bit so no
+    // computation observes -0 (grouping/sort/equality already collapse ±0 elsewhere).
+    let neg = num_of(&Value::Num(-0.0)).unwrap();
+    let pos = num_of(&Value::Num(0.0)).unwrap();
+    assert_eq!(
+        neg.to_bits(),
+        0.0f64.to_bits(),
+        "num_of(-0.0) must be +0.0 bit-for-bit"
+    );
+    assert_eq!(neg.to_bits(), pos.to_bits());
+    // A non-zero value is untouched.
+    assert_eq!(num_of(&Value::Num(-3.5)).unwrap(), -3.5);
+}

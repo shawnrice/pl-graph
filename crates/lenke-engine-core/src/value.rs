@@ -13,7 +13,12 @@
 //! - **NaN in the total order is the greatest number** (so sorts/min/max are
 //!   deterministic), but **NaN is never equal to anything, including itself**,
 //!   under `equals` (the predicate `=`), matching IEEE and JS.
-//! - **`-0.0` and `0.0` are equal** and compare equal.
+//! - **There is no negative zero.** `-0.0` and `0.0` are equal and compare equal,
+//!   AND `num_of` collapses `-0.0 → 0.0` on the way into every computation, so no
+//!   operation ever observes a signed zero (e.g. `cot(-0)` is `+Inf`, not `-Inf`).
+//!   Deliberately unlike IEEE: graph queries never need signed zero (no complex
+//!   branch cuts, no underflow-sign recovery), and preserving it only leaked the
+//!   meaningless sign bit into results and diverged across engines.
 //! - **Cross-type `equals` is simply false** — a number never equals a string —
 //!   rather than an error. Cross-type *ordering* is a language-level decision the
 //!   front-end makes; `cmp_total` itself is total and never fails, because sorts
@@ -205,7 +210,13 @@ pub fn as_num(v: &Value) -> Option<f64> {
 #[must_use]
 pub fn num_of(v: &Value) -> Option<f64> {
     match v {
-        Value::Num(x) => Some(*x),
+        // Collapse -0.0 to +0.0: the numeric model has NO negative zero (a deliberate
+        // deviation from IEEE — graph queries never need signed zero, and preserving it
+        // only leaks the meaningless sign bit into results, e.g. `cot(-0)` -> -Inf vs
+        // +Inf, which diverged across engines). Grouping (`num_group_bits`), sort
+        // (`cmp_num_total`) and equality already collapse ±0; this is the last path —
+        // computation — so no operation ever observes a -0.
+        Value::Num(x) => Some(if *x == 0.0 { 0.0 } else { *x }),
         _ => None,
     }
 }

@@ -126,7 +126,10 @@ export const numOf = (v: unknown): number | null => {
   }
 
   if (typeof v === 'number') {
-    return v;
+    // Collapse -0 to +0: the numeric model has NO negative zero (deliberate, unlike
+    // IEEE — see native `num_of`). Grouping/sort/equality already collapse ±0; this is
+    // the computation path, so no op observes a -0 (e.g. cot(-0) is +Inf, not -Inf).
+    return v === 0 ? 0 : v;
   }
 
   return dataException(`arithmetic requires a number, got ${typeName(v)}`);
@@ -654,7 +657,10 @@ export const lengthOf = (a: unknown): number | null => {
 // else → NaN. So abs('0x10') / abs([5]) are NaN in both engines.
 export const numArg = (v: unknown): number => {
   if (typeof v === 'number') {
-    return v;
+    // Collapse -0 to +0: no negative zero in the numeric model (see native `num_of`).
+    // This is the numeric-function path (cot, atan2, …), the last place a -0 could be
+    // observed after grouping/sort/equality already collapse ±0.
+    return v === 0 ? 0 : v;
   }
 
   // Numbers are NOT coerced from booleans or strings — a non-number where a number is
