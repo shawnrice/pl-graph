@@ -300,6 +300,7 @@ const genExpr = (r: () => number, depth: number): string => {
       '(0.0 - 0.0)',
       '(n.x - n.x)',
     ]);
+
     return `(${pick(r, ['-0.0', '0.0'])} ${pick(r, CMP)} cot(${zero}))`;
   }
 
