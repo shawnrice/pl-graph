@@ -284,6 +284,25 @@ const genExpr = (r: () => number, depth: number): string => {
 
   const e = (): string => genExpr(r, depth - 1);
 
+  // Signed-zero probe (deterministic ~4% slice). `cot(±0)` is `±Inf` — the sign bit of a
+  // *zero* is the one thing that leaks into the sign of an *infinity*, and that Inf is only
+  // observable through a comparison (it collapses to null on RETURN). This is exactly the
+  // shape that diverged (native erased the `-0.0` literal, TS kept it) before the "no
+  // negative zero" fix. Emitting it on EVERY run — over literal, computed, and
+  // property-derived zeros — guards that invariant deterministically instead of hoping the
+  // generator stumbles onto `cot(-0.0) < 0` by chance.
+  if (p < 0.04) {
+    const zero = pick(r, [
+      '-0.0',
+      '0.0',
+      '(-1.0 * 0.0)',
+      '(0.0 * n.x)',
+      '(0.0 - 0.0)',
+      '(n.x - n.x)',
+    ]);
+    return `(${pick(r, ['-0.0', '0.0'])} ${pick(r, CMP)} cot(${zero}))`;
+  }
+
   if (p < 0.14) {
     return `(${e()} ${pick(r, ARITH)} ${e()})`;
   }
