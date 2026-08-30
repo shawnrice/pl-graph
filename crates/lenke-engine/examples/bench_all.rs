@@ -12,6 +12,8 @@
 //! Env: BENCH_REPS (samples, default 7), BENCH_N (sweep size, default 200k).
 
 // The harness is a shared toolkit; even bench_all may not use every helper.
+#[path = "support/algo.rs"]
+mod algo;
 #[path = "support/harness.rs"]
 #[allow(dead_code)]
 mod harness;
@@ -25,4 +27,5 @@ fn main() {
     // Groups are added here as each is built; every group honours `cfg.filter`.
     ingest::run(&cfg);
     query::run(&cfg);
+    algo::run(&cfg);
 }

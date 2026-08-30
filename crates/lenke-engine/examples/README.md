@@ -52,7 +52,8 @@ comparison, use `cd packages/native && bun run bench` instead.
 | _(coming)_ Should adjacency storage change, and what do writes pay? | `storage_bench`                    |
 | _(coming)_ How far is WHERE from a columnar kernel?                 | `storage_bench -- eval`            |
 | _(coming)_ Does the type / property / temporal index seed a seek?   | `index_bench`                      |
-| _(coming)_ What do the graph algorithms / neighborAggregate / CALL cost? | `algo_bench`                  |
+| What do the graph algorithms cost, and how do they parallelize?     | `algo_bench -- run` / `parallel` |
+| What does neighborAggregate / a CALL cost?                          | `algo_bench -- neighboragg` / `call` |
 | _(coming)_ What do map / record / temporal-column values cost?      | `value_bench`                      |
 | _(coming)_ How do shapes scale with size? CDC? AML / HRIS shapes?   | `scale_bench`                      |
 
