@@ -647,10 +647,15 @@ pub(crate) fn build_store(staged: StagedNdjson, threads: u32) -> Result<Store, S
         indeg[t as usize] += 1;
     }
     store.reserve_for_edges(edges.len(), &outdeg, &indeg);
+    // Edge insert stays SERIAL: it is memory-bound scattered adjacency writes with tiny
+    // (avg few-edge) per-node work, and a parallel counting-sort rebuild measured SLOWER
+    // — more passes over E, plus rayon overhead across 50k tiny per-node tasks. (Passing
+    // the id by reference instead of a throwaway `Arc` per edge is measurement-neutral —
+    // the transient small allocs are cheap — but it is cleaner, so it stays.)
     for ((_, _, edge_id, labels, props), &(f, t)) in edges.iter().zip(&resolved) {
         let etype = &labels[0];
         let eid = match edge_id {
-            Some(id) => store.add_edge_with_id(&Arc::from(id.as_str()), f, t, etype),
+            Some(id) => store.add_edge_with_id(id, f, t, etype),
             None => store.add_edge(f, t, etype),
         };
         if labels.len() > 1 {
