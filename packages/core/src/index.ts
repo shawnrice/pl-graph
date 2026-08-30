@@ -1,6 +1,7 @@
 export {
   CONFIG_IDS,
   DEFAULT_CONFIG,
+  PARALLELISM_CONFIG_ID,
   Edge,
   Graph,
   isEdgeShaped,

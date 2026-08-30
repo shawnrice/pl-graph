@@ -206,7 +206,7 @@ describe('typed results (opt-in row-shape generic)', () => {
 
 // Regressions found by the cross-engine differential fuzzer
 // (packages/native/src/differential-fuzz.test.ts). Each pins a case where this
-// engine disagreed with the Rust core; the fuzzer is randomized, so these
+// engine disagreed with the Rust engine; the fuzzer is randomized, so these
 // deterministic tests are the permanent guards.
 describe('GQL: byte-identity regressions from the differential fuzzer', () => {
   const g2 = createTestSocialGraph();
@@ -500,6 +500,7 @@ describe('GQL: graph settings are constructor-only', () => {
     expect(new Graph({ limits: { trail: 50 } }).config).toEqual({
       limits: { range: 1_000_000, trail: 50, intermediate: 50_000_000, operatorChain: 10_000 },
       clock: null,
+      parallelism: 1,
     });
 
     for (const bad of [0, -1, 1.5, Number.NaN]) {

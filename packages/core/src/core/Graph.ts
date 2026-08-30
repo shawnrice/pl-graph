@@ -78,6 +78,17 @@ export type GraphLimits = {
 export type GraphConfig = {
   limits: GraphLimits;
   clock: Clock | null;
+  /**
+   * Max worker threads the in-engine graph algorithms may use, opt-in multicore.
+   * `1` (the default) runs them serially — single-core performance is unchanged and
+   * nothing competes with the host. A value > 1 lets the NATIVE engine run
+   * betweenness/closeness/PageRank/label-propagation/peer-pressure on a DEDICATED,
+   * bounded pool of that many workers (never the global pool, so it will not starve
+   * the event loop). Results are byte-identical at any thread count. Ignored by the
+   * pure-TS engine and the wasm build (no threads); a per-call `threads` on an
+   * algorithm config overrides this default.
+   */
+  parallelism: number;
 };
 
 /**
@@ -87,6 +98,7 @@ export type GraphConfig = {
 export type GraphConfigPatch = {
   limits?: Partial<GraphLimits>;
   clock?: Clock | null;
+  parallelism?: number;
 };
 
 /**
@@ -102,6 +114,7 @@ export const DEFAULT_CONFIG: GraphConfig = {
     operatorChain: 10_000,
   },
   clock: null,
+  parallelism: 1,
 };
 
 /**
@@ -115,6 +128,13 @@ export const CONFIG_IDS: Record<`limits.${keyof GraphLimits}`, number> = {
   'limits.intermediate': 2,
   'limits.operatorChain': 3,
 };
+
+/**
+ * Wire id for the non-limit `parallelism` setting (matches Rust `ConfigId::Parallelism`).
+ * Id 4 is reserved for the native-only `dictMaxDistinct` knob (not surfaced here), so
+ * parallelism takes 5. Like the limit ids, it rides the one keyed FFI setter.
+ */
+export const PARALLELISM_CONFIG_ID = 5;
 
 /**
  * The spec passed to {@link Graph.createIndex}: which element (`on`), the index
@@ -167,6 +187,15 @@ export type GraphOptions = {
    * of its contract (tests pin and unpin a clock on a live graph).
    */
   clock?: Clock | null;
+
+  /**
+   * Max worker threads the graph algorithms may use (opt-in multicore; default `1`
+   * = serial). Accepted here so the construction API matches the native engine, but
+   * the pure-TS engine has no threads and always runs serially — it stores the value
+   * (so `graph.config.parallelism` round-trips) and otherwise ignores it. Multicore
+   * runs only on the native build. See {@link GraphConfig.parallelism}.
+   */
+  parallelism?: number;
 };
 
 /**
@@ -718,6 +747,17 @@ export class Graph {
       this.settings = { ...this.settings, clock: config.clock ?? null };
     }
 
+    if (config.parallelism !== undefined) {
+      if (!Number.isInteger(config.parallelism) || config.parallelism < 1) {
+        throw new LenkeError(`parallelism must be a positive integer, got ${config.parallelism}`, {
+          code: ErrorCode.InvalidValue,
+        });
+      }
+
+      // Stored for API symmetry + round-trip; the pure-TS engine runs serially.
+      this.settings = { ...this.settings, parallelism: config.parallelism };
+    }
+
     return this;
   }
 
@@ -755,6 +795,7 @@ export class Graph {
         ...options.limits,
       },
       ...('clock' in options ? { clock: options.clock ?? null } : {}),
+      ...(options.parallelism === undefined ? {} : { parallelism: options.parallelism }),
     });
 
     this.mutationVersion = 0;

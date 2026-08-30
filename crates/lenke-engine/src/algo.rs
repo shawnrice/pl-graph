@@ -1,6 +1,6 @@
 //! In-engine graph algorithms over [`crate::store::Store`]. Each returns a
 //! per-node result keyed by the node's dense id, in ascending-id order, so the
-//! output is DETERMINISTIC and reproducible (the same rule lenke-core follows so
+//! output is DETERMINISTIC and reproducible (the same rule the TS engine follows so
 //! the two engines agree). Deleted (tombstoned) nodes are skipped.
 //!
 //! The catalog: the non-iterative set — degree, weakly/strongly connected
@@ -10,7 +10,7 @@
 //! propagation and peer-pressure clustering, whose f64 summation / tiebreak order
 //! is pinned (node-id and
 //! in-adjacency order, reciprocal multiply) so their results are reproducible and
-//! match lenke-core bit-for-bit. Most procedures yield one scalar per node;
+//! match the TS engine bit-for-bit. Most procedures yield one scalar per node;
 //! neighbor_aggregate yields a per-node feature vector (a `Value::List`).
 
 use crate::ir::Dir;
@@ -18,12 +18,21 @@ use crate::store::Store;
 use crate::value::Value;
 use std::collections::HashMap;
 
-/// PageRank defaults, matching lenke-core.
+// Opt-in multicore (feature `parallel`, native-only). The dedicated-pool helper
+// ([`crate::parallel`]) and the rayon parallel-iterator traits are pulled in only on a
+// build that has threads; wasm and `--no-default-features` builds compile the serial
+// paths alone.
+#[cfg(feature = "parallel")]
+use crate::parallel;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
+/// PageRank defaults, matching the TS engine.
 pub const DEFAULT_DAMPING: f64 = 0.85;
 pub const DEFAULT_PAGERANK_ITERATIONS: u32 = 20;
-/// Label-propagation default round bound, matching lenke-core.
+/// Label-propagation default round bound, matching the TS engine.
 pub const DEFAULT_LABEL_ITERATIONS: u32 = 10;
-/// Peer-pressure default round bound, matching lenke-core (30, NOT the pagerank 20).
+/// Peer-pressure default round bound, matching the TS engine (30, NOT the pagerank 20).
 pub const DEFAULT_PEER_PRESSURE_ITERATIONS: u32 = 30;
 
 /// Resolve an optional edge-type name to `Some(Some(id))` (a specific type),
@@ -92,19 +101,28 @@ impl Csr {
 /// (`Out`/`In`/`Both`), optionally restricted to `edge_label`. A named-but-unknown
 /// edge type gives every node degree 0. Ascending-id order.
 #[must_use]
-pub fn degree(store: &Store, dir: Dir, edge_label: Option<&str>) -> Vec<(u32, f64)> {
+pub fn degree(store: &Store, dir: Dir, edge_label: Option<&str>, threads: u32) -> Vec<(u32, f64)> {
     let nodes = store.all_nodes();
     let Some(want) = want_etype(store, edge_label) else {
         return nodes.into_iter().map(|v| (v, 0.0)).collect();
     };
-    nodes
-        .into_iter()
-        .map(|v| {
-            let mut d = 0u64;
-            for_each_nbr(store, v, dir, want, |_| d += 1);
-            (v, d as f64)
-        })
-        .collect()
+    // One output cell per node, a pure function of that node's adjacency — no shared
+    // state, so parallel and serial are trivially bit-identical (integer counts, no
+    // float reduction). The `degree_of` closure is the single source of truth.
+    let degree_of = |v: u32| -> (u32, f64) {
+        let mut d = 0u64;
+        for_each_nbr(store, v, dir, want, |_| d += 1);
+        (v, d as f64)
+    };
+    #[cfg(feature = "parallel")]
+    if threads > 1 {
+        return parallel::with_pool(threads, || {
+            nodes.par_iter().map(|&v| degree_of(v)).collect()
+        });
+    }
+    #[cfg(not(feature = "parallel"))]
+    let _ = threads;
+    nodes.iter().map(|&v| degree_of(v)).collect()
 }
 
 /// Union-find root with full path compression.
@@ -158,7 +176,7 @@ pub fn weakly_connected_components(store: &Store, edge_label: Option<&str>) -> V
 /// Every SHORTEST path from `src` along `dir` to every reachable vertex, as node-id
 /// lists (`[src, …, target]`). BFS records all minimum-length predecessors, then
 /// reconstructs each distinct shortest path — a target reachable two equally-short
-/// ways yields two paths. Ported from lenke-core's `shortest_paths_from`. The result
+/// ways yields two paths. Ported from the now-removed lenke-core's `shortest_paths_from`. The result
 /// ORDER is unspecified (target set iterated in hash order), so compare as a multiset.
 #[must_use]
 pub fn shortest_paths_from(store: &Store, src: u32, dir: Dir) -> Vec<Vec<u32>> {
@@ -251,10 +269,10 @@ pub fn bfs_distances(
 
 /// PageRank (pull model): `pr'[v] = (1−d)/N + d·dangling/N + d·Σ_{u→v} pr[u]/outdeg[u]`,
 /// where `dangling = Σ pr[u]` over out-degree-0 nodes and `N` = live node count.
-/// Runs a FIXED `iterations` (no tolerance). Ported from lenke-core: the per-target
+/// Runs a FIXED `iterations` (no tolerance). Ported from the now-removed lenke-core: the per-target
 /// pull sums its terms in `in_adj` order (== edge-insertion order for that target),
 /// and the dangling sum is in node-id order, so the accumulation is reproducible
-/// (and matches lenke-core bit-for-bit on the same graph). Unweighted. Returns
+/// (and matches the TS engine bit-for-bit on the same graph). Unweighted. Returns
 /// `(node, rank)` in ascending-id order; a named-but-unknown edge type makes every
 /// node dangling → the uniform `1/N`.
 #[must_use]
@@ -264,6 +282,7 @@ pub fn pagerank(
     weight_property: Option<&str>,
     damping: f64,
     iterations: u32,
+    threads: u32,
 ) -> Vec<(u32, f64)> {
     let live = store.all_nodes();
     let nf = live.len() as f64;
@@ -273,7 +292,7 @@ pub fn pagerank(
     // Resolve the wanted edge type. None edge_label = any type; a KNOWN name = that
     // type; a named-but-UNKNOWN type matches NO edge (every node dangles). The unknown
     // case is NOT short-circuited to `1/N` — the full iteration must run so the uniform
-    // result is produced by core's exact base formula `(1-d)/N + d·dangling/N`, which
+    // result is produced by the TS engine's exact base formula `(1-d)/N + d·dangling/N`, which
     // differs from a bare `1.0/N` in the last ULP.
     let (want, unknown_type): (Option<u32>, bool) = match edge_label {
         None => (None, false),
@@ -284,11 +303,11 @@ pub fn pagerank(
     };
     let slots = store.node_count();
 
-    // Mirror core's `build_pull_graph`: resolve each edge's weight, then accumulate
+    // Mirror the TS engine's `build_pull_graph`: resolve each edge's weight, then accumulate
     // out-strength (weighted out-degree) and an incoming CSR of per-edge factors
     // (weight / out_strength[src]) — ALL in edge-id order so every f64 sum is pinned
-    // byte-identically to core. Unweighted stays identical: weight 1.0 → out_strength ==
-    // out-degree and factor == 1/out-degree, the same values (and order) core produces.
+    // byte-identically to the TS engine. Unweighted stays identical: weight 1.0 → out_strength ==
+    // out-degree and factor == 1/out-degree, the same values (and order) the TS engine produces.
     let edges = store.all_edges(); // live eids, ascending = edge-insertion order
     let type_ok = |eid: u32| {
         if unknown_type {
@@ -300,7 +319,7 @@ pub fn pagerank(
         }
     };
     // Unweighted = weight 1.0; else the numeric `weightProperty` (non-numeric/absent →
-    // 0.0, matching core's `edge_weights`). A source whose total out-weight is 0 dangles.
+    // 0.0, matching the TS engine's `edge_weights`). A source whose total out-weight is 0 dangles.
     let weight_of = |eid: u32| -> f64 {
         match weight_property {
             None => 1.0,
@@ -357,38 +376,92 @@ pub fn pagerank(
     for &v in &live {
         pr[v as usize] = 1.0 / nf;
     }
-    for _ in 0..iterations {
-        // Dangling mass, summed in node-id order (serial — the f64 order is pinned).
-        let mut dangling = 0.0;
-        for &u in &live {
-            if out_strength[u as usize] == 0.0 {
-                dangling += pr[u as usize];
+    // The per-target pull (`pr_pull`) is the one hot loop and is independent across
+    // targets — each writes only its own `next[v]` and its inner sum is over v's own
+    // incoming edges in CSR (edge-id) order, so parallelizing ACROSS targets is
+    // bit-identical to the serial loop (no cross-target reduction). The `dangling` sum
+    // stays serial (node-id order pinned; it is cheap). The whole iteration loop runs
+    // inside ONE `with_pool` so the bounded pool is built once, not per iteration.
+    let run = |use_par: bool, mut pr: Vec<f64>| -> Vec<f64> {
+        for _ in 0..iterations {
+            // Dangling mass, summed in node-id order (serial — the f64 order is pinned).
+            let mut dangling = 0.0;
+            for &u in &live {
+                if out_strength[u as usize] == 0.0 {
+                    dangling += pr[u as usize];
+                }
             }
-        }
-        let base = (1.0 - damping) / nf + damping * dangling / nf;
-        let mut next = vec![0.0f64; slots];
-        for &v in &live {
-            // Pull over incoming edges in CSR (edge-id) order.
-            let mut sum = 0.0;
-            for j in inc_off[v as usize]..inc_off[v as usize + 1] {
-                sum += pr[inc_src[j] as usize] * inc_fac[j];
+            let base = (1.0 - damping) / nf + damping * dangling / nf;
+            let mut next = vec![0.0f64; slots];
+            #[cfg(feature = "parallel")]
+            if use_par {
+                let ups: Vec<f64> = live
+                    .par_iter()
+                    .map(|&v| pr_pull(v, &pr, &inc_off, &inc_src, &inc_fac, base, damping))
+                    .collect();
+                for (i, &v) in live.iter().enumerate() {
+                    next[v as usize] = ups[i];
+                }
+            } else {
+                for &v in &live {
+                    next[v as usize] = pr_pull(v, &pr, &inc_off, &inc_src, &inc_fac, base, damping);
+                }
             }
-            next[v as usize] = base + damping * sum;
+            #[cfg(not(feature = "parallel"))]
+            {
+                let _ = use_par;
+                for &v in &live {
+                    next[v as usize] = pr_pull(v, &pr, &inc_off, &inc_src, &inc_fac, base, damping);
+                }
+            }
+            pr = next;
         }
-        pr = next;
-    }
+        pr
+    };
+    #[cfg(feature = "parallel")]
+    let pr = if threads > 1 {
+        parallel::with_pool(threads, || run(true, pr))
+    } else {
+        run(false, pr)
+    };
+    #[cfg(not(feature = "parallel"))]
+    let pr = {
+        let _ = threads;
+        run(false, pr)
+    };
     live.into_iter().map(|v| (v, pr[v as usize])).collect()
+}
+
+/// One PageRank pull: `base + damping · Σ_{u→v} pr[u]·factor[u→v]`, the incoming
+/// edges swept in CSR (edge-id) order. The single source of truth for both the serial
+/// and parallel target loops, so they are bit-identical (each target's sum order is
+/// fixed by the CSR regardless of how targets are scheduled across threads).
+#[inline]
+fn pr_pull(
+    v: u32,
+    pr: &[f64],
+    inc_off: &[usize],
+    inc_src: &[u32],
+    inc_fac: &[f64],
+    base: f64,
+    damping: f64,
+) -> f64 {
+    let mut sum = 0.0;
+    for j in inc_off[v as usize]..inc_off[v as usize + 1] {
+        sum += pr[inc_src[j] as usize] * inc_fac[j];
+    }
+    base + damping * sum
 }
 
 /// Personalized PageRank (random-walk-with-restart): like PageRank, but the restart
 /// mass teleports to a PERSONALIZATION vector `p` — uniform `1/k` over the `k`
 /// distinct resolved `source_ext_ids` seeds (unknown/duplicate ids dropped), or
-/// `1/N` when no seed resolves (degenerating to global PageRank). Ported from core's
+/// `1/N` when no seed resolves (degenerating to global PageRank). Ported from the now-removed lenke-core's
 /// `personalized_pagerank`: `teleport = (1-d) + d·dangling`; `pr'[v] = teleport·p[v]
 /// + d·Σ_{u→v} pr[u]·recip[u]` with `recip[u] = 1/outdeg[u]` a PRECOMPUTED reciprocal
-/// that is MULTIPLIED (matching core's `inc_fac`), the dangling sum taken in
+/// that is MULTIPLIED (matching the TS engine's `inc_fac`), the dangling sum taken in
 /// ascending-id order and the incoming pull in in-adjacency (edge-insertion) order —
-/// the same fixed orders core uses, so it is byte-identical. `pr` starts at `p`.
+/// the same fixed orders the TS engine uses, so it is byte-identical. `pr` starts at `p`.
 /// Returns `(node, score)` in ascending-id order.
 #[must_use]
 pub fn personalized_pagerank(
@@ -397,6 +470,7 @@ pub fn personalized_pagerank(
     source_ext_ids: &[String],
     damping: f64,
     iterations: u32,
+    threads: u32,
 ) -> Vec<(u32, f64)> {
     let live = store.all_nodes();
     if live.is_empty() {
@@ -407,7 +481,7 @@ pub fn personalized_pagerank(
     let want_opt = want_etype(store, edge_label); // Option<Option<u32>>; None = no edges
 
     // Out-degree of the wanted type, and its precomputed reciprocal (multiplied, not
-    // divided, to match core's `inc_fac` bit-for-bit). A dangling node's recip is 0.
+    // divided, to match the TS engine's `inc_fac` bit-for-bit). A dangling node's recip is 0.
     let mut outdeg = vec![0u32; slots];
     if let Some(want) = want_opt {
         for &u in &live {
@@ -446,37 +520,120 @@ pub fn personalized_pagerank(
             p[s] = share;
         }
     }
-    let mut pr = p.clone();
+    let pr = p.clone();
 
-    for _ in 0..iterations {
-        // Dangling mass, summed in ascending-id order (pinned f64 order).
-        let mut dangling = 0.0;
-        for &u in &live {
-            if outdeg[u as usize] == 0 {
-                dangling += pr[u as usize];
+    // The incoming pull is independent per target (each `next[v]` reads read-only `pr`
+    // and sums v's own in-neighbours in in-adjacency order), so parallelizing across
+    // targets is bit-identical. `dangling` stays serial (ascending-id order pinned).
+    // One `with_pool` wraps the whole loop so the pool is built once.
+    let run = |use_par: bool, mut pr: Vec<f64>| -> Vec<f64> {
+        for _ in 0..iterations {
+            // Dangling mass, summed in ascending-id order (pinned f64 order).
+            let mut dangling = 0.0;
+            for &u in &live {
+                if outdeg[u as usize] == 0 {
+                    dangling += pr[u as usize];
+                }
             }
+            // Restart mass redistributed per `p` (not uniformly) — `teleport * p[v]`.
+            let teleport = (1.0 - damping) + damping * dangling;
+            let mut next = vec![0.0f64; slots];
+            if let Some(want) = want_opt {
+                #[cfg(feature = "parallel")]
+                if use_par {
+                    let ups: Vec<f64> = live
+                        .par_iter()
+                        .map(|&v| {
+                            ppr_pull(
+                                store,
+                                v,
+                                want,
+                                &pr,
+                                &recip,
+                                teleport,
+                                p[v as usize],
+                                damping,
+                            )
+                        })
+                        .collect();
+                    for (i, &v) in live.iter().enumerate() {
+                        next[v as usize] = ups[i];
+                    }
+                } else {
+                    for &v in &live {
+                        next[v as usize] = ppr_pull(
+                            store,
+                            v,
+                            want,
+                            &pr,
+                            &recip,
+                            teleport,
+                            p[v as usize],
+                            damping,
+                        );
+                    }
+                }
+                #[cfg(not(feature = "parallel"))]
+                {
+                    let _ = use_par;
+                    for &v in &live {
+                        next[v as usize] = ppr_pull(
+                            store,
+                            v,
+                            want,
+                            &pr,
+                            &recip,
+                            teleport,
+                            p[v as usize],
+                            damping,
+                        );
+                    }
+                }
+            } else {
+                // No edges: every pull sum is 0, so `pr` relaxes straight back to `p`.
+                for &v in &live {
+                    next[v as usize] = teleport * p[v as usize];
+                }
+            }
+            pr = next;
         }
-        // Restart mass redistributed per `p` (not uniformly) — `teleport * p[v]`.
-        let teleport = (1.0 - damping) + damping * dangling;
-        let mut next = vec![0.0f64; slots];
-        if let Some(want) = want_opt {
-            for &v in &live {
-                let mut sum = 0.0;
-                for_each_nbr(store, v, Dir::In, want, |u| {
-                    sum += pr[u as usize] * recip[u as usize];
-                });
-                next[v as usize] = teleport * p[v as usize] + damping * sum;
-            }
-        } else {
-            // No edges: every pull sum is 0, so `pr` relaxes straight back to `p`.
-            for &v in &live {
-                next[v as usize] = teleport * p[v as usize];
-            }
-        }
-        pr = next;
-    }
+        pr
+    };
+    #[cfg(feature = "parallel")]
+    let pr = if threads > 1 {
+        parallel::with_pool(threads, || run(true, pr))
+    } else {
+        run(false, pr)
+    };
+    #[cfg(not(feature = "parallel"))]
+    let pr = {
+        let _ = threads;
+        run(false, pr)
+    };
 
     live.into_iter().map(|v| (v, pr[v as usize])).collect()
+}
+
+/// One personalized-PageRank pull for target `v`: `teleport·p[v] + damping·Σ_{u→v}
+/// pr[u]·recip[u]`, in-neighbours swept in in-adjacency (edge-insertion) order. Shared
+/// by the serial and parallel target loops so they are bit-identical.
+#[inline]
+#[allow(clippy::too_many_arguments)] // a plain hot-loop helper; a param struct would only obscure it
+fn ppr_pull(
+    store: &Store,
+    v: u32,
+    want: Option<u32>,
+    pr: &[f64],
+    recip: &[f64],
+    teleport: f64,
+    p_v: f64,
+    damping: f64,
+) -> f64 {
+    let mut sum = 0.0;
+    for_each_nbr(store, v, Dir::In, want, |u| {
+        sum += pr[u as usize] * recip[u as usize];
+    });
+    teleport * p_v + damping * sum
 }
 
 /// Synchronous label propagation (community detection). Every node starts labelled
@@ -486,7 +643,7 @@ pub fn personalized_pagerank(
 /// bound, stopping early once a round changes nothing. Returns `(node, label)` in
 /// ascending-id order; a named-but-unknown edge type keeps every node its own label.
 ///
-/// (lenke-core carries labels as external-id STRINGS and breaks ties
+/// (the TS engine carries labels as external-id STRINGS and breaks ties
 /// lexicographically; this engine has only dense node ids, so the tiebreak is the
 /// smallest id — the results agree whenever id order matches string order.)
 #[must_use]
@@ -495,6 +652,7 @@ pub fn label_propagation(
     edge_label: Option<&str>,
     iterations: u32,
     seed_property: Option<&str>,
+    threads: u32,
 ) -> Vec<(u32, u32)> {
     let n = store.node_count();
     let live = store.all_nodes();
@@ -515,79 +673,149 @@ pub fn label_propagation(
         },
     );
     if let Some(want) = want_etype(store, edge_label) {
-        // Reused scratch: a dense per-label tally indexed by label id (labels are
-        // always in `0..n`), reset via a touched-list so each node costs O(degree),
-        // not O(n) — and never a per-node heap allocation (the previous `HashMap`
-        // per node per iteration was the whole cost). The winner is identical: the
-        // most-frequent label, ties broken by smallest id (order-independent).
-        let mut count = vec![0u32; n];
-        let mut touched: Vec<u32> = Vec::new();
         // Both-direction CSR built once and swept every iteration (order = out then
         // in, as `for_each_nbr` gives — the tally is order-independent anyway).
         let csr = Csr::build(store, Dir::Both, want, n);
-        for _ in 0..iterations {
-            let mut next = labels.clone();
-            for &v in &live {
-                // A seed anchor keeps its label — never tallies, never changes. (Its
-                // label is still counted by its neighbours via the CSR sweep below.)
-                if is_seed[v as usize] {
-                    continue;
-                }
-                touched.clear();
-                for &u in csr.nbrs(v) {
-                    let lbl = labels[u as usize];
-                    if count[lbl as usize] == 0 {
-                        touched.push(lbl);
-                    }
-                    count[lbl as usize] += 1;
-                }
-                // Most-frequent label; tie → lexicographically smallest EXTERNAL id
-                // (matching core's `vid.text(lbl) < vid.text(bl)`), NOT the internal
-                // dense id — the two orders disagree when nodes were not inserted in
-                // ext-id order, which is exactly when LP diverged. No neighbours → keep.
-                let mut best: Option<(u32, u32)> = None; // (label, count)
-                for &lbl in &touched {
-                    let c = count[lbl as usize];
-                    let better = match best {
-                        None => true,
-                        Some((bl, bc)) => {
-                            c > bc || (c == bc && store.node_ext_id(lbl) < store.node_ext_id(bl))
+        // A node's new label is a pure function of its neighbours' current labels plus
+        // the ext-id tiebreak, so the result is order-INDEPENDENT — parallel and serial
+        // agree regardless of scheduling. The only shared mutable is the tally scratch,
+        // which the serial path reuses across nodes and the parallel path allocates
+        // per-thread (`map_init`); both call the same `lp_winner`. The whole loop runs
+        // inside one `with_pool` so the bounded pool is built once.
+        let run = |use_par: bool, mut labels: Vec<u32>| -> Vec<u32> {
+            // Reused scratch for the serial path: a dense per-label tally reset via a
+            // touched-list so each node costs O(degree), not O(n).
+            let mut count = vec![0u32; n];
+            let mut touched: Vec<u32> = Vec::new();
+            for _ in 0..iterations {
+                let mut next = labels.clone();
+                #[cfg(feature = "parallel")]
+                if use_par {
+                    let ups: Vec<(u32, Option<u32>)> = live
+                        .par_iter()
+                        .map_init(
+                            || (vec![0u32; n], Vec::<u32>::new()),
+                            |(count, touched), &v| {
+                                if is_seed[v as usize] {
+                                    (v, None)
+                                } else {
+                                    (v, lp_winner(store, &csr, v, &labels, count, touched))
+                                }
+                            },
+                        )
+                        .collect();
+                    for (v, nl) in ups {
+                        if let Some(l) = nl {
+                            next[v as usize] = l;
                         }
-                    };
-                    if better {
-                        best = Some((lbl, c));
+                    }
+                } else {
+                    for &v in &live {
+                        if is_seed[v as usize] {
+                            continue;
+                        }
+                        if let Some(l) =
+                            lp_winner(store, &csr, v, &labels, &mut count, &mut touched)
+                        {
+                            next[v as usize] = l;
+                        }
                     }
                 }
-                if let Some((lbl, _)) = best {
-                    next[v as usize] = lbl;
+                #[cfg(not(feature = "parallel"))]
+                {
+                    let _ = use_par;
+                    for &v in &live {
+                        if is_seed[v as usize] {
+                            continue;
+                        }
+                        if let Some(l) =
+                            lp_winner(store, &csr, v, &labels, &mut count, &mut touched)
+                        {
+                            next[v as usize] = l;
+                        }
+                    }
                 }
-                for &lbl in &touched {
-                    count[lbl as usize] = 0; // reset only what this node touched
+                if next == labels {
+                    break; // converged
                 }
+                labels = next;
             }
-            if next == labels {
-                break; // converged
-            }
-            labels = next;
+            labels
+        };
+        #[cfg(feature = "parallel")]
+        {
+            labels = if threads > 1 {
+                parallel::with_pool(threads, || run(true, labels))
+            } else {
+                run(false, labels)
+            };
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            let _ = threads;
+            labels = run(false, labels);
         }
     }
     live.into_iter().map(|v| (v, labels[v as usize])).collect()
+}
+
+/// One label-propagation winner for node `v`: the most-frequent label among its CSR
+/// neighbours, ties broken by the SMALLEST external-id string (matching the TS engine's
+/// `vid.text` compare) — an order-independent total order, so serial and parallel agree.
+/// `Some(label)` to adopt, `None` (no neighbours) to keep. `count`/`touched` are
+/// caller-owned scratch (reused serially, per-thread in parallel); reset before return.
+fn lp_winner(
+    store: &Store,
+    csr: &Csr,
+    v: u32,
+    labels: &[u32],
+    count: &mut [u32],
+    touched: &mut Vec<u32>,
+) -> Option<u32> {
+    touched.clear();
+    for &u in csr.nbrs(v) {
+        let lbl = labels[u as usize];
+        if count[lbl as usize] == 0 {
+            touched.push(lbl);
+        }
+        count[lbl as usize] += 1;
+    }
+    let mut best: Option<(u32, u32)> = None; // (label, count)
+    for &lbl in touched.iter() {
+        let c = count[lbl as usize];
+        let better = match best {
+            None => true,
+            Some((bl, bc)) => c > bc || (c == bc && store.node_ext_id(lbl) < store.node_ext_id(bl)),
+        };
+        if better {
+            best = Some((lbl, c));
+        }
+    }
+    for &lbl in touched.iter() {
+        count[lbl as usize] = 0; // reset only what this node touched
+    }
+    best.map(|(lbl, _)| lbl)
 }
 
 /// Peer-pressure clustering (a directed, vote-weighted label propagation). Every
 /// vertex starts as its own cluster; each round it adopts the cluster with the
 /// highest incoming VOTE ENERGY, where a source `s` casts `vote[s] = 1/outdeg[s]`
 /// for its current cluster and the energies are summed over `s`'s in-neighbours in
-/// in-adjacency (edge-insertion) order — the same fixed order core uses, so the
+/// in-adjacency (edge-insertion) order — the same fixed order the TS engine uses, so the
 /// per-cluster f64 sum is byte-identical. A vertex with no incoming vote keeps its
-/// own cluster. Ties are broken by the SMALLEST external-id string (matching core's
+/// own cluster. Ties are broken by the SMALLEST external-id string (matching the TS engine's
 /// `vid.text` comparison, not the dense id, so multi-digit ids agree too). Rounds
-/// run to convergence or `iterations` (core's default is 30). The cluster label is
+/// run to convergence or `iterations` (the TS engine's default is 30). The cluster label is
 /// the winning cluster's dense id (surfaced as a number, like WCC/SCC). Returns
 /// `(node, cluster)` in ascending-id order; a named-but-unknown edge type → every
 /// vertex its own cluster.
 #[must_use]
-pub fn peer_pressure(store: &Store, edge_label: Option<&str>, iterations: u32) -> Vec<(u32, u32)> {
+pub fn peer_pressure(
+    store: &Store,
+    edge_label: Option<&str>,
+    iterations: u32,
+    threads: u32,
+) -> Vec<(u32, u32)> {
     let n = store.node_count();
     let live = store.all_nodes();
     let mut cluster: Vec<u32> = (0..n as u32).collect();
@@ -606,54 +834,112 @@ pub fn peer_pressure(store: &Store, edge_label: Option<&str>, iterations: u32) -
         .iter()
         .map(|&d| if d > 0 { 1.0 / f64::from(d) } else { 0.0 })
         .collect();
-    // Break ties on the source cluster's EXTERNAL id string (core's `vid.text`).
-    let ext = |c: u32| store.node_ext_id(c);
-
-    for _ in 0..iterations {
-        let mut next = cluster.clone();
-        for &u in &live {
-            // Tally incoming vote energy per candidate cluster, in in-adjacency order.
-            let mut energy: HashMap<u32, f64> = HashMap::new();
-            let mut any = false;
-            for a in store.inc(u) {
-                if want.is_none_or(|w| w == a.etype) {
-                    *energy.entry(cluster[a.nbr as usize]).or_insert(0.0) += vote[a.nbr as usize];
-                    any = true;
+    // A node's new cluster is a pure function of its in-neighbours' current clusters
+    // and votes plus the ext-id tiebreak — order-INDEPENDENT, so parallel and serial
+    // agree. The per-node energy tally is caller-owned scratch: the serial path reuses
+    // one map (cleared per node), the parallel path allocates one per thread
+    // (`map_init`); both call the same `pp_winner`. One `with_pool` wraps the loop.
+    let run = |use_par: bool, mut cluster: Vec<u32>| -> Vec<u32> {
+        let mut energy: HashMap<u32, f64> = HashMap::new();
+        for _ in 0..iterations {
+            let mut next = cluster.clone();
+            #[cfg(feature = "parallel")]
+            if use_par {
+                let ups: Vec<(u32, Option<u32>)> = live
+                    .par_iter()
+                    .map_init(HashMap::<u32, f64>::new, |energy, &u| {
+                        (u, pp_winner(store, u, &cluster, &vote, want, energy))
+                    })
+                    .collect();
+                for (u, nc) in ups {
+                    if let Some(c) = nc {
+                        next[u as usize] = c;
+                    }
+                }
+            } else {
+                for &u in &live {
+                    if let Some(c) = pp_winner(store, u, &cluster, &vote, want, &mut energy) {
+                        next[u as usize] = c;
+                    }
                 }
             }
-            if !any {
-                continue; // no incoming vote → keep own cluster
-            }
-            // Adopt the max-energy cluster; tie → smallest external id.
-            let mut best: Option<(u32, f64)> = None;
-            for (&c, &e) in &energy {
-                let better = match best {
-                    None => true,
-                    Some((bc, be)) => e > be || (e == be && ext(c) < ext(bc)),
-                };
-                if better {
-                    best = Some((c, e));
+            #[cfg(not(feature = "parallel"))]
+            {
+                let _ = use_par;
+                for &u in &live {
+                    if let Some(c) = pp_winner(store, u, &cluster, &vote, want, &mut energy) {
+                        next[u as usize] = c;
+                    }
                 }
             }
-            if let Some((c, _)) = best {
-                next[u as usize] = c;
+            if next == cluster {
+                break; // converged
             }
+            cluster = next;
         }
-        if next == cluster {
-            break; // converged
-        }
-        cluster = next;
+        cluster
+    };
+    #[cfg(feature = "parallel")]
+    {
+        cluster = if threads > 1 {
+            parallel::with_pool(threads, || run(true, cluster))
+        } else {
+            run(false, cluster)
+        };
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let _ = threads;
+        cluster = run(false, cluster);
     }
 
     live.into_iter().map(|v| (v, cluster[v as usize])).collect()
 }
 
+/// One peer-pressure winner for node `u`: the incoming cluster with the highest summed
+/// vote energy (each in-neighbour `s` casts `vote[s] = 1/outdeg[s]`), ties broken by
+/// the SMALLEST external-id string. Order-independent (the energy sum is internal to
+/// `u`, the winner tiebreak is a total order), so serial and parallel agree. `Some` to
+/// adopt, `None` (no incoming vote) to keep. `energy` is caller-owned scratch (reused
+/// serially, per-thread in parallel); cleared before use.
+fn pp_winner(
+    store: &Store,
+    u: u32,
+    cluster: &[u32],
+    vote: &[f64],
+    want: Option<u32>,
+    energy: &mut HashMap<u32, f64>,
+) -> Option<u32> {
+    energy.clear();
+    let mut any = false;
+    for a in store.inc(u) {
+        if want.is_none_or(|w| w == a.etype) {
+            *energy.entry(cluster[a.nbr as usize]).or_insert(0.0) += vote[a.nbr as usize];
+            any = true;
+        }
+    }
+    if !any {
+        return None; // no incoming vote → keep own cluster
+    }
+    let mut best: Option<(u32, f64)> = None;
+    for (&c, &e) in energy.iter() {
+        let better = match best {
+            None => true,
+            Some((bc, be)) => e > be || (e == be && store.node_ext_id(c) < store.node_ext_id(bc)),
+        };
+        if better {
+            best = Some((c, e));
+        }
+    }
+    best.map(|(c, _)| c)
+}
+
 /// Closeness centrality (unweighted, directed OUT): for each node, the reciprocal
 /// of the summed shortest-path (hop) distances to every node it can reach, or 0
-/// when it reaches nothing else. Ported from lenke-core's `closeness`: the
+/// when it reaches nothing else. Ported from the now-removed lenke-core's `closeness`: the
 /// distances are integer BFS hops summed in ascending-id order and the only
 /// floating-point operation is the final reciprocal, so it is byte-identical to
-/// core on the same graph. Weighted closeness (`weightProperty`) is deferred — this
+/// the TS engine on the same graph. Weighted closeness (`weightProperty`) is deferred — this
 /// is the unweighted default. Returns `(node, closeness)` in ascending-id order; a
 /// named-but-unknown edge type reaches only each source (every sum 0 → every 0).
 #[must_use]
@@ -661,46 +947,55 @@ pub fn closeness(
     store: &Store,
     edge_label: Option<&str>,
     weight_property: Option<&str>,
+    threads: u32,
 ) -> Vec<(u32, f64)> {
-    store
-        .all_nodes()
-        .into_iter()
-        .map(|s| {
-            // Sum finite shortest-path distances in ascending-id order (core's
-            // vertex-insertion order). Unweighted → BFS hops; weighted → Dijkstra.
-            let sum = match weight_property {
-                None => {
-                    // `bfs_distances` yields reached nodes (incl. the source at 0),
-                    // ascending id — the same set/order core sums.
-                    let mut acc = 0.0f64;
-                    for (_, d) in bfs_distances(store, s, Dir::Out, edge_label) {
-                        acc += f64::from(d);
-                    }
-                    acc
+    // Each source produces exactly ONE output cell (`1/sum` of its own reachable
+    // distances), so there is no cross-source reduction to pin — parallelizing the
+    // outer per-source map is bit-identical to the serial map. The per-source sum
+    // itself is over `bfs_distances`/`dijkstra_dist` output in ascending id, unchanged.
+    let closeness_of = |s: u32| -> (u32, f64) {
+        let sum = match weight_property {
+            None => {
+                // `bfs_distances` yields reached nodes (incl. the source at 0),
+                // ascending id — the same set/order the TS engine sums.
+                let mut acc = 0.0f64;
+                for (_, d) in bfs_distances(store, s, Dir::Out, edge_label) {
+                    acc += f64::from(d);
                 }
-                Some(wk) => {
-                    let dist = dijkstra_dist(store, s, Dir::Out, edge_label, wk);
-                    let mut acc = 0.0f64;
-                    for d in dist {
-                        if d.is_finite() {
-                            acc += d;
-                        }
+                acc
+            }
+            Some(wk) => {
+                let dist = dijkstra_dist(store, s, Dir::Out, edge_label, wk);
+                let mut acc = 0.0f64;
+                for d in dist {
+                    if d.is_finite() {
+                        acc += d;
                     }
-                    acc
                 }
-            };
-            let c = if sum == 0.0 { 0.0 } else { 1.0 / sum };
-            (s, c)
-        })
-        .collect()
+                acc
+            }
+        };
+        let c = if sum == 0.0 { 0.0 } else { 1.0 / sum };
+        (s, c)
+    };
+    let nodes = store.all_nodes();
+    #[cfg(feature = "parallel")]
+    if threads > 1 {
+        return parallel::with_pool(threads, || {
+            nodes.par_iter().map(|&s| closeness_of(s)).collect()
+        });
+    }
+    #[cfg(not(feature = "parallel"))]
+    let _ = threads;
+    nodes.iter().map(|&s| closeness_of(s)).collect()
 }
 
 /// Strongly connected components (Tarjan, iterative): partition the directed graph
 /// into maximal sets of mutually reachable vertices, labelling every member with
 /// the SMALLEST dense id in its component (matching the WCC convention). Ported
-/// from lenke-core's `strongly_connected_components`, which uses the same iterative
+/// from the now-removed lenke-core's `strongly_connected_components`, which uses the same iterative
 /// Tarjan and the same min-member representative — the partition is unique and the
-/// rep is order-independent, so this agrees with core regardless of adjacency
+/// rep is order-independent, so this agrees with the TS engine regardless of adjacency
 /// order. (Core surfaces the rep as its external-id string; this engine has only
 /// dense ids, so the rep is the number, exactly as WCC's `connected_components`
 /// does.) Returns `(node, representative)` in ascending-id order; a named-but-
@@ -809,7 +1104,7 @@ pub fn strongly_connected_components(store: &Store, edge_label: Option<&str>) ->
 
 /// Per-vertex cycle membership: `1.0` iff the vertex lies on a directed cycle —
 /// its SCC has more than one member OR it has a self-loop (a 1-cycle) — else `0.0`.
-/// Ported from core's `on_cycle`, derived from the same SCC partition plus a
+/// Ported from the now-removed lenke-core's `on_cycle`, derived from the same SCC partition plus a
 /// self-loop scan, so it is byte-identical (the value is a boolean 0/1, no float
 /// arithmetic). Returns `(node, on_cycle)` in ascending-id order; a named-but-
 /// unknown edge type → no edges → every vertex `0.0`.
@@ -847,11 +1142,11 @@ pub fn on_cycle(store: &Store, edge_label: Option<&str>) -> Vec<(u32, f64)> {
 
 /// Betweenness centrality (Brandes, unweighted, directed OUT, exact all-sources):
 /// for each vertex, the sum over all source-target pairs of the fraction of
-/// shortest paths that pass through it. Ported from core's `betweenness`: the
+/// shortest paths that pass through it. Ported from the now-removed lenke-core's `betweenness`: the
 /// per-source SSSP is the same BFS (VecDeque, `stack` in dequeue order, neighbours
 /// in edge-insertion order — which the engine's adjacency already is), `sigma`
 /// counts shortest paths, `pred` the predecessors, and the dependency
-/// back-propagation runs in reverse-stack order — the same fixed order core uses,
+/// back-propagation runs in reverse-stack order — the same fixed order the TS engine uses,
 /// so the per-vertex f64 sum is byte-identical. Sources are taken in ascending id.
 /// Weighted betweenness (`weightProperty`) and pivot sampling (`pivots`) are
 /// deferred — this is the exact unweighted default. Returns `(node, centrality)` in
@@ -862,6 +1157,7 @@ pub fn betweenness(
     edge_label: Option<&str>,
     weight_property: Option<&str>,
     pivots: Option<usize>,
+    threads: u32,
 ) -> Vec<(u32, f64)> {
     let n = store.node_count();
     let live = store.all_nodes();
@@ -874,81 +1170,44 @@ pub fn betweenness(
         _ => live.clone(),
     };
     let want = want_etype(store, edge_label);
-    let type_ok = |et: u32| want.is_some_and(|inner| inner.is_none_or(|t| t == et));
     let mut cb = vec![0f64; n];
 
-    for &s in &sources {
-        // --- single-source shortest-path DAG (sigma / pred / stack) ---
-        let mut sigma = vec![0f64; n];
-        let mut pred: Vec<Vec<u32>> = vec![Vec::new(); n];
-        let mut dist = vec![f64::INFINITY; n];
-        let mut stack: Vec<u32> = Vec::new();
-        sigma[s as usize] = 1.0;
-        dist[s as usize] = 0.0;
-        if let Some(wk) = weight_property {
-            // Weighted Dijkstra SSSP: settle in (dist, idx) heap order (== stack
-            // order); sigma RESETS on a strictly shorter path, ACCUMULATES on an
-            // equal-length one — core's weighted `sssp` branch exactly.
-            let mut settled = vec![false; n];
-            let mut heap = std::collections::BinaryHeap::new();
-            heap.push(DijkstraState { dist: 0.0, idx: s });
-            while let Some(DijkstraState { idx: v, .. }) = heap.pop() {
-                if settled[v as usize] {
-                    continue;
-                }
-                settled[v as usize] = true;
-                stack.push(v);
-                let dv = dist[v as usize];
-                for a in store.out(v) {
-                    if !type_ok(a.etype) {
-                        continue;
-                    }
-                    let to = a.nbr;
-                    let nd = dv + edge_weight(store, a.eid, wk);
-                    if nd < dist[to as usize] {
-                        dist[to as usize] = nd;
-                        sigma[to as usize] = sigma[v as usize];
-                        pred[to as usize] = vec![v];
-                        heap.push(DijkstraState { dist: nd, idx: to });
-                    } else if nd == dist[to as usize] {
-                        sigma[to as usize] += sigma[v as usize];
-                        pred[to as usize].push(v);
+    // Each source's dependency contribution is fully independent (its own SSSP + back-
+    // prop); the ONLY cross-source state is `cb`. `betweenness_source` returns that
+    // source's `(w, delta[w])` list in reverse-stack order (w != s) — the exact
+    // sequence the serial loop added. We keep byte-identity by applying those
+    // contributions to `cb` in ASCENDING SOURCE ORDER regardless of thread count:
+    // sources are chunked in order, each chunk computed in parallel, then applied
+    // serially in order (chunk 0's sources, then chunk 1's, …). Bounded to O(chunk·V).
+    #[cfg(feature = "parallel")]
+    if threads > 1 {
+        let chunk = (threads as usize).saturating_mul(4).max(1);
+        parallel::with_pool(threads, || {
+            for part in sources.chunks(chunk) {
+                let parts: Vec<Vec<(u32, f64)>> = part
+                    .par_iter()
+                    .map(|&s| betweenness_source(store, s, n, want, weight_property))
+                    .collect();
+                for contrib in &parts {
+                    for &(w, d) in contrib {
+                        cb[w as usize] += d;
                     }
                 }
             }
-        } else {
-            // Unweighted BFS layers.
-            let mut queue = std::collections::VecDeque::new();
-            queue.push_back(s);
-            while let Some(v) = queue.pop_front() {
-                stack.push(v);
-                let dv = dist[v as usize];
-                if let Some(w) = want {
-                    for_each_nbr(store, v, Dir::Out, w, |to| {
-                        if dist[to as usize].is_infinite() {
-                            dist[to as usize] = dv + 1.0;
-                            queue.push_back(to);
-                        }
-                        // A shortest-path edge (v is one hop closer than `to`): count
-                        // v's paths into `to` and record v as a predecessor.
-                        if dist[to as usize] == dv + 1.0 {
-                            sigma[to as usize] += sigma[v as usize];
-                            pred[to as usize].push(v);
-                        }
-                    });
-                }
+        });
+    } else {
+        for &s in &sources {
+            for (w, d) in betweenness_source(store, s, n, want, weight_property) {
+                cb[w as usize] += d;
             }
         }
-
-        // --- dependency accumulation, reverse-stack (non-increasing distance) ---
-        let mut delta = vec![0f64; n];
-        for &w in stack.iter().rev() {
-            let coeff = 1.0 + delta[w as usize];
-            for &v in &pred[w as usize] {
-                delta[v as usize] += (sigma[v as usize] / sigma[w as usize]) * coeff;
-            }
-            if w != s {
-                cb[w as usize] += delta[w as usize];
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let _ = threads;
+        for &s in &sources {
+            for (w, d) in betweenness_source(store, s, n, want, weight_property) {
+                cb[w as usize] += d;
             }
         }
     }
@@ -964,11 +1223,102 @@ pub fn betweenness(
     live.into_iter().map(|v| (v, cb[v as usize])).collect()
 }
 
+/// One Brandes source: the SSSP DAG (`sigma`/`pred`/`stack`) then reverse-stack
+/// dependency accumulation, returning this source's `(w, delta[w])` contributions in
+/// reverse-stack order (excluding the source `w == s`, whose delta is never added).
+/// This is the exact per-source sequence the serial `cb[w] += delta[w]` loop applied,
+/// so folding the returned lists into `cb` in ascending-source order — serial or
+/// parallel — reproduces the serial bit pattern. `want` is `want_etype`'s result
+/// (`None` = named-but-unknown type → no edges).
+fn betweenness_source(
+    store: &Store,
+    s: u32,
+    n: usize,
+    want: Option<Option<u32>>,
+    weight_property: Option<&str>,
+) -> Vec<(u32, f64)> {
+    let type_ok = |et: u32| want.is_some_and(|inner| inner.is_none_or(|t| t == et));
+    let mut sigma = vec![0f64; n];
+    let mut pred: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut dist = vec![f64::INFINITY; n];
+    let mut stack: Vec<u32> = Vec::new();
+    sigma[s as usize] = 1.0;
+    dist[s as usize] = 0.0;
+    if let Some(wk) = weight_property {
+        // Weighted Dijkstra SSSP: settle in (dist, idx) heap order (== stack order);
+        // sigma RESETS on a strictly shorter path, ACCUMULATES on an equal-length one —
+        // the TS engine's weighted `sssp` branch exactly.
+        let mut settled = vec![false; n];
+        let mut heap = std::collections::BinaryHeap::new();
+        heap.push(DijkstraState { dist: 0.0, idx: s });
+        while let Some(DijkstraState { idx: v, .. }) = heap.pop() {
+            if settled[v as usize] {
+                continue;
+            }
+            settled[v as usize] = true;
+            stack.push(v);
+            let dv = dist[v as usize];
+            for a in store.out(v) {
+                if !type_ok(a.etype) {
+                    continue;
+                }
+                let to = a.nbr;
+                let nd = dv + edge_weight(store, a.eid, wk);
+                if nd < dist[to as usize] {
+                    dist[to as usize] = nd;
+                    sigma[to as usize] = sigma[v as usize];
+                    pred[to as usize] = vec![v];
+                    heap.push(DijkstraState { dist: nd, idx: to });
+                } else if nd == dist[to as usize] {
+                    sigma[to as usize] += sigma[v as usize];
+                    pred[to as usize].push(v);
+                }
+            }
+        }
+    } else {
+        // Unweighted BFS layers.
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(s);
+        while let Some(v) = queue.pop_front() {
+            stack.push(v);
+            let dv = dist[v as usize];
+            if let Some(w) = want {
+                for_each_nbr(store, v, Dir::Out, w, |to| {
+                    if dist[to as usize].is_infinite() {
+                        dist[to as usize] = dv + 1.0;
+                        queue.push_back(to);
+                    }
+                    // A shortest-path edge (v is one hop closer than `to`): count v's
+                    // paths into `to` and record v as a predecessor.
+                    if dist[to as usize] == dv + 1.0 {
+                        sigma[to as usize] += sigma[v as usize];
+                        pred[to as usize].push(v);
+                    }
+                });
+            }
+        }
+    }
+
+    // --- dependency accumulation, reverse-stack (non-increasing distance) ---
+    let mut delta = vec![0f64; n];
+    let mut contrib: Vec<(u32, f64)> = Vec::with_capacity(stack.len());
+    for &w in stack.iter().rev() {
+        let coeff = 1.0 + delta[w as usize];
+        for &v in &pred[w as usize] {
+            delta[v as usize] += (sigma[v as usize] / sigma[w as usize]) * coeff;
+        }
+        if w != s {
+            contrib.push((w, delta[w as usize]));
+        }
+    }
+    contrib
+}
+
 /// Single-source shortest-path distances (unweighted BFS layers) from a `source`
 /// external id, along `dir`/`edge_label`. Returns `(node, distance)` for every node
 /// REACHED (the source at 0), in ascending-id order — the unweighted default of
-/// core's `shortestPath`. Distances are integer hops, so the result is byte-
-/// identical to core. An unknown/absent source (or one resolving to no live node)
+/// the TS engine's `shortestPath`. Distances are integer hops, so the result is byte-
+/// identical to the TS engine. An unknown/absent source (or one resolving to no live node)
 /// yields nothing; a named-but-unknown edge type reaches only the source. Weighted
 /// (`weightProperty`, Dijkstra) and A* (`target`) are deferred.
 #[must_use]
@@ -990,7 +1340,7 @@ pub fn shortest_path(
             .collect(),
         Some(wk) => dijkstra(store, src, dir, edge_label, wk),
     };
-    // A `target` restricts the result to that one vertex's distance (like core): its
+    // A `target` restricts the result to that one vertex's distance (like the TS engine): its
     // row if reachable (`all` holds only reachable nodes), else nothing — and an
     // unknown target id yields nothing.
     match target {
@@ -1003,7 +1353,7 @@ pub fn shortest_path(
 }
 
 /// A Dijkstra frontier entry, ordered as a MIN-heap on `(dist, idx)` — the exact
-/// reversed comparison lenke-core's `State` uses, so `BinaryHeap` pops the smallest
+/// reversed comparison the TS engine's `State` uses, so `BinaryHeap` pops the smallest
 /// distance (ties by smallest id) in the same order and the per-vertex f64 distance
 /// is byte-identical.
 struct DijkstraState {
@@ -1032,7 +1382,7 @@ impl PartialOrd for DijkstraState {
 }
 
 /// An edge's weight for the weighted shortest path: its `key` property as `f64`, or
-/// `0.0` when absent/non-numeric — matching core's `edge_weights`.
+/// `0.0` when absent/non-numeric — matching the TS engine's `edge_weights`.
 fn edge_weight(store: &Store, eid: u32, key: &str) -> f64 {
     match store.edge_prop(eid, key) {
         Value::Num(n) => n,
@@ -1041,7 +1391,7 @@ fn edge_weight(store: &Store, eid: u32, key: &str) -> f64 {
 }
 
 /// Weighted single-source shortest paths (Dijkstra) from `src` along `dir`/
-/// `edge_label`, edge costs read from the `weight` property. Ported from core's
+/// `edge_label`, edge costs read from the `weight` property. Ported from the now-removed lenke-core's
 /// weighted `shortestPath`: the same min-heap `(dist, idx)` ordering, stale-entry
 /// skip (`du > dist[u]`), and strict relaxation (`nd < dist[nbr]`), with edge
 /// weights read in the same way — so the settling order and the accumulated f64
@@ -1055,7 +1405,7 @@ fn dijkstra(
     edge_label: Option<&str>,
     weight: &str,
 ) -> Vec<(u32, f64)> {
-    // Negative/NaN weights make Dijkstra unsound — reject the whole run (core errs
+    // Negative/NaN weights make Dijkstra unsound — reject the whole run (the TS engine errs
     // here, only for shortestPath; closeness/betweenness run the SSSP unchecked).
     for eid in store.all_edges() {
         let w = edge_weight(store, eid, weight);
@@ -1071,9 +1421,9 @@ fn dijkstra(
 }
 
 /// The weighted single-source distance vector (`f64::INFINITY` for unreachable) —
-/// core's weighted `sssp`. Shared by weighted `shortest_path` and `closeness`. No
+/// the TS engine's weighted `sssp`. Shared by weighted `shortest_path` and `closeness`. No
 /// weight validation (the caller decides); relaxes incident edges in the configured
-/// direction in adjacency order, so the settled distances are byte-identical to core.
+/// direction in adjacency order, so the settled distances are byte-identical to the TS engine.
 fn dijkstra_dist(
     store: &Store,
     src: u32,
@@ -1097,7 +1447,7 @@ fn dijkstra_dist(
             continue; // a shorter distance was already settled
         }
         // Relax the incident edges in the configured direction (out-adj then in-adj
-        // for `both`), in adjacency (edge-insertion) order — core's visit_adj order.
+        // for `both`), in adjacency (edge-insertion) order — the TS engine's visit_adj order.
         let mut relax = |nbr: u32, eid: u32, etype: u32| {
             if !type_ok(etype) {
                 return;
@@ -1125,11 +1475,11 @@ fn dijkstra_dist(
 /// A\* goal-directed search from `source` to `target` (both external ids). Like
 /// Dijkstra, but the heap priority is `g + h`, where `g` is the best-known cost so
 /// far and `h(v)` is the admissible lower-bound from `v` to the target read from the
-/// `heuristic` property (0 when absent). Ported from core's `astar`: same
+/// `heuristic` property (0 when absent). Ported from the now-removed lenke-core's `astar`: same
 /// `(priority, idx)` heap order, same closed-set + strict `ng < g[nbr]` relaxation,
 /// same edge weights (unweighted → unit cost). With an admissible heuristic the
 /// settled `g[target]` is the exact shortest distance — identical to Dijkstra's, and
-/// byte-identical to core. Returns `[(target, distance)]` if reachable, else empty.
+/// byte-identical to the TS engine. Returns `[(target, distance)]` if reachable, else empty.
 fn astar_search(
     store: &Store,
     source: Option<&str>,
@@ -1228,15 +1578,15 @@ fn read_feature(store: &Store, v: u32, key: &str) -> Option<Vec<f64>> {
 
 /// Neighbor feature aggregation (a GNN message-passing primitive): for each node,
 /// element-wise aggregate the `feature` vector property over its neighbours under
-/// `op` (mean/sum/max/min). Ported from core's `neighbor_aggregate` for the
+/// `op` (mean/sum/max/min). Ported from the now-removed lenke-core's `neighbor_aggregate` for the
 /// unweighted, un-normalized case: contributors are the node's out- and/or in-
 /// neighbours (per `direction`, a both-direction self-loop counted once), gathered
 /// and SORTED BY EDGE ID for a canonical accumulation order, so the folded f64 sum
-/// is byte-identical to core. `mean` divides by the number of folded contributors;
+/// is byte-identical to the TS engine. `mean` divides by the number of folded contributors;
 /// a node with no featured contributor yields the zero vector (of the shared
 /// dimension). `include_self` folds the node's own feature first. Weighted
 /// (`weightProperty`) and GCN normalization are deferred (rejected for max/min in
-/// core; not built here). Returns `(node, Value::List)` in ascending-id order, or an
+/// the TS engine; not built here). Returns `(node, Value::List)` in ascending-id order, or an
 /// `Err` for a missing `feature`, a bad `op`/`direction`, or ragged feature lengths.
 fn neighbor_aggregate(
     store: &Store,
@@ -1284,7 +1634,7 @@ fn neighbor_aggregate(
         }
     };
     let include_self = cfg_bool("includeSelf").unwrap_or(false);
-    // The edge-type filter arrives as `edgeLabel` (core's key, sent by the shared Backend)
+    // The edge-type filter arrives as `edgeLabel` (the TS engine's key, sent by the shared Backend)
     // OR `edgeType` (the engine's own CALL spelling) — accept both, like the dispatch's
     // `edge_filter`. Reading only `edgeType` silently no-op'd the filter for every direct
     // Backend call (e.g. `neighborAggregate({ edgeLabel: 'KNOWS' })`).
@@ -1299,7 +1649,7 @@ fn neighbor_aggregate(
         }
     };
     // A per-edge weight or a GCN norm SCALES each contributor, which is meaningless
-    // for the order/scale-independent max/min — reject loudly (matching core).
+    // for the order/scale-independent max/min — reject loudly (matching the TS engine).
     let weight_property = cfg_str("weightProperty");
     if (weight_property.is_some() || gcn) && matches!(op, AggOp::Max | AggOp::Min) {
         return Err(
@@ -1310,7 +1660,7 @@ fn neighbor_aggregate(
     }
 
     // Precompute every vertex's feature vector; infer the shared dimension (ragged
-    // vectors fault, matching core).
+    // vectors fault, matching the TS engine).
     let slots = store.node_count();
     let feats: Vec<Option<Vec<f64>>> = (0..slots as u32)
         .map(|v| read_feature(store, v, feature))
@@ -1433,7 +1783,7 @@ fn neighbor_aggregate(
 }
 
 /// The built-in procedure catalog: a `CALL name(...)` procedure name → its
-/// non-`node` result column name (matching lenke-core's snake_case surface). The
+/// non-`node` result column name (matching the TS engine's snake_case surface). The
 /// output columns of every procedure are `[node, <result>]`. `None` = unknown.
 #[must_use]
 pub fn procedure_result_col(name: &str) -> Option<&'static str> {
@@ -1454,7 +1804,7 @@ pub fn procedure_result_col(name: &str) -> Option<&'static str> {
     })
 }
 
-/// The accepted `CALL <algo>({…})` config keys (core's list, plus the engine's
+/// The accepted `CALL <algo>({…})` config keys (the TS engine's list, plus the engine's
 /// `edgeType` spelling of `edgeLabel`). A config map is validated against this set so
 /// a typo or a wrong key no longer silently no-ops. Order is fixed so the "did you
 /// mean" tie-break is deterministic.
@@ -1477,6 +1827,7 @@ const CONFIG_KEYS: &[&str] = &[
     "op",
     "includeSelf",
     "norm",
+    "threads",
 ];
 
 /// Case-insensitive Levenshtein edit distance — for the config-key "did you mean".
@@ -1498,11 +1849,11 @@ fn edit_distance(a: &str, b: &str) -> usize {
 
 /// Validate a `CALL` config map: every key must be a known config key (unknown →
 /// error, with a "did you mean") and carry the right value TYPE (a wrong type is a
-/// data exception). Matches core — a bad config no longer silently no-ops.
+/// data exception). Matches the TS engine — a bad config no longer silently no-ops.
 pub fn validate_config(config: &[(String, Value)]) -> Result<(), String> {
     for (k, v) in config {
         let expect: &str = match k.as_str() {
-            "dampingFactor" | "iterations" | "pivots" => "number",
+            "dampingFactor" | "iterations" | "pivots" | "threads" => "number",
             "includeSelf" => "boolean",
             "sourceNodes" => "list",
             "edgeLabel" | "edgeType" | "direction" | "weightProperty" | "seedProperty"
@@ -1573,21 +1924,26 @@ pub fn run_procedure(
         Some("both") => Dir::Both,
         _ => Dir::Out,
     };
-    // The edge-type filter arrives as `edgeLabel` (core's key, sent by the shared
+    // The edge-type filter arrives as `edgeLabel` (the TS engine's key, sent by the shared
     // Backend / direct-algo path) OR `edgeType` (the engine's own CALL spelling) —
     // accept either so a filtered degree/CC/label-prop/… is honoured on both paths.
     // Reading only `edgeType` silently no-op'd the filter for every direct-algo call.
     let edge_filter = || str_of("edgeLabel").or_else(|| str_of("edgeType"));
+    // Effective worker-thread count: a per-call `threads` overrides the graph-level
+    // default (`Store::parallelism`); 1 = serial. Ignored on a build without threads.
+    let threads = num_of("threads")
+        .map(|n| n.max(1.0) as u32)
+        .unwrap_or_else(|| store.effective_parallelism());
     // Every remaining procedure is scalar `(node, f64)`; wrap into `(node, Value::Num)`.
     let numeric: Vec<(u32, f64)> = match name {
-        "degree" => degree(store, dir(), edge_filter()),
+        "degree" => degree(store, dir(), edge_filter(), threads),
         "connected_components" => weakly_connected_components(store, edge_filter())
             .into_iter()
             .map(|(v, c)| (v, f64::from(c)))
             .collect(),
         "label_propagation" => {
             let iters = num_of("iterations").map_or(DEFAULT_LABEL_ITERATIONS, |n| n as u32);
-            label_propagation(store, edge_filter(), iters, str_of("seedProperty"))
+            label_propagation(store, edge_filter(), iters, str_of("seedProperty"), threads)
                 .into_iter()
                 .map(|(v, l)| (v, f64::from(l)))
                 .collect()
@@ -1595,9 +1951,16 @@ pub fn run_procedure(
         "pagerank" => {
             let d = num_of("dampingFactor").unwrap_or(DEFAULT_DAMPING);
             let iters = num_of("iterations").map_or(DEFAULT_PAGERANK_ITERATIONS, |n| n as u32);
-            pagerank(store, edge_filter(), str_of("weightProperty"), d, iters)
+            pagerank(
+                store,
+                edge_filter(),
+                str_of("weightProperty"),
+                d,
+                iters,
+                threads,
+            )
         }
-        "closeness" => closeness(store, edge_filter(), str_of("weightProperty")),
+        "closeness" => closeness(store, edge_filter(), str_of("weightProperty"), threads),
         "strongly_connected_components" => strongly_connected_components(store, edge_filter())
             .into_iter()
             .map(|(v, c)| (v, f64::from(c)))
@@ -1608,6 +1971,7 @@ pub fn run_procedure(
             edge_filter(),
             str_of("weightProperty"),
             num_of("pivots").map(|n| n as usize),
+            threads,
         ),
         "shortest_path" => {
             if str_of("algorithm") == Some("astar") {
@@ -1655,11 +2019,11 @@ pub fn run_procedure(
                     }
                 })
                 .unwrap_or_default();
-            personalized_pagerank(store, edge_filter(), &seeds, d, iters)
+            personalized_pagerank(store, edge_filter(), &seeds, d, iters, threads)
         }
         "peer_pressure" => {
             let iters = num_of("iterations").map_or(DEFAULT_PEER_PRESSURE_ITERATIONS, |n| n as u32);
-            peer_pressure(store, edge_filter(), iters)
+            peer_pressure(store, edge_filter(), iters, threads)
                 .into_iter()
                 .map(|(v, c)| (v, f64::from(c)))
                 .collect()
@@ -1670,7 +2034,7 @@ pub fn run_procedure(
     // peer_pressure yield a NODE ID (the component root / cluster representative).
     // Core surfaces it as that node's EXTERNAL id STRING — a stable, user-meaningful
     // id — not the internal dense index. Map the dense id back through the external
-    // id table so both the direct-algo and GQL `CALL` paths agree with core.
+    // id table so both the direct-algo and GQL `CALL` paths agree with the TS engine.
     if matches!(
         name,
         "connected_components"
@@ -1688,7 +2052,7 @@ pub fn run_procedure(
                 .collect(),
         );
     }
-    // `on_cycle` yields a BOOLEAN flag (core surfaces `onCycle` as Bool, not a 0/1
+    // `on_cycle` yields a BOOLEAN flag (the TS engine surfaces `onCycle` as Bool, not a 0/1
     // number); every other scalar procedure yields a number.
     let to_value: fn(f64) -> Value = if name == "on_cycle" {
         |x| Value::Bool(x != 0.0)

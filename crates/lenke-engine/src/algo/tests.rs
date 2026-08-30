@@ -19,20 +19,20 @@ fn degree_out_in_both() {
     let st = triangle_plus_isolated();
     // Each triangle node: 1 out, 1 in, 2 both; the isolated node: 0.
     assert_eq!(
-        degree(&st, Dir::Out, None),
+        degree(&st, Dir::Out, None, 1),
         vec![(0, 1.0), (1, 1.0), (2, 1.0), (3, 0.0)]
     );
     assert_eq!(
-        degree(&st, Dir::In, None),
+        degree(&st, Dir::In, None, 1),
         vec![(0, 1.0), (1, 1.0), (2, 1.0), (3, 0.0)]
     );
     assert_eq!(
-        degree(&st, Dir::Both, None),
+        degree(&st, Dir::Both, None, 1),
         vec![(0, 2.0), (1, 2.0), (2, 2.0), (3, 0.0)]
     );
     // An unknown edge type → all zero.
     assert_eq!(
-        degree(&st, Dir::Out, Some("NOPE")),
+        degree(&st, Dir::Out, Some("NOPE"), 1),
         vec![(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
     );
 }
@@ -44,12 +44,12 @@ fn closeness_reciprocal_of_summed_distances() {
     // distances 1 and 2, so Σ = 3 and closeness = 1/3. The isolated node reaches
     // nothing → sum 0 → closeness 0.
     assert_eq!(
-        closeness(&st, None, None),
+        closeness(&st, None, None, 1),
         vec![(0, 1.0 / 3.0), (1, 1.0 / 3.0), (2, 1.0 / 3.0), (3, 0.0)]
     );
     // A named-but-unknown edge type reaches only each source → every closeness 0.
     assert_eq!(
-        closeness(&st, Some("NOPE"), None),
+        closeness(&st, Some("NOPE"), None, 1),
         vec![(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
     );
 }
@@ -110,7 +110,7 @@ fn betweenness_directed_triangle_and_diamond() {
     // one 2-hop shortest path, so every betweenness is 1.0; the isolated node 0.
     let st = triangle_plus_isolated();
     assert_eq!(
-        betweenness(&st, None, None, None),
+        betweenness(&st, None, None, None, 1),
         vec![(0, 1.0), (1, 1.0), (2, 1.0), (3, 0.0)]
     );
     // Diamond 0→1, 0→2, 1→3, 2→3: from 0 there are TWO shortest paths to 3, so
@@ -126,12 +126,12 @@ fn betweenness_directed_triangle_and_diamond() {
     b.edge(r, d, "R");
     let diamond = b.build();
     assert_eq!(
-        betweenness(&diamond, None, None, None),
+        betweenness(&diamond, None, None, None, 1),
         vec![(0, 0.0), (1, 0.5), (2, 0.5), (3, 0.0)]
     );
     // A named-but-unknown edge type → no paths → every vertex 0.0.
     assert_eq!(
-        betweenness(&st, Some("NOPE"), None, None),
+        betweenness(&st, Some("NOPE"), None, None, 1),
         vec![(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
     );
 }
@@ -147,6 +147,7 @@ fn personalized_pagerank_restarts_at_the_seed() {
             &owned,
             DEFAULT_DAMPING,
             DEFAULT_PAGERANK_ITERATIONS,
+            1,
         )
     };
     // Seeding node 0 concentrates mass at 0, tapering around the directed cycle;
@@ -185,7 +186,7 @@ fn neighbor_aggregate_gcn_normalization() {
     // deg[0]=2 (two contributors), deg[1]=deg[2]=1 (no out-neighbours, floored to
     // 1). Each contributor's GCN factor is 1/sqrt(deg_0·deg_nbr) = 1/sqrt(2), so
     // the GCN sum at 0 is 2/sqrt(2) + 4/sqrt(2) — folded in that order (the exact
-    // f64 lenke-core produces, NOT a re-derived 3·sqrt(2), which rounds one ULP
+    // f64 the TS engine produces, NOT a re-derived 3·sqrt(2), which rounds one ULP
     // off in the last place).
     let mut b = Builder::default();
     let f = |x: f64| Value::List(vec![Value::Num(x)]);
@@ -339,12 +340,12 @@ fn peer_pressure_adopts_max_energy_cluster() {
     b.edge(z, a, "R");
     let sink = b.build();
     assert_eq!(
-        peer_pressure(&sink, None, DEFAULT_PEER_PRESSURE_ITERATIONS),
+        peer_pressure(&sink, None, DEFAULT_PEER_PRESSURE_ITERATIONS, 1),
         vec![(0, 1), (1, 1), (2, 2), (3, 3)]
     );
     // A named-but-unknown edge type → every vertex its own cluster.
     assert_eq!(
-        peer_pressure(&sink, Some("NOPE"), DEFAULT_PEER_PRESSURE_ITERATIONS),
+        peer_pressure(&sink, Some("NOPE"), DEFAULT_PEER_PRESSURE_ITERATIONS, 1),
         vec![(0, 0), (1, 1), (2, 2), (3, 3)]
     );
 }
@@ -367,11 +368,11 @@ fn closeness_weighted_uses_dijkstra_distances() {
     st.set_edge_prop(e2, "w", Value::Num(1.0));
 
     assert_eq!(
-        closeness(&st, None, Some("w")),
+        closeness(&st, None, Some("w"), 1),
         vec![(0, 1.0 / 3.0), (1, 0.0), (2, 1.0)]
     );
     assert_eq!(
-        closeness(&st, None, None),
+        closeness(&st, None, None, 1),
         vec![(0, 1.0 / 2.0), (1, 0.0), (2, 1.0)]
     );
 }
@@ -396,11 +397,11 @@ fn betweenness_weighted_reroutes_dependency() {
     st.set_edge_prop(e3, "w", Value::Num(5.0));
 
     assert_eq!(
-        betweenness(&st, None, Some("w"), None),
+        betweenness(&st, None, Some("w"), None, 1),
         vec![(0, 0.0), (1, 1.0), (2, 0.0), (3, 0.0)]
     );
     assert_eq!(
-        betweenness(&st, None, None, None),
+        betweenness(&st, None, None, None, 1),
         vec![(0, 0.0), (1, 0.5), (2, 0.5), (3, 0.0)]
     );
 }
@@ -476,7 +477,7 @@ fn shortest_path_weighted_dijkstra() {
         shortest_path(&st, Some("0"), Dir::Out, None, None, None),
         vec![(0, 0.0), (1, 1.0), (2, 1.0)]
     );
-    // A negative weight makes Dijkstra unsound → the empty result (core errs).
+    // A negative weight makes Dijkstra unsound → the empty result (the TS engine errs).
     let mut b2 = Builder::default();
     b2.node(&["N"], &[]);
     b2.node(&["N"], &[]);
@@ -556,12 +557,12 @@ fn label_propagation_converges_a_triangle() {
     // The undirected triangle collapses to one label (its smallest member id,
     // 0); the isolated node keeps its own label (3).
     assert_eq!(
-        label_propagation(&st, None, DEFAULT_LABEL_ITERATIONS, None),
+        label_propagation(&st, None, DEFAULT_LABEL_ITERATIONS, None, 1),
         vec![(0, 0), (1, 0), (2, 0), (3, 3)]
     );
     // No edges (unknown type) → every node keeps its own label.
     assert_eq!(
-        label_propagation(&st, Some("NOPE"), DEFAULT_LABEL_ITERATIONS, None),
+        label_propagation(&st, Some("NOPE"), DEFAULT_LABEL_ITERATIONS, None, 1),
         vec![(0, 0), (1, 1), (2, 2), (3, 3)]
     );
 }
@@ -581,6 +582,7 @@ fn pagerank_two_cycle_is_uniform_and_sums_to_one() {
         None,
         DEFAULT_DAMPING,
         DEFAULT_PAGERANK_ITERATIONS,
+        1,
     );
     assert!((pr[0].1 - 0.5).abs() < 1e-12);
     assert!((pr[1].1 - 0.5).abs() < 1e-12);
@@ -606,6 +608,7 @@ fn pagerank_ranks_higher_in_degree_and_is_reproducible() {
         None,
         DEFAULT_DAMPING,
         DEFAULT_PAGERANK_ITERATIONS,
+        1,
     );
     assert!(pr[2].1 > pr[1].1, "hub should outrank {pr:?}");
     assert!(
@@ -622,7 +625,133 @@ fn pagerank_ranks_higher_in_degree_and_is_reproducible() {
             None,
             None,
             DEFAULT_DAMPING,
-            DEFAULT_PAGERANK_ITERATIONS
+            DEFAULT_PAGERANK_ITERATIONS,
+            1
         )
     );
+}
+
+/// Two `(u32, f64)` result vectors are BIT-for-bit identical (not just `==`, which
+/// would treat `-0.0`/`0.0` alike and mishandle NaN) — the byte-identity bar.
+fn feq(a: &[(u32, f64)], b: &[(u32, f64)]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.0 == y.0 && x.1.to_bits() == y.1.to_bits())
+}
+
+/// A deterministic, RNG-free, moderately-dense directed graph (ring + fixed chords)
+/// with enough structure that every algorithm produces varied per-node values —
+/// the fixture for the parallel-vs-serial byte-identity check.
+fn parallel_fixture() -> Store {
+    let mut b = Builder::default();
+    let n = 60usize;
+    let ids: Vec<u32> = (0..n).map(|_| b.node(&["N"], &[])).collect();
+    for i in 0..n {
+        b.edge(ids[i], ids[(i + 1) % n], "R"); // ring
+        b.edge(ids[i], ids[(i * 7 + 3) % n], "R"); // chords
+        if i % 3 == 0 {
+            b.edge(ids[i], ids[(i * 13 + 5) % n], "R");
+        }
+    }
+    b.build()
+}
+
+/// The load-bearing invariant for this feature: every parallelized algorithm returns
+/// a BIT-identical result at 8 threads and at 1 (serial). If a parallel reduction ever
+/// reassociates a sum, this fails. (On a build without the `parallel` feature both
+/// sides run serial, so it still holds trivially.)
+#[test]
+fn algorithms_are_byte_identical_across_thread_counts() {
+    let g = parallel_fixture();
+
+    assert!(
+        feq(
+            &degree(&g, Dir::Both, None, 1),
+            &degree(&g, Dir::Both, None, 8)
+        ),
+        "degree diverged across thread counts"
+    );
+    assert!(
+        feq(&closeness(&g, None, None, 1), &closeness(&g, None, None, 8)),
+        "closeness diverged across thread counts"
+    );
+    assert!(
+        feq(
+            &pagerank(
+                &g,
+                None,
+                None,
+                DEFAULT_DAMPING,
+                DEFAULT_PAGERANK_ITERATIONS,
+                1
+            ),
+            &pagerank(
+                &g,
+                None,
+                None,
+                DEFAULT_DAMPING,
+                DEFAULT_PAGERANK_ITERATIONS,
+                8
+            )
+        ),
+        "pagerank diverged across thread counts"
+    );
+    let seeds = vec!["0".to_string(), "5".to_string(), "17".to_string()];
+    assert!(
+        feq(
+            &personalized_pagerank(
+                &g,
+                None,
+                &seeds,
+                DEFAULT_DAMPING,
+                DEFAULT_PAGERANK_ITERATIONS,
+                1
+            ),
+            &personalized_pagerank(
+                &g,
+                None,
+                &seeds,
+                DEFAULT_DAMPING,
+                DEFAULT_PAGERANK_ITERATIONS,
+                8
+            )
+        ),
+        "personalized_pagerank diverged across thread counts"
+    );
+    assert!(
+        feq(
+            &betweenness(&g, None, None, None, 1),
+            &betweenness(&g, None, None, None, 8)
+        ),
+        "betweenness (exact) diverged across thread counts"
+    );
+    assert!(
+        feq(
+            &betweenness(&g, None, None, Some(10), 1),
+            &betweenness(&g, None, None, Some(10), 8)
+        ),
+        "betweenness (pivots) diverged across thread counts"
+    );
+    // Integer-labelled algorithms: exact equality across thread counts.
+    assert_eq!(
+        label_propagation(&g, None, DEFAULT_LABEL_ITERATIONS, None, 1),
+        label_propagation(&g, None, DEFAULT_LABEL_ITERATIONS, None, 8),
+        "label_propagation diverged across thread counts"
+    );
+    assert_eq!(
+        peer_pressure(&g, None, DEFAULT_PEER_PRESSURE_ITERATIONS, 1),
+        peer_pressure(&g, None, DEFAULT_PEER_PRESSURE_ITERATIONS, 8),
+        "peer_pressure diverged across thread counts"
+    );
+}
+
+/// The `parallelism` graph config flows through the keyed setter into
+/// `effective_parallelism` (default serial).
+#[test]
+fn parallelism_config_sets_effective_thread_count() {
+    let mut g = triangle_plus_isolated();
+    assert_eq!(g.effective_parallelism(), 1); // unset ⇒ serial
+    g.set_limit(crate::store::ConfigId::Parallelism, 4);
+    assert_eq!(g.effective_parallelism(), 4);
 }

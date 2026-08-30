@@ -51,6 +51,10 @@ pub mod ir;
 pub mod json;
 pub mod ndjson;
 pub mod opt;
+// The dedicated bounded thread pool shared by the parallelized algorithms and codecs
+// (feature `parallel`, native-only). `pub(crate)` items, reachable crate-wide.
+#[cfg(feature = "parallel")]
+mod parallel;
 pub mod prepared;
 pub mod schema_op;
 pub mod store;

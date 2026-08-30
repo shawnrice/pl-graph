@@ -16,7 +16,7 @@ use crate::store::{Column, Store};
 use crate::value::{self, Value};
 
 /// Mulberry32 PRNG — the fully-specified generator `sample()` uses with a FIXED seed,
-/// byte-identical to lenke-core (and the TS engine): same seed + same draw order ⇒ the
+/// byte-identical to the TS engine: same seed + same draw order ⇒ the
 /// same seeded shuffle on every engine.
 struct Mulberry32 {
     s: u32,
@@ -75,7 +75,7 @@ use fnv::{Map as FnvMap, Set as FnvSet};
 /// so compare results through `value::equals`/`cmp_total`, not `==`.
 /// Result cells in a FLAT row-major buffer (`data[i*ncols + j]`) — one allocation
 /// for the whole result instead of a `Vec` per row. The nested `Vec<Vec<Value>>`
-/// layout measured ~4x slower to build (a malloc per row), and this matches core's
+/// layout measured ~4x slower to build (a malloc per row), and this matches the TS engine's
 /// `RowSet`. It still indexes and iterates like the old nested layout —
 /// `flat[i]` / `flat[i][j]` yield a row slice / cell, `flat.len()` the row count,
 /// `flat.iter()` (and `&flat`) yield `&[Value]` rows — so read sites are unchanged;
@@ -438,7 +438,7 @@ fn stmt_rollback(store: &mut Store, scope: StmtScope) {
 /// standalone (`Implicit` scope, its own auto-commit transaction). Inside an explicit
 /// transaction (`Nested`) the checks are DEFERRED to that transaction's COMMIT
 /// ([`commit_with_deferred_checks`]), so a later statement can complete a state that is
-/// temporarily invalid mid-transaction — the SQL DEFERRABLE-constraint model core uses.
+/// temporarily invalid mid-transaction — the SQL DEFERRABLE-constraint model the TS engine uses.
 /// Immediate faults (a string-`id` collision, a syntax error) are NOT deferred; they
 /// still roll the one statement back at the write site.
 fn check_deferred_if_standalone(store: &Store, scope: StmtScope) -> Result<(), String> {
@@ -468,7 +468,7 @@ pub(crate) fn commit_with_deferred_checks(store: &mut Store) -> Result<(), Strin
 
 /// Execute an ISO GQL transaction-control command against the store's transaction
 /// frame, returning an empty result (no rows/columns), like a write-only query. ISO
-/// semantics are enforced HERE (matching core's `run_tx_control`), every violation
+/// semantics are enforced HERE (matching the TS engine's `run_tx_control`), every violation
 /// carrying the `E_INVALID_GRAPH_OP` wire code: `START TRANSACTION` while one is
 /// active → error (no nesting); `COMMIT` / `ROLLBACK` with no active transaction →
 /// error. The transaction persists across `lnk_query` calls (the store IS the
@@ -513,7 +513,7 @@ pub(crate) fn run_tx_control(
 }
 
 /// Reject a write statement issued inside a `READ ONLY` transaction, before it
-/// applies. Called by the FFI write path (a read is always allowed). Matches core's
+/// applies. Called by the FFI write path (a read is always allowed). Matches the TS engine's
 /// `enforce_read_only`.
 pub(crate) fn enforce_read_only(store: &Store) -> Result<(), String> {
     if store.tx_read_only() {
@@ -540,7 +540,7 @@ pub enum Executed {
 /// place — so every embedder (the C ABI, a future in-process host) gets identical
 /// semantics — it dispatches ISO transaction control (`START TRANSACTION`/`COMMIT`/
 /// `ROLLBACK`), enforces `READ ONLY`, and splits writes from reads. This mirrors
-/// core, whose eval layer (not its ABI) owns transaction dispatch; previously the
+/// the TS engine, whose eval layer (not its ABI) owns transaction dispatch; previously the
 /// engine duplicated this decision at each FFI language arm.
 ///
 /// A `TxControl` command yields no rows and is neither optimized nor planned. Every
@@ -559,12 +559,12 @@ pub fn run_query(plan: Plan, store: &mut Store) -> Result<Executed, String> {
     }
 }
 
-/// The `FAULT_ID_DUP` message, matching core: a string `id` is an element's unique
+/// The `FAULT_ID_DUP` message, matching the TS engine: a string `id` is an element's unique
 /// external identity. The `E_UNIQUE:` prefix maps to `E_CONSTRAINT_VIOLATION`.
 const ID_DUP_ERR: &str = "E_UNIQUE: an element with this id already exists — a string `id` \
      property is the element's unique identity; use _MERGE to upsert, or a fresh id";
 
-/// The `FAULT_ID_IMMUTABLE` message, matching core: a string `id` is an element's
+/// The `FAULT_ID_IMMUTABLE` message, matching the TS engine: a string `id` is an element's
 /// fixed identity, so `SET x.id = …` is rejected (`E_INVALID_GRAPH_OP`).
 const ID_IMMUTABLE_ERR: &str = "E_INVALID_GRAPH_OP: cannot SET `id`: a string `id` is the \
      element's identity and is fixed at creation — insert a new element with the new id instead";
@@ -814,8 +814,8 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         }
         Plan::Sample { input, n } => {
             // A fixed-seed Mulberry32 partial Fisher-Yates shuffle over the whole row
-            // stream, truncated to n — byte-identical to core's sampleStep (same seed,
-            // same draw order). The engine's frontier order matches core's here, so the
+            // stream, truncated to n — byte-identical to the TS engine's sampleStep (same seed,
+            // same draw order). The engine's frontier order matches the TS engine's here, so the
             // selected subset agrees.
             let b = pull(input, store, track)?;
             let len = b.rows();
@@ -1114,7 +1114,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         ),
         Plan::GroupToMap { input } => {
             // Fold the grouped `[key, value]` rows into one Gremlin Map, first-seen
-            // key order (the harness compares map content order-independently; core
+            // key order (the harness compares map content order-independently; the TS engine
             // is also first-seen). A single-column value the group produced (count,
             // list) is the map value; a missing second column reads as NULL.
             let b = pull(input, store, track)?;
@@ -1261,29 +1261,39 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             let mut b = pull(input, store, track)?;
             let el = edge_label.as_deref();
             // Compute the per-node result once over the whole store (byte-identical to
-            // core — same summation/root rules in `algo`). Component/cluster ids are
-            // the ROOT vertex's external-id STRING (core writes the same), pageRank a
+            // the TS engine — same summation/root rules in `algo`). Component/cluster ids are
+            // the ROOT vertex's external-id STRING (the TS engine writes the same), pageRank a
             // numeric score.
             let scores: std::collections::HashMap<u32, Value> = match algo {
                 GremlinAlgo::PageRank {
                     damping,
                     iterations,
-                } => crate::algo::pagerank(store, el, None, *damping, *iterations)
-                    .into_iter()
-                    .map(|(v, s)| (v, Value::Num(s)))
-                    .collect(),
+                } => crate::algo::pagerank(
+                    store,
+                    el,
+                    None,
+                    *damping,
+                    *iterations,
+                    store.effective_parallelism(),
+                )
+                .into_iter()
+                .map(|(v, s)| (v, Value::Num(s)))
+                .collect(),
                 GremlinAlgo::ConnectedComponent => {
                     crate::algo::weakly_connected_components(store, el)
                         .into_iter()
                         .map(|(v, root)| (v, root_ext_id(store, root)))
                         .collect()
                 }
-                GremlinAlgo::PeerPressure { iterations } => {
-                    crate::algo::peer_pressure(store, el, *iterations)
-                        .into_iter()
-                        .map(|(v, root)| (v, root_ext_id(store, root)))
-                        .collect()
-                }
+                GremlinAlgo::PeerPressure { iterations } => crate::algo::peer_pressure(
+                    store,
+                    el,
+                    *iterations,
+                    store.effective_parallelism(),
+                )
+                .into_iter()
+                .map(|(v, root)| (v, root_ext_id(store, root)))
+                .collect(),
             };
             let n = b.rows();
             let col: Vec<Value> = (0..n)
@@ -1601,7 +1611,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         Plan::Project { input, items } => {
             // Fused numeric-filtered projection streams the surviving frontier instead of
             // materializing the whole `[src, nbr]` expand batch (a fixed cost that loses to
-            // core's streaming when the filter is mid-selective). Falls through otherwise.
+            // the TS engine's streaming when the filter is mid-selective). Falls through otherwise.
             if let Some(b) = try_fused_hop_project(input, items, store, track) {
                 return Ok(b);
             }
@@ -1997,7 +2007,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         }
         Plan::CallProcedure { name, config } => {
             // A bad config (unknown key / wrong-type value) is a data exception — not
-            // silently ignored — matching core.
+            // silently ignored — matching the TS engine.
             crate::algo::validate_config(config)?;
             // Run the named graph algorithm over the whole store into a two-slot
             // batch: node ids, then the per-node result. The parser validates the
@@ -2906,7 +2916,7 @@ fn range_seek_ids(store: &Store, label: &str, key: &str, op: CompareOp, value: &
 /// returns `Ok(vec![])` (an empty `want` slice reads as "any"). A typed list whose
 /// names ALL fail to resolve matches no edge, so it returns `Err(())` and the caller
 /// short-circuits to its own empty result. Otherwise the known ids, unknown names
-/// dropped — mirroring core's `lower_labels`.
+/// dropped — mirroring the TS engine's `lower_labels`.
 /// Does node `v` have ANY neighbour over `dir`/`want` (empty `want` = any type)? A
 /// short-circuiting existence check for `where(out/in/both)` — scans adjacency until
 /// the first match, never materializing the neighbours. Self-loop doubling is moot for
@@ -3067,7 +3077,7 @@ fn node_has_nbr(store: &Store, v: u32, dir: Dir, want: &[u32]) -> bool {
         // edge_type_matches instead of edge_has_label, so a primary-type MISS does not
         // pay a redundant random read of edge_etype[eid] to re-learn `et != w` — only
         // the (rare) secondary-set probe. Guard the probe on has_extra so a single-label
-        // graph never touches it. See edge_type_matches / core's 4.3x note.
+        // graph never touches it. See edge_type_matches / the TS engine's 4.3x note.
         want.is_empty()
             || want
                 .iter()
@@ -3217,7 +3227,7 @@ fn for_each_nbr(
         // edge_type_matches instead of edge_has_label, so a primary-type MISS does not
         // pay a redundant random read of edge_etype[eid] to re-learn `et != w` — only
         // the (rare) secondary-set probe. Guard the probe on has_extra so a single-label
-        // graph never touches it. See edge_type_matches / core's 4.3x note.
+        // graph never touches it. See edge_type_matches / the TS engine's 4.3x note.
         want.is_empty()
             || want
                 .iter()
@@ -3359,7 +3369,7 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
                 Err(()) => return Some(Vec::new()), // unknown label matches nothing
             };
             // Gremlin `both()` walks a self-loop TWICE (`double_loops`), so the endpoint
-            // multiset matches core.
+            // multiset matches the TS engine.
             let dl = *double_loops;
             let mut out = Vec::new();
             for &v in &src {
@@ -3424,7 +3434,7 @@ fn count_hops(plan: &Plan) -> usize {
 /// covers a large fraction of the graph. A 5-hop count from a SINGLE source touches
 /// at most fan-out^hops distinct nodes — kept sparse, it costs O(active) per hop
 /// instead of the O(node_count) alloc + full scan a dense array pays every hop
-/// (that made `aml/chain5` 30x SLOWER than core: an 8 MB zeroed array and a 1M-entry
+/// (that made `aml/chain5` 30x SLOWER than the TS engine: an 8 MB zeroed array and a 1M-entry
 /// scan, five times, for a frontier of a few hundred nodes). Counts are exact
 /// integers (< 2^53), so the f64 sums are order-independent and the representation
 /// switch is byte-identical.
@@ -3521,7 +3531,7 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Counts> {
                 Err(()) => return Some(Counts::Sparse(Vec::new())), // unknown label → no paths
             };
             // Gremlin `both()` walks a self-loop TWICE — `for_each_nbr` doubles it under
-            // `double_loops`, so the multiplicity (hence the count) matches core.
+            // `double_loops`, so the multiplicity (hence the count) matches the TS engine.
             let dl = *double_loops;
             // Estimate the next frontier's fan-out from the source count and the
             // average degree; go dense when it will be large, sparse otherwise. The
@@ -3645,9 +3655,9 @@ fn try_filtered_count(
     };
     // STREAM a numeric predicate over the label bucket — count matches with raw-f64
     // compares, never materializing the scan's id vector or a keep list. This is
-    // core's structure (it iterates the bucket and tests inline) but with the
-    // engine's typed compare instead of core's boxed CExpr tree-walk: measured 3.67x
-    // core (and ~5x the engine's own materialize-then-filter) on a 200k range count.
+    // the TS engine's structure (it iterates the bucket and tests inline) but with the
+    // engine's typed compare instead of the TS engine's boxed CExpr tree-walk: measured 3.67x
+    // the TS engine (and ~5x the engine's own materialize-then-filter) on a 200k range count.
     if let Some(c) = try_stream_num_count(store, label, pred) {
         return Some(scalar_num(c as f64));
     }
@@ -4460,8 +4470,8 @@ fn try_num_conjunction(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<
     // below. At 1M this turns range filter+project from 0.68x to 1.10x.
     //
     // The 200k cache-resident `scan/range-and` PROJECTION sits at ~0.85x, and that is
-    // projection-bound, not filter-bound: the FILTER, streamed, is 3.67x core (see
-    // `try_stream_num_count` — the win was skipping the scan-id materialization, core's
+    // projection-bound, not filter-bound: the FILTER, streamed, is 3.67x the TS engine (see
+    // `try_stream_num_count` — the win was skipping the scan-id materialization, the TS engine's
     // trick), but this shape returns 20k names and the ~0.66ms of string projection
     // dominates the ~0.12ms filter, so both engines pay it and the ratio parks near a
     // tie. REJECTED, all measured NEUTRAL at 200k:
@@ -5147,7 +5157,7 @@ fn compare(op: CompareOp, l: &Col, r: &Col) -> Col {
 
 /// Read a column as three-valued booleans (None = UNKNOWN).
 /// Coerce a non-boolean predicate column to Kleene truth for WHERE/FILTER, matching
-/// core's `as_truth`: a NUMBER is true when non-zero and non-NaN; a STRING when
+/// the TS engine's `as_truth`: a NUMBER is true when non-zero and non-NaN; a STRING when
 /// non-empty; NULL is unknown (`None`); any other non-null value (temporal, list,
 /// record, element) is true. (A bare `WHERE <number>` / `WHERE <string>` is thus a
 /// truthiness test, not a no-match — the engine used to drop every non-bool row.)

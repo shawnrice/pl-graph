@@ -64,6 +64,14 @@ export type AlgorithmConfig = {
    * Composes with `weightProperty`; `sum`/`mean` only.
    */
   norm?: 'none' | 'gcn';
+  /**
+   * Max worker threads for THIS call, overriding the graph-level `parallelism`
+   * default. `1` = serial. On the native engine a value > 1 runs the float-heavy
+   * algorithms (betweenness / closeness / PageRank / label-propagation /
+   * peer-pressure) on a dedicated, bounded pool — byte-identical to serial at any
+   * thread count. Ignored by the pure-TS engine and the wasm build (no threads).
+   */
+  threads?: number;
 };
 
 /**

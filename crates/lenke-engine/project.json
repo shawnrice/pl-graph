@@ -18,7 +18,7 @@
     "build-wasm": {
       "executor": "nx:run-commands",
       "options": {
-        "command": "cargo build --release --target wasm32-unknown-unknown --features capi",
+        "command": "cargo build --release --target wasm32-unknown-unknown --no-default-features --features capi,codecs",
         "cwd": "crates/lenke-engine"
       },
       "inputs": ["rustEngine"],

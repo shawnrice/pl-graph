@@ -26,9 +26,9 @@
   "scripts": {
     "build": "bun build.ts",
     "build:rust": "cargo build --release --features capi --manifest-path ../../crates/lenke-engine/Cargo.toml",
-    "build:wasm": "cargo build --release --target wasm32-unknown-unknown --features capi --manifest-path ../../crates/lenke-engine/Cargo.toml",
+    "build:wasm": "cargo build --release --target wasm32-unknown-unknown --no-default-features --features capi,codecs --manifest-path ../../crates/lenke-engine/Cargo.toml",
     "engine:build:rust": "cargo build --release --features capi --manifest-path ../../crates/lenke-engine/Cargo.toml",
-    "engine:build:wasm": "cargo build --release --target wasm32-unknown-unknown --features capi --manifest-path ../../crates/lenke-engine/Cargo.toml",
+    "engine:build:wasm": "cargo build --release --target wasm32-unknown-unknown --no-default-features --features capi,codecs --manifest-path ../../crates/lenke-engine/Cargo.toml",
     "test": "bun test",
     "test:engine": "LENKE_ENGINE=1 bun test",
     "bench": "bun bench.ts",

@@ -16,10 +16,20 @@ all = { level = "warn", priority = -1 }
 crate-type = ["lib", "cdylib"]
 
 [features]
-# `default = codecs`: the shipped build ships the extra textual codecs; a minimal
-# build drops them with `--no-default-features` (NDJSON + binary stay — they are
-# native, not in the optional crate — so load/query/snapshot still work).
-default = ["codecs"]
+# `default = codecs + parallel`: the shipped native build ships the extra textual
+# codecs AND opt-in multicore for the graph algorithms. A minimal build drops the
+# codecs with `--no-default-features` (NDJSON + binary stay — they are native, not in
+# the optional crate — so load/query/snapshot still work). The wasm build drops
+# `parallel` (`--no-default-features --features capi,codecs`): wasm32 has no threads.
+default = ["codecs", "parallel"]
+
+# `parallel`: opt-in multicore for the graph algorithms, via a DEDICATED, bounded
+# `rayon::ThreadPool` (never the global pool — that would starve the embedding host's
+# event loop / libuv threadpool). Pulls in `rayon`. OFF for wasm. When off, every
+# algorithm runs its existing serial path unchanged. Parallelism is still opt-IN at
+# runtime (a graph/call must set a thread count > 1); this feature only makes it
+# *available* on a build with threads. See `src/algo/parallel.rs`.
+parallel = ["dep:rayon"]
 
 # `capi`: expose the C ABI (`src/ffi.rs` — the `lnk_*` exports). OFF by default so the
 # plain lib/test build does not export the engine's `#[no_mangle]` FFI symbols
@@ -53,6 +63,13 @@ regex = { version = "1", default-features = false, features = [
   "unicode-perl",
   "unicode-case",
 ] }
+
+# Optional data-parallelism for the graph algorithms (gated on the `parallel`
+# feature; absent from the wasm build). Only used to build a bounded, dedicated
+# `ThreadPool`; the algorithms never touch rayon's global pool. Byte-identity across
+# thread counts is preserved by construction (per-source/per-node private
+# accumulators folded in a fixed order — see `src/algo/parallel.rs`).
+rayon = { version = "1", optional = true }
 
 [dev-dependencies]
 # Test-only: the ported Gremlin suite (tests/gremlin_ported.rs) and the GQL

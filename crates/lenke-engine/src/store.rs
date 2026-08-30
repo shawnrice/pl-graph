@@ -153,7 +153,7 @@ pub enum Column {
     },
     /// A homogeneous temporal column: every present value is the SAME kind
     /// (`kind`). A temporal of a DIFFERENT kind — or a non-temporal — written to it
-    /// promotes it to `Gen`, matching lenke-core's one-kind-per-column model.
+    /// promotes it to `Gen`, matching the TS engine's one-kind-per-column model.
     Temporal {
         kind: crate::temporal::TemporalKind,
         data: Vec<crate::temporal::Temporal>,
@@ -713,7 +713,7 @@ pub struct Adj {
 }
 
 /// A scalar / list / open-record property type for a TYPE constraint. The names
-/// mirror the scalar set lenke-core's `PropType` accepts (its closed-record
+/// mirror the scalar set the TS engine's `PropType` accepts (its closed-record
 /// `record { … }` specs are a later addition here). `AnyRecord` is `any record`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PropType {
@@ -765,7 +765,7 @@ impl PropType {
 
 /// A declared property TYPE: a scalar, a closed `record { field :: type, … }` (an
 /// exact field set, each field itself a `TypeSpec`, so records nest), or the open
-/// `any record`. Mirrors lenke-core's `TypeSpec`.
+/// `any record`. Mirrors the TS engine's `TypeSpec`.
 #[derive(Clone, PartialEq, Eq)]
 pub enum TypeSpec {
     Scalar(PropType),
@@ -816,7 +816,7 @@ impl TypeSpec {
 }
 
 /// A tiny recursive-descent parser for a constraint type expression (ported from
-/// lenke-core's `TypeParser`).
+/// the now-removed lenke-core's `TypeParser`).
 struct TypeParser<'a> {
     s: &'a [u8],
     i: usize,
@@ -911,7 +911,7 @@ impl TypeParser<'_> {
 }
 
 /// The scalar [`PropType`] a value satisfies, or `None` for a value EXEMPT from a
-/// scalar constraint (`Null` and a record/map). Mirrors core's `value_type`.
+/// scalar constraint (`Null` and a record/map). Mirrors the TS engine's `value_type`.
 fn value_prop_type(v: &Value) -> Option<PropType> {
     Some(match v {
         Value::Node(_) | Value::Edge(_) => {
@@ -936,7 +936,7 @@ fn value_prop_type(v: &Value) -> Option<PropType> {
 /// Whether `v` satisfies `spec`. A top-level `Null` always passes here (the
 /// property's own nullability is the separate `not_null` check, applied by the
 /// caller); a record/map is exempt from a scalar type. A closed record is checked
-/// closed-on-extras with each field optional unless `NOT NULL`. Mirrors core's
+/// closed-on-extras with each field optional unless `NOT NULL`. Mirrors the TS engine's
 /// `value_matches`.
 fn value_matches(v: &Value, spec: &TypeSpec) -> bool {
     if matches!(v, Value::Null) {
@@ -975,7 +975,7 @@ fn value_matches(v: &Value, spec: &TypeSpec) -> bool {
 }
 
 /// Parse a type-constraint spec (scalar / `record{…}` / `any record`), optionally
-/// suffixed ` NOT NULL`. `Err` (`E_INVALID_VALUE`) on malformed input, matching core.
+/// suffixed ` NOT NULL`. `Err` (`E_INVALID_VALUE`) on malformed input, matching the TS engine.
 fn parse_type_spec(spec: &str) -> Result<(TypeSpec, bool), String> {
     TypeSpec::parse_with_not_null(spec).ok_or_else(|| {
         "E_INVALID_VALUE: unknown or malformed type name for a type constraint".to_string()
@@ -983,7 +983,7 @@ fn parse_type_spec(spec: &str) -> Result<(TypeSpec, bool), String> {
 }
 
 /// Whether a value participates in a unique/index set (a scalar). A null, list, or
-/// record is exempt (mirrors core's index-backed edge uniqueness).
+/// record is exempt (mirrors the TS engine's index-backed edge uniqueness).
 fn is_indexable(v: &Value) -> bool {
     matches!(
         v,
@@ -1042,7 +1042,7 @@ struct InvariantRule {
 /// looked up by name; a label bucket (`by_label`) is the seed for a scan.
 /// Resource ceilings — ANTI-RUNAWAY bounds, not semantics. A query under the ceiling
 /// behaves identically whatever the ceiling is; tripping one is a loud
-/// `E_RESOURCE_EXHAUSTED`, never a truncated result. Mirrors `lenke-core`'s `GraphLimits`
+/// `E_RESOURCE_EXHAUSTED`, never a truncated result. Mirrors the TS engine's `GraphLimits`
 /// (same fields, same defaults) so the columnar engine enforces the SAME guards at the
 /// SAME thresholds as the shipped row engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1050,7 +1050,7 @@ pub struct GraphLimits {
     /// Ceiling on `range(start, end [, step])` element count.
     pub range: u64,
     /// Cap on total variable-length / `repeat` traversal rows a single expansion may
-    /// emit — the guard against exponential blowup on a dense graph (core's `trail`).
+    /// emit — the guard against exponential blowup on a dense graph (the TS engine's `trail`).
     pub trail: u64,
     /// Ceiling on the intermediate frontier a fixed-length multi-segment scan may
     /// materialize before the trailing hop/LIMIT prunes it.
@@ -1079,7 +1079,7 @@ impl Default for GraphLimits {
 }
 
 /// Stable wire ids for [`GraphLimits`] knobs — the FFI limit setter is ONE export keyed
-/// by id (append-only), matching core's `ConfigId` so the same host code drives both
+/// by id (append-only), matching the TS engine's `ConfigId` so the same host code drives both
 /// engines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -1089,6 +1089,10 @@ pub enum ConfigId {
     LimitsIntermediate = 2,
     LimitsOperatorChain = 3,
     LimitsDictMaxDistinct = 4,
+    /// Max worker threads the graph algorithms may use (opt-in multicore; 1 = serial,
+    /// the default). NOT a resource ceiling — a compute knob — but rides the same
+    /// id-keyed setter so it needs no new FFI export. See [`Store::effective_parallelism`].
+    Parallelism = 5,
 }
 
 impl ConfigId {
@@ -1100,6 +1104,7 @@ impl ConfigId {
             2 => Some(Self::LimitsIntermediate),
             3 => Some(Self::LimitsOperatorChain),
             4 => Some(Self::LimitsDictMaxDistinct),
+            5 => Some(Self::Parallelism),
             _ => None,
         }
     }
@@ -1112,6 +1117,11 @@ pub struct Store {
     node_count: usize,
     /// Resource ceilings (default [`GraphLimits::default`]); set via [`Store::set_limit`].
     limits: GraphLimits,
+    /// Opt-in multicore for the graph algorithms: the max worker threads they may use.
+    /// `0`/`1` = serial (the default; `Store::default` gives 0, read as 1 via
+    /// [`Store::effective_parallelism`]). Set via [`Store::set_limit`]/[`ConfigId::Parallelism`].
+    /// A compute knob, not a ceiling; ignored on builds without the `parallel` feature (wasm).
+    parallelism: u32,
     /// label name -> the sorted node ids carrying it (the scan seed).
     by_label: FnvMap<String, Vec<u32>>,
     /// property name -> its typed column (length == node_count).
@@ -1147,14 +1157,14 @@ pub struct Store {
     /// `bool` read instead of a SipHash-of-`u32` + bucket chase. Parallel to
     /// `edge_etype` (grows with it, never shrinks). Empty ⇒ treated as all-false.
     edge_has_extra: Vec<bool>,
-    /// SECONDARY edge labels (eid -> the labels past the first), mirroring core's
+    /// SECONDARY edge labels (eid -> the labels past the first), mirroring the TS engine's
     /// `e_extra`. An edge's *type* is its first label (`edge_etype`); a multi-label
     /// edge — `-[:X:Y]->` / an ndjson `"labels":["X","Y"]` — carries the rest here.
     /// SPARSE: empty unless some edge has >1 label, so a single-label graph pays
     /// nothing and `edge_has_label` stays the single `u32` compare it replaced.
     edge_extra: U32Map<Vec<u32>>,
     /// `(src, dst)` node ids per eid (indexed by eid; grows 1:1 with `next_eid` and
-    /// never shrinks, like `edge_etype`). Lets an edge be rendered as core's
+    /// never shrinks, like `edge_etype`). Lets an edge be rendered as the TS engine's
     /// `{id, from, to, labels, properties}` map from its eid alone, without scanning
     /// adjacency for its endpoints.
     edge_ends: Vec<(u32, u32)>,
@@ -1313,6 +1323,7 @@ impl Clone for Store {
         Self {
             node_count: self.node_count,
             limits: self.limits,
+            parallelism: self.parallelism,
             by_label: self.by_label.clone(),
             props: self.props.clone(),
             prop_keys_cache: std::sync::RwLock::new(
@@ -1511,7 +1522,7 @@ impl Store {
     }
 
     /// Override one resource ceiling, keyed by its stable [`ConfigId`] — the single entry
-    /// point a host (or the FFI) uses to configure limits, matching core's keyed setter.
+    /// point a host (or the FFI) uses to configure limits, matching the TS engine's keyed setter.
     pub fn set_limit(&mut self, id: ConfigId, value: u64) {
         match id {
             ConfigId::LimitsRange => self.limits.range = value,
@@ -1519,7 +1530,19 @@ impl Store {
             ConfigId::LimitsIntermediate => self.limits.intermediate = value,
             ConfigId::LimitsOperatorChain => self.limits.operator_chain = value,
             ConfigId::LimitsDictMaxDistinct => self.limits.dict_max_distinct = value,
+            // Not a limit — a compute knob — but rides the same keyed setter. Saturate
+            // to u32; 0 is unreachable here (the FFI setter rejects value == 0).
+            ConfigId::Parallelism => self.parallelism = u32::try_from(value).unwrap_or(u32::MAX),
         }
+    }
+
+    /// The configured algorithm worker-thread count, floored at 1 (so an unset store
+    /// runs serial). `1` means the serial path; a value > 1 opts into the bounded
+    /// dedicated pool. On a build without the `parallel` feature this is still returned
+    /// but the algorithms ignore anything above 1.
+    #[must_use]
+    pub fn effective_parallelism(&self) -> u32 {
+        self.parallelism.max(1)
     }
 
     /// The interned id for an edge-type name, or `None` if no edge ever used it
@@ -1727,7 +1750,7 @@ impl Store {
     }
 
     /// Every LIVE edge id, in id order — the source for Gremlin `g.E()`. Each edge
-    /// appears exactly once as an out-edge (mirroring core's `g.E()` == `g.V().outE()`
+    /// appears exactly once as an out-edge (mirroring the TS engine's `g.E()` == `g.V().outE()`
     /// desugar), and `delete_edge` retains-out the adjacency entry, so iterating
     /// `out_adj` already reflects liveness with no separate tombstone check.
     #[must_use]
@@ -2112,7 +2135,7 @@ impl Store {
     fn check_label_unique(&self, label: &str, keys: &[String]) -> Result<(), String> {
         let mut seen: crate::exec::fnv::Set<Vec<u8>> = crate::exec::fnv::Set::default();
         for &id in self.nodes_with_label(label) {
-            // A tuple with ANY non-indexable value (null/list/record) is EXEMPT (SQL/core
+            // A tuple with ANY non-indexable value (null/list/record) is EXEMPT (SQL/the TS engine
             // semantics: `null != null`), so it never collides — including two stored
             // present-nulls. Matches the edge-unique check. Skip it entirely.
             if keys.iter().any(|k| !is_indexable(&self.prop(id, k))) {
@@ -2136,7 +2159,7 @@ impl Store {
     //
     // A required constraint declares that every live node with `label` carries a
     // PRESENT, NON-NULL value for `key` — both an absent key and a stored present-null
-    // violate (core's rule). Enforced by the write statements after a mutation, like
+    // violate (the TS engine's rule). Enforced by the write statements after a mutation, like
     // `unique`.
 
     /// The declared required constraints as `(label, key)` — for snapshot/schema.
@@ -2167,7 +2190,7 @@ impl Store {
 
     fn check_label_required(&self, label: &str, key: &str) -> Result<(), String> {
         for &id in self.nodes_with_label(label) {
-            // A required value must be PRESENT and NON-NULL (core's rule). `prop` reads
+            // A required value must be PRESENT and NON-NULL (the TS engine's rule). `prop` reads
             // NULL for both an absent key AND a stored present-null, so this rejects both
             // — a `SET k = null` no longer slips past a required constraint.
             if self.prop(id, key).is_null() {
@@ -2185,7 +2208,7 @@ impl Store {
     // store primitives stay infallible so rollback can always replay them. After
     // the mutations, the statement calls `run_deferred_checks` ONCE — it derives
     // the touched set from the open transaction's CDC change list and re-checks
-    // every constraint that could be affected, mirroring lenke-core's commit-time
+    // every constraint that could be affected, mirroring the TS engine's commit-time
     // `run_deferred_checks`. On the first violation it returns the coded message
     // and the caller rolls the whole statement back.
 
@@ -2266,7 +2289,7 @@ impl Store {
 
     /// Declare an edge unique constraint on `(etype, keys)` — at most one live edge
     /// of `etype` may carry a given tuple of non-null scalar values. Null/list
-    /// values are exempt (matching core, whose edge unique is index-backed). Errors
+    /// values are exempt (matching the TS engine, whose edge unique is index-backed). Errors
     /// if the CURRENT data already violates it.
     pub fn create_edge_unique_constraint(
         &mut self,
@@ -2339,7 +2362,7 @@ impl Store {
 
     fn check_etype_required(&self, etype: &str, key: &str) -> Result<(), String> {
         for eid in self.edges_of_type(etype) {
-            // Present AND non-null (core's rule): `edge_prop` reads NULL for an absent key
+            // Present AND non-null (the TS engine's rule): `edge_prop` reads NULL for an absent key
             // and for a stored present-null, so both violate.
             if self.edge_prop(eid, key).is_null() {
                 return Err(format!(
@@ -2794,6 +2817,27 @@ impl Store {
         self.add_edge_with_id(&ext, from, to, label)
     }
 
+    /// Pre-reserve the edge-indexed vectors and each node's adjacency for a bulk load of
+    /// `additional` edges with the given per-node out/in degrees — so the insert loop does
+    /// no incremental reallocation. `outdeg`/`indeg` are indexed by dense node id. A no-op
+    /// beyond capacity hints, so it never changes results.
+    pub fn reserve_for_edges(&mut self, additional: usize, outdeg: &[u32], indeg: &[u32]) {
+        self.edge_etype.reserve(additional);
+        self.edge_has_extra.reserve(additional);
+        self.edge_ends.reserve(additional);
+        self.edge_ext.reserve(additional);
+        for (i, &d) in outdeg.iter().enumerate() {
+            if let Some(adj) = self.out_adj.get_mut(i) {
+                adj.reserve_exact(d as usize);
+            }
+        }
+        for (i, &d) in indeg.iter().enumerate() {
+            if let Some(adj) = self.in_adj.get_mut(i) {
+                adj.reserve_exact(d as usize);
+            }
+        }
+    }
+
     /// Add an edge carrying an explicit external id (used by ingest). Returns the
     /// eid.
     pub fn add_edge_with_id(&mut self, ext: &str, from: u32, to: u32, label: &str) -> u32 {
@@ -2805,8 +2849,17 @@ impl Store {
             (from as usize) < self.node_count && (to as usize) < self.node_count,
             "edge endpoint out of range"
         );
-        let next = self.etype_ids.len() as u32;
-        let etype = *self.etype_ids.entry(label.to_string()).or_insert(next);
+        // Resolve the edge-type id WITHOUT allocating a key when the type already exists
+        // (the common case in a bulk load — every edge shares a handful of types). `entry`
+        // would force a `label.to_string()` on every call, even a hit.
+        let etype = match self.etype_ids.get(label) {
+            Some(&t) => t,
+            None => {
+                let next = self.etype_ids.len() as u32;
+                self.etype_ids.insert(label.to_string(), next);
+                next
+            }
+        };
         let eid = self.next_eid;
         self.next_eid += 1;
         debug_assert_eq!(
@@ -2889,7 +2942,7 @@ impl Store {
     }
 
     /// Does edge `eid` carry label `tid`? Checks the primary type then, only when
-    /// some edge in the graph is multi-label, the secondary set. Mirrors core's
+    /// some edge in the graph is multi-label, the secondary set. Mirrors the TS engine's
     /// `edge_has_label`: the `is_empty` guard keeps a single-label graph at one
     /// `u32` compare.
     #[must_use]
@@ -2907,10 +2960,10 @@ impl Store {
     }
 
     /// As [`edge_has_label`](Self::edge_has_label), for a caller that ALREADY holds
-    /// the edge's primary type (`first`, mirrored on every `Adj`). Mirrors core's
+    /// the edge's primary type (`first`, mirrored on every `Adj`). Mirrors the TS engine's
     /// `edge_type_matches`: starting from `first` (already in a register) skips the
     /// random `edge_etype[eid]` re-read `edge_has_label` does — a cache miss per edge
-    /// to learn something the caller had. Core measured that re-read at 4.3x on a
+    /// to learn something the caller had. The now-removed lenke-core measured that re-read at 4.3x on a
     /// per-row correlated edge count; an adjacency type-filter is the same hot loop.
     #[must_use]
     pub fn edge_type_matches(&self, first: u32, eid: u32, tid: u32) -> bool {
@@ -3501,7 +3554,7 @@ impl Store {
     /// Drop the vertex index(es) on `key` — the hash index on that exact path
     /// AND/OR the range index on that key. Idempotent: a no-op (still `Ok`) if no
     /// such index exists. REJECTED if `key` backs a unique constraint — drop the
-    /// constraint first (mirrors lenke-core, which keeps a unique constraint's
+    /// constraint first (mirrors the TS engine, which keeps a unique constraint's
     /// backing index an invariant).
     pub fn drop_vertex_index(&mut self, key: &str) -> Result<(), String> {
         if self
@@ -3523,7 +3576,7 @@ impl Store {
 
     /// Drop the edge interval index if `key` is one of its `[lo, hi]` keys.
     /// Idempotent (a no-op otherwise). REJECTED if `key` backs an edge unique
-    /// constraint (mirrors lenke-core).
+    /// constraint (mirrors the TS engine).
     pub fn drop_edge_index(&mut self, key: &str) -> Result<(), String> {
         if self
             .e_unique
@@ -4388,6 +4441,7 @@ impl Builder {
         let mut st = Store {
             node_count: n,
             limits: GraphLimits::default(),
+            parallelism: 0,
             by_label: self.by_label,
             props,
             prop_keys_cache: std::sync::RwLock::default(),

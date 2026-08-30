@@ -1,6 +1,6 @@
 # In-engine graph algorithms
 
-lenke runs whole-graph algorithms **inside** the engine — PageRank (and personalized PageRank), connected components, strongly-connected components, cycle membership, label propagation, degree, shortest path, peer pressure, and betweenness/closeness centrality. They are not a bolt-on library that pulls your graph out into JS arrays; they execute against the live store (the Rust core uses its rayon parallelism; the pure-TS driver time-slices so it never blocks the event loop) and, on the native engine, run genuinely off the JS thread.
+lenke runs whole-graph algorithms **inside** the engine — PageRank (and personalized PageRank), connected components, strongly-connected components, cycle membership, label propagation, degree, shortest path, peer pressure, and betweenness/closeness centrality. They are not a bolt-on library that pulls your graph out into JS arrays; they execute against the live store. By default they run **single-threaded** — the pure-TS driver time-slices so it never blocks the event loop, and on the native engine each run happens genuinely off the JS thread. The float-heavy ones can additionally use **opt-in multicore** on the native build (see [Parallelism](#parallelism) below).
 
 The same computation is reachable from **four surfaces**. Pick the one that fits your call site — the `config` shape and the results are identical across all of them, and the numeric output is **byte-identical** across the pure-TS and Rust engines (a fixed summation order is the rule that guarantees it, so a score computed in the browser matches one computed on the server bit for bit).
 
@@ -95,7 +95,7 @@ Now every downstream GQL/Gremlin query can filter, sort, and traverse on `pr` �
 
 ## Surface 2 — native `RustGraph` methods
 
-The identical algorithms hang off the native graph handle, each returning a `Promise<Row[]>` and running on a libuv threadpool thread (off the JS thread, keeping the engine's parallelism):
+The identical algorithms hang off the native graph handle, each returning a `Promise<Row[]>` and running on a libuv threadpool thread (off the JS thread; single-threaded by default — opt into multicore with `parallelism`/`threads`, see [Parallelism](#parallelism)):
 
 ```ts
 const scores = await g.pagerank({ iterations: 20 });
@@ -152,3 +152,28 @@ The Gremlin frontend exposes the same computations as traversal steps:
 - **A Gremlin shop** → the traversal steps.
 
 All four are the same engine code path — the choice is purely about where the call lives, never about what it computes.
+
+## Parallelism
+
+The float-heavy algorithms — **betweenness**, **closeness**, **PageRank**, **personalized PageRank**, **label propagation**, **peer pressure** (and **degree**) — can run across multiple cores on the **native engine**. It is strictly **opt-in**: the default is one thread (serial), so single-core performance is unchanged and nothing you don't ask for competes with your process.
+
+Set it per graph, or override per call:
+
+```ts
+// Graph-level default for every algorithm run on this graph:
+const g = graphFromNdjson(backend, ndjson, { parallelism: 8 });
+await g.betweenness(); // uses up to 8 workers
+
+// Or per call (overrides the graph default):
+await g.betweenness({ threads: 8 });
+await g.closeness({ threads: 4 });
+```
+
+From GQL, pass `threads` in the `CALL` config: `CALL betweenness({ threads: 8 }) YIELD node, centrality`.
+
+Two guarantees make this safe to turn on:
+
+- **It will not starve your process.** Each run uses a **dedicated, bounded pool** of exactly the thread count you asked for — never a global pool sized to every core — so the host's event loop and other work keep running. A conservative number (say, half your cores) is usually the right call on a shared machine.
+- **Results are byte-identical at any thread count.** A parallel run returns bit-for-bit the same scores as a serial one (and the same as the pure-TS engine): the parallelized work is either independent per node or folded back in a fixed order, so no float sum is ever reassociated. `threads: 1` and `threads: 16` produce identical output.
+
+Not available on the **wasm** build (WebAssembly has no threads) or the **pure-TS** engine — both accept the setting for API symmetry and run serially. Betweenness and closeness (the `O(V·E)` centralities) benefit most; a typical 8-thread run is several times faster than serial on a mid-size graph.
