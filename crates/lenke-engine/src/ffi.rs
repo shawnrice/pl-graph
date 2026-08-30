@@ -1,5 +1,5 @@
 //! The engine's C ABI — a deliberately small, flat exported surface (16 symbols)
-//! that `packages/native` can load in place of `lenke-core`.
+//! that `packages/native` loads as its Rust backend.
 //!
 //! Design (see `docs/abi.md`):
 //!   * **Pare down external symbols.** Variant families are folded behind an enum
@@ -16,7 +16,7 @@
 //! Failures ride the error channel with a canonical `E_*` code from the shared
 //! `@lenke/errors` vocabulary (`E_SYNTAX`, `E_CONSTRAINT_VIOLATION`,
 //! `E_INVALID_VALUE`, `E_UNSUPPORTED`, …) so the host maps them to the same
-//! `LenkeError` the core backend produces.
+//! `LenkeError` the former core backend produces.
 
 // C-ABI boundary module: keep every raw-pointer op an explicit `unsafe {}` block.
 #![allow(unsafe_code)]
@@ -25,7 +25,7 @@
 use crate::store::Store;
 
 /// The ABI version the host asserts in lockstep (see `packages/native/src/abi.ts`).
-pub const ABI_VERSION: u32 = 18;
+pub const ABI_VERSION: u32 = 19;
 
 // ------------------------------------------------------------------ helpers ---
 
@@ -173,7 +173,7 @@ fn run_algo_command(
     // `betweenness`) requires NON-NEGATIVE weights — a negative edge never settles (the
     // relaxation can loop forever) and a NaN strands the search, so the distances are
     // undefined and the two engines diverge. Reject any negative/NaN weight UP FRONT,
-    // matching lenke-core + the TS engine. Plain `Err` → `E_INVALID_VALUE` at the FFI
+    // matching the TS engine. Plain `Err` → `E_INVALID_VALUE` at the FFI
     // boundary.
     if matches!(name.as_str(), "shortest_path" | "closeness" | "betweenness") {
         if let Some((_, crate::value::Value::Str(wk))) =
@@ -196,7 +196,7 @@ fn run_algo_command(
     let results = crate::algo::run_procedure(store, &name, &config)
         .ok_or_else(|| format!("algorithm `{name}` rejected its config"))?;
 
-    // A `writeProperty` writes each result back to that node property (as core does).
+    // A `writeProperty` writes each result back to that node property (as the TS engine does).
     let write_prop = config.iter().find_map(|(k, v)| {
         if k == "writeProperty" {
             if let crate::value::Value::Str(s) = v {
@@ -243,7 +243,7 @@ fn prepared_handle(input: Option<&str>) -> Result<u64, String> {
 /// The exec layer signals over `Result<_, String>`; a constraint violation carries
 /// an `E_*:`-prefixed message. Map the known prefixes to the shared `@lenke/errors`
 /// codes (so a constraint failure surfaces as `E_CONSTRAINT_VIOLATION`, matching
-/// lenke-core), stripping the prefix from the human message; anything else is a
+/// the TS engine), stripping the prefix from the human message; anything else is a
 /// generic `E_INVALID_VALUE` evaluation error.
 fn set_exec_error(e: &str) {
     // Every constraint kind funnels to the one canonical violation code.
@@ -337,7 +337,12 @@ pub use crate::ffi_error::lnk_last_error_json;
 /// # Safety
 /// If non-null, `ptr`/`len` must describe a readable byte range.
 #[no_mangle]
-pub unsafe extern "C" fn lnk_open(ptr: *const u8, len: usize, format: u8) -> *mut Store {
+pub unsafe extern "C" fn lnk_open(
+    ptr: *const u8,
+    len: usize,
+    format: u8,
+    threads: u32,
+) -> *mut Store {
     crate::ffi_error::begin();
     match format {
         0 => {
@@ -349,7 +354,9 @@ pub unsafe extern "C" fn lnk_open(ptr: *const u8, len: usize, format: u8) -> *mu
                 crate::ffi_error::set("E_FFI", "NDJSON input is not valid UTF-8");
                 return std::ptr::null_mut();
             };
-            match crate::ndjson::from_ndjson(text) {
+            // `threads` parallelizes the NDJSON PARSE only (opt-in; 1 = serial). Other
+            // formats ignore it (serial decode).
+            match crate::ndjson::from_ndjson_threads(text, threads) {
                 Ok(store) => Box::into_raw(Box::new(store)),
                 Err(e) => {
                     crate::ffi_error::set("E_INVALID_JSON", &e.to_string());
@@ -372,7 +379,7 @@ pub unsafe extern "C" fn lnk_open(ptr: *const u8, len: usize, format: u8) -> *mu
             }
         }
         // The shared textual codecs (pg-json/pg-text/graphson/csv), via the neutral
-        // GraphData bridge — one byte-identical implementation with lenke-core. Gated
+        // GraphData bridge — one byte-identical implementation with the TS engine. Gated
         // behind the `codecs` feature; without it, an unknown format.
         // SAFETY: forwards this fn's contract to the codec helper.
         _ => unsafe { open_via_codec(ptr, len, format) },
@@ -471,7 +478,7 @@ pub unsafe extern "C" fn lnk_config(s: *mut Store, id: u32, value: u64) -> u32 {
         return 0;
     };
     if value == 0 {
-        return 0; // reject a zero ceiling (matches core)
+        return 0; // reject a zero ceiling (matches the TS engine)
     }
     store.set_limit(id, value);
     1
@@ -698,7 +705,7 @@ pub unsafe extern "C" fn lnk_tx(s: *mut Store, action: u8) -> i32 {
         0 => store.begin(),
         // Commit runs the DEFERRED declared-constraint checks against the fully-staged
         // graph first; a violation rolls the whole transaction back and fails the commit
-        // with its coded error (so the host `transaction()` throws, matching core).
+        // with its coded error (so the host `transaction()` throws, matching the TS engine).
         1 => {
             if let Err(e) = crate::exec::commit_with_deferred_checks(store) {
                 set_exec_error(&e);
@@ -892,7 +899,7 @@ pub unsafe extern "C" fn lnk_command(
             // SAFETY: out_len is writable per this fn's contract.
             unsafe { out_string(store.last_write_scope_json(scope_key), out_len) }
         }
-        // First-wins bulk merge of an NDJSON document (matching core). Input is the
+        // First-wins bulk merge of an NDJSON document (matching the TS engine). Input is the
         // NDJSON text; output the `MergeReport`
         // `{"nodesAdded","edgesAdded","nodesSkipped":[…],"edgesSkipped":[…],"phantomVertices":[…]}`.
         "merge" => {
@@ -1029,7 +1036,7 @@ pub unsafe extern "C" fn lnk_command(
         // Run a native graph algorithm directly (also reachable via GQL `CALL`).
         // Input `{"name": "<algo>", "config": {…}}`; output a
         // `{"columns":["node","<result>"],"rows":[["<ext id>", value], …]}` row set
-        // (same shape as core's `lnk_algo`). A `writeProperty` in the config writes
+        // (same shape as the TS engine's `lnk_algo`). A `writeProperty` in the config writes
         // each result back to that node property.
         "algo" => {
             let Some(text) = input else {

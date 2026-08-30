@@ -598,7 +598,7 @@ const genPlan = (r: () => number): Plan => {
 };
 
 const nativeRun = (text: string): unknown[] => {
-  const handle = backend!.graphFromNdjson(new TextEncoder().encode(MODERN), false);
+  const handle = backend!.graphFromNdjson(new TextEncoder().encode(MODERN));
 
   try {
     return JSON.parse(decoder.decode(backend!.gremlinJson(handle, text))) as unknown[];

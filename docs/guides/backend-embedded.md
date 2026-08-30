@@ -14,7 +14,7 @@ import { createStore, graphFromNdjson } from '@lenke/native';
 
 const backend = createNodeBackend();
 
-// Build + bulk-load in one step (the NDJSON decoder is parallel by default):
+// Build + bulk-load in one step:
 const store = createStore(graphFromNdjson(backend, ndjsonBytes));
 
 // Query:

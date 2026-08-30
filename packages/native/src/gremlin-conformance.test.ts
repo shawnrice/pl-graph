@@ -1,10 +1,10 @@
 // Differential conformance: the TS Gremlin engine (@lenke/gremlin, in-process)
-// vs the Rust core (this package, over bun:ffi), driven from ONE source of
+// vs the Rust engine (this package, over bun:ffi), driven from ONE source of
 // truth — a TS `Plan` — so a case can't drift between the two forms.
 //
 //   author once:   plan
 //   TS engine:     canonJson(toArray(plan, tsGraph))
-//   Rust core:     canonJson(nativeRun(planToGremlin(plan)))
+//   Rust engine:   canonJson(nativeRun(planToGremlin(plan)))
 //   assert:        the two canonical results are equal
 //
 // `planToGremlin` is the Plan→Groovy emitter — the mirror of serialize.ts's
@@ -78,8 +78,8 @@ import {
 
 import { nativeBackend, NATIVE_LIB, nativeReady } from './conformance-harness.js';
 
-// --- native backend bootstrap (via the drop-in harness: core by default,
-// lenke-engine under LENKE_ENGINE=1; see conformance-harness.ts) --------------
+// --- native backend bootstrap (via the drop-in harness: the engine backend;
+// see conformance-harness.ts) -------------------------------------------------
 const hasLib = nativeReady;
 
 if (!hasLib) {
@@ -184,7 +184,7 @@ const backend = hasLib ? nativeBackend() : null;
 const decoder = new TextDecoder();
 
 const nativeRun = (planStr: string): unknown[] => {
-  const handle = backend!.graphFromNdjson(new TextEncoder().encode(MODERN_NDJSON), false);
+  const handle = backend!.graphFromNdjson(new TextEncoder().encode(MODERN_NDJSON));
 
   try {
     const bytes = backend!.gremlinJson(handle, planStr);
@@ -452,7 +452,7 @@ const CORPUS: Case[] = [
   // The scores/labels are order-sensitive (V() insertion order) and depend on
   // canonical f64 summation order; agreement here proves the whole gremlin path
   // (parse → run_with vs builder → runAlgorithmSync) matches, on top of the
-  // algo-conformance differential over the core math.
+  // algo-conformance differential over the engine's math.
   {
     name: "V().pageRank().values('…pageRank')  [scores, f64 byte-identity]",
     plan: traversal(V(), pageRank(), values('gremlin.pageRankVertexProgram.pageRank')),
@@ -631,7 +631,7 @@ const CORPUS: Case[] = [
   },
 ];
 
-suite('gremlin conformance: TS engine ⟷ Rust core (over ffi)', () => {
+suite('gremlin conformance: TS engine ⟷ Rust engine (over ffi)', () => {
   for (const c of CORPUS) {
     test(c.name, () => {
       if (c.verdict.kind === 'tsOnly') {
@@ -761,7 +761,7 @@ suite('gremlin conformance: bitemporal as-of across the bridge', () => {
       }
     }
 
-    const handle = backend!.graphFromNdjson(new TextEncoder().encode(TEMPORAL_NDJSON), false);
+    const handle = backend!.graphFromNdjson(new TextEncoder().encode(TEMPORAL_NDJSON));
 
     try {
       const native = JSON.parse(decoder.decode(backend!.gremlinJson(handle, groovy))) as unknown[];
@@ -839,7 +839,7 @@ suite('gremlin conformance: property(key, traversal) — traversal-induced value
   for (const c of cases) {
     test(c.name, () => {
       const groovy = planToGremlin(c.plan);
-      const handle = backend!.graphFromNdjson(new TextEncoder().encode(NDJSON), false);
+      const handle = backend!.graphFromNdjson(new TextEncoder().encode(NDJSON));
 
       try {
         const native = JSON.parse(
@@ -896,7 +896,7 @@ suite('gremlin conformance: stored map property', () => {
     const plan = traversal(V(), values('meta'));
     const groovy = planToGremlin(plan);
     const ts = toArray(plan, buildTs()).map(canonJson);
-    const handle = backend!.graphFromNdjson(new TextEncoder().encode(MAP_NDJSON), false);
+    const handle = backend!.graphFromNdjson(new TextEncoder().encode(MAP_NDJSON));
 
     try {
       const native = JSON.parse(decoder.decode(backend!.gremlinJson(handle, groovy))) as unknown[];

@@ -25,11 +25,10 @@
  * different question than one that spills, so vary BENCH_N before drawing a
  * conclusion.
  *
- * READING THE RATIOS. They are against the first engine listed. The decode rows
- * are not purely codegen: decode defaults to the parallel path and only ffi has
- * threads, so wasm and TS both run it serially. (Not much of the gap — the
- * parallel decoder buys ~1.2x on ffi anyway.) Encode and query rows have no such
- * asymmetry.
+ * READING THE RATIOS. They are against the first engine listed. Decode is
+ * single-threaded on every build (the graph algorithms are the only opt-in
+ * multicore path), so the decode rows are codegen/allocation differences, not a
+ * threading asymmetry.
  */
 import { existsSync } from 'node:fs';
 
@@ -65,7 +64,7 @@ const WANTED = new Set(
 /**
  * What a workload needs from an engine.
  *
- * The two implementations have genuinely different shapes — the Rust core is a
+ * The two implementations have genuinely different shapes — the Rust engine is a
  * handle behind a backend and must be freed, the TS core is an ordinary
  * GC-managed object — so workloads are written against this rather than against
  * either one.

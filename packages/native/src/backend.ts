@@ -52,8 +52,12 @@ export type Backend = {
   /** Value of `lnk_abi_version()` for the loaded artifact. */
   readonly abiVersion: number;
 
-  /** Decode NDJSON bytes into a graph; returns an owning handle. */
-  graphFromNdjson: (bytes: Uint8Array, parallel: boolean) => GraphHandle;
+  /**
+   * Decode NDJSON bytes into a graph; returns an owning handle. `threads` (default 1)
+   * parallelizes the PARSE phase only — the store build stays serial so ids are
+   * assigned in input order, keeping the result byte-identical at any thread count.
+   */
+  graphFromNdjson: (bytes: Uint8Array, threads?: number) => GraphHandle;
   /**
    * Bulk-append NDJSON bytes into an existing graph — a `COPY FROM` for a live
    * store. Ingests at bulk speed (no per-`INSERT` parse); a node whose id

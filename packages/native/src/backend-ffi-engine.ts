@@ -21,7 +21,7 @@ const SYMBOLS = {
   lnk_abi_version: { args: [], returns: FFIType.u32 },
   lnk_free: { args: [FFIType.ptr, U], returns: FFIType.void },
   lnk_last_error_json: { args: [FFIType.ptr], returns: FFIType.ptr },
-  lnk_open: { args: [FFIType.ptr, U, FFIType.u8], returns: FFIType.ptr },
+  lnk_open: { args: [FFIType.ptr, U, FFIType.u8, FFIType.u32], returns: FFIType.ptr },
   lnk_close: { args: [FFIType.ptr], returns: FFIType.void },
   lnk_clone: { args: [FFIType.ptr], returns: FFIType.ptr },
   lnk_config: { args: [FFIType.ptr, FFIType.u32, U], returns: FFIType.u32 },
@@ -112,11 +112,12 @@ export const createFfiEngineBackend = (libPath: string): Backend => {
 
   const abi: EngineAbi = {
     abiVersion,
-    open: (bytes, format) => {
+    open: (bytes, format, threads = 1) => {
       const h = symbols.lnk_open(
         bytes ? bytesPtr(bytes) : null,
         bytes ? bytes.byteLength : 0,
         format,
+        threads,
       );
 
       if (!h) {

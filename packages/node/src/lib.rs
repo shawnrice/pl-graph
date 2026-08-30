@@ -131,7 +131,9 @@ impl Graph {
             None => (std::ptr::null(), 0),
         };
         // SAFETY: `p`/`l` describe the JS Buffer; `lnk_open` copies out of it.
-        let store = unsafe { ffi::lnk_open(p, l, format) };
+        // `threads = 1`: the napi addon decodes serially (parse parallelism is wired
+        // through the bun:ffi / wasm backends' `graphFromNdjson` thread count).
+        let store = unsafe { ffi::lnk_open(p, l, format, 1) };
         if store.is_null() {
             return Err(unsafe { last_error("open") });
         }

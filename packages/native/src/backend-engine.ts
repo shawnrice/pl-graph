@@ -1,6 +1,6 @@
 /**
  * The engine backend translator: implements the {@link Backend} contract (shaped
- * around lenke-core's 44-symbol ABI) over the standalone engine's lean 16-symbol
+ * around the former lenke-core's 44-symbol ABI) over the standalone engine's lean 16-symbol
  * ABI. Written ONCE here; the FFI and wasm engine backends each supply the
  * low-level {@link EngineAbi} (how to call `lnk_*` and marshal buffers) and wrap
  * it with {@link buildEngineBackend}.
@@ -16,7 +16,7 @@
  * cardinality, validators, invariants); direct `algo`; and prepared statements
  * (JSON + Arrow). A failure throws a coded `LenkeError` read from the engine's
  * out-of-band last-error channel, so callers branch on `error.code` exactly as
- * with the core backend.
+ * with the former core backend.
  */
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
@@ -32,9 +32,10 @@ export type EngineAbi = {
   readonly abiVersion: number;
   /**
    * `lnk_open` — format 0 = NDJSON (null bytes = empty graph), 1 = binary,
-   * 2 = pg-json, 3 = pg-text, 4 = graphson, 5 = csv.
+   * 2 = pg-json, 3 = pg-text, 4 = graphson, 5 = csv. `threads` (default 1)
+   * parallelizes the NDJSON PARSE only; every other format decodes serially.
    */
-  open: (bytes: Uint8Array | null, format: number) => GraphHandle;
+  open: (bytes: Uint8Array | null, format: number, threads?: number) => GraphHandle;
   /** `lnk_close`. */
   close: (handle: GraphHandle) => void;
   /** `lnk_clone`. */
@@ -74,7 +75,7 @@ const FMT_ARROW = 1;
 const FMT_ARROW_IPC = 2; // Arrow IPC file / Feather layout
 const FMT_ARROW_IPC_STREAM = 3; // Arrow IPC stream layout
 // lnk_open / lnk_encode `format` bytes. 0/1 are the engine's native channels;
-// 2..5 route through the shared lenke-codec bridge (byte-identical with core).
+// 2..5 route through the shared lenke-codec bridge (byte-identical with the TS engine).
 const FMT_NDJSON = 0;
 const FMT_BINARY = 1;
 /** The textual codecs handled by the shared crate, mapped to their format byte. */
@@ -265,9 +266,9 @@ export const buildEngineBackend = (abi: EngineAbi): Backend => {
   return {
     abiVersion: abi.abiVersion,
 
-    graphFromNdjson: (bytes) => abi.open(bytes, FMT_NDJSON),
+    graphFromNdjson: (bytes, threads) => abi.open(bytes, FMT_NDJSON, threads),
     mergeNdjson: (handle, bytes): MergeReport =>
-      // First-wins bulk merge (matching core): the engine returns the full report
+      // First-wins bulk merge (matching the TS engine): the engine returns the full report
       // (added counts + skipped ids + phantom endpoints) directly.
       parseJson<MergeReport>(abi.command(handle, 'merge', bytes)),
     graphClone: (handle) => abi.clone(handle),

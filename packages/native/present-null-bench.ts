@@ -33,7 +33,7 @@ const time = (label: string, setup: string[], query: string): void => {
   let best = Infinity;
 
   for (let r = 0; r < REPS; r++) {
-    const h = backend.graphFromNdjson(DOC, false);
+    const h = backend.graphFromNdjson(DOC);
 
     try {
       backend.createIndex(h, 'vertex', 'hash', ['age']);
@@ -58,7 +58,7 @@ const timeWrite = (label: string, write: string): void => {
   let best = Infinity;
 
   for (let r = 0; r < REPS; r++) {
-    const h = backend.graphFromNdjson(DOC, false);
+    const h = backend.graphFromNdjson(DOC);
 
     try {
       const t = performance.now();

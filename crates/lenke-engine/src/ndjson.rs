@@ -3,7 +3,7 @@
 //! writer, no serde) and deterministic (nodes by id; labels and property keys
 //! sorted; edges in adjacency order).
 //!
-//! Emits the SHIPPED shape (byte-shape-compatible with lenke-core /
+//! Emits the SHIPPED shape (byte-shape-compatible with
 //! `@lenke/serialization`) so NDJSON is interchangeable across the engines (ids
 //! are PRESERVED external ids — strings; a numeric id on ingest is kept as text):
 //! - node: `{"type":"node","id":"N","labels":[...],"properties":{...}}`
@@ -25,12 +25,26 @@ use std::sync::Arc;
 use crate::store::Store;
 use crate::value::Value;
 
-/// The store as NDJSON: a line per live node, then a line per edge. Ends with a
-/// trailing newline when non-empty.
+// Multicore NDJSON parse (feature `parallel`, native-only): the parse phase stages
+// disjoint line-chunks in parallel; the store build stays serial (ids in input order).
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
+/// The store as NDJSON: a line per live node, then a line per edge, ending with a
+/// trailing newline when non-empty. Uses the graph's configured
+/// [`Store::effective_parallelism`] (serial by default); see [`to_ndjson_threads`] to
+/// pick the thread count explicitly.
 #[must_use]
 pub fn to_ndjson(store: &Store) -> String {
-    // Pre-size so the buffer does not repeatedly reallocate mid-stream (~96 B/element).
-    let mut out = String::with_capacity((store.node_count() + store.edge_count()) * 96);
+    to_ndjson_threads(store, store.effective_parallelism())
+}
+
+/// The store as NDJSON, rendered with up to `threads` workers. `threads <= 1` (or a
+/// build without the `parallel` feature) runs the serial path. Output is byte-identical
+/// at any thread count — nodes then edges are split on contiguous id ranges and
+/// concatenated in order.
+#[must_use]
+pub fn to_ndjson_threads(store: &Store, threads: u32) -> String {
     let node_keys = store.prop_keys();
     let edge_keys = store.edge_prop_keys();
     // Resolve each node property column ONCE, in key order — the node loop then reads
@@ -39,46 +53,83 @@ pub fn to_ndjson(store: &Store) -> String {
         .iter()
         .filter_map(|k| store.column(k).map(|c| (k.as_str(), c)))
         .collect();
+    let n = u32::try_from(store.node_count()).unwrap_or(u32::MAX);
 
-    for id in 0..u32::try_from(store.node_count()).unwrap_or(u32::MAX) {
+    // One node's line and one node's whole out-edge run, as the SINGLE source of truth
+    // for both the serial and parallel paths (so they are byte-identical). Each appends
+    // to a caller-owned buffer and reads only immutable store state, so a parallel
+    // renderer can format disjoint id ranges into private buffers and concatenate them
+    // in id order — the exact serial byte sequence (see `parallel::concat_ranges`).
+    let fmt_node = |out: &mut String, id: u32| {
         if !store.is_alive(id) {
-            continue;
+            return;
         }
-        // The SHIPPED shape (lenke-core / @lenke/serialization): a `type`
-        // discriminator, `properties` (not `props`), and the PRESERVED external id.
-        // Ids and labels are BORROWED (`&str`) — no per-node `GStr` clone or
-        // `Vec<String>` of cloned labels.
+        // The SHIPPED shape (@lenke/serialization): a `type` discriminator,
+        // `properties` (not `props`), and the PRESERVED external id. Ids and labels are
+        // BORROWED (`&str`) — no per-node `GStr` clone or `Vec<String>` of cloned labels.
         out.push_str("{\"type\":\"node\",\"id\":");
-        encode_string(&mut out, store.node_ext_id_ref(id).unwrap_or(""));
+        encode_string(out, store.node_ext_id_ref(id).unwrap_or(""));
         out.push_str(",\"labels\":");
-        encode_str_array(&mut out, &store.labels_of_refs(id));
+        encode_str_array(out, &store.labels_of_refs(id));
         out.push_str(",\"properties\":");
-        encode_object_cols(&mut out, &node_cols, id as usize);
+        encode_object_cols(out, &node_cols, id as usize);
         out.push_str("}\n");
-    }
-
-    for from in 0..u32::try_from(store.node_count()).unwrap_or(u32::MAX) {
+    };
+    let fmt_out_edges = |out: &mut String, from: u32| {
         if !store.is_alive(from) {
-            continue;
+            return;
         }
         for a in store.out(from) {
             let eid = a.eid;
-            // An edge carries a type SET in `labels` (first = primary type), like
-            // core — not a single `type` string.
+            // An edge carries a type SET in `labels` (first = primary type), like the
+            // TS engine — not a single `type` string.
             out.push_str("{\"type\":\"edge\",\"id\":");
-            encode_string(&mut out, store.edge_ext_id_ref(eid).unwrap_or(""));
+            encode_string(out, store.edge_ext_id_ref(eid).unwrap_or(""));
             out.push_str(",\"from\":");
-            encode_string(&mut out, store.node_ext_id_ref(from).unwrap_or(""));
+            encode_string(out, store.node_ext_id_ref(from).unwrap_or(""));
             out.push_str(",\"to\":");
-            encode_string(&mut out, store.node_ext_id_ref(a.nbr).unwrap_or(""));
+            encode_string(out, store.node_ext_id_ref(a.nbr).unwrap_or(""));
             out.push_str(",\"labels\":");
-            encode_str_array(&mut out, &store.edge_labels_of(eid));
+            encode_str_array(out, &store.edge_labels_of(eid));
             out.push_str(",\"properties\":");
-            encode_object(&mut out, &edge_keys, |k| {
+            encode_object(out, &edge_keys, |k| {
                 store.has_edge_prop(eid, k).then(|| store.edge_prop(eid, k))
             });
             out.push_str("}\n");
         }
+    };
+
+    // Nodes (ascending id), then edges (by ascending `from`, out-adjacency order within).
+    // Both sections split cleanly on contiguous id ranges, so parallel rendering
+    // concatenated in range order reproduces the serial bytes exactly.
+    #[cfg(feature = "parallel")]
+    if threads > 1 {
+        let nodes = crate::parallel::concat_ranges(threads, n, |lo, hi| {
+            let mut s = String::new();
+            for id in lo..hi {
+                fmt_node(&mut s, id);
+            }
+            s
+        });
+        let edges = crate::parallel::concat_ranges(threads, n, |lo, hi| {
+            let mut s = String::new();
+            for from in lo..hi {
+                fmt_out_edges(&mut s, from);
+            }
+            s
+        });
+        return nodes + &edges;
+    }
+    #[cfg(not(feature = "parallel"))]
+    let _ = threads;
+
+    // Pre-size so the buffer does not repeatedly reallocate mid-stream (~96 B/element).
+    let mut out = String::with_capacity((store.node_count() + store.edge_count()) * 96);
+    for id in 0..n {
+        fmt_node(&mut out, id);
+    }
+    for from in 0..n {
+        fmt_out_edges(&mut out, from);
     }
     out
 }
@@ -198,7 +249,7 @@ pub fn encode_value(out: &mut String, v: &Value) {
         }
         Value::Str(s) => encode_string(out, s),
         // Tagged temporal: {"@date":"2024-01-15"} — the ISO string under a kind
-        // key, matching lenke-core's json_tagged form.
+        // key, matching the TS engine's json_tagged form.
         Value::Temporal(t) => {
             out.push_str("{\"@");
             out.push_str(t.tag());
@@ -302,75 +353,47 @@ pub(crate) struct StagedNdjson {
 }
 
 /// Parse an NDJSON document into staged records. External ids are PRESERVED
-/// verbatim (no remap), so element_id / egress round-trip.
+/// verbatim (no remap), so element_id / egress round-trip. Serial by default; a
+/// caller wanting multicore staging uses [`stage_ndjson_threads`].
 fn stage_ndjson(text: &str) -> Result<StagedNdjson, String> {
+    stage_lines(text, 0)
+}
+
+/// Parse ONE slice of complete NDJSON lines into staged records, numbering error
+/// messages from `line_offset` (so a parallel chunk still reports the true global
+/// line). Pure — no shared state — so disjoint line-chunks stage independently and
+/// their record vectors concatenate in order to the exact serial result.
+fn stage_lines(text: &str, line_offset: usize) -> Result<StagedNdjson, String> {
     let mut constraints: Vec<(String, Vec<String>)> = Vec::new();
     let mut required: Vec<(String, String)> = Vec::new();
     let mut nodes: Vec<NodeRec> = Vec::new();
     let mut edges: Vec<EdgeRec> = Vec::new();
 
+    // Both shapes are accepted so the engine is a drop-in for the TS engine's NDJSON AND
+    // keeps reading anything it wrote earlier: the shipped `{"type":…,"labels":[…],
+    // "properties":{…}}` and the legacy node `{"id",…,"props"}` / edge `{"from","to",
+    // "type":"<etype>","props"}`. `record()` routes both (edge told by `from`; props from
+    // `properties` OR `props`; edge type from `labels` or a legacy `type`).
     for (lineno, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let err = |m: String| format!("line {}: {m}", lineno + 1);
-        let Json::Obj(fields) = parse_line(line).map_err(err)? else {
-            return Err(err("expected a JSON object".into()));
+        let err = |m: String| format!("line {}: {m}", line_offset + lineno + 1);
+        let mut p = JsonParser {
+            b: line.as_bytes(),
+            i: 0,
         };
-        if let Some(kind) = field(&fields, "schema") {
-            // Schema line (leads the snapshot): "unique" or "required".
-            match json_string(kind).map_err(err)?.as_str() {
-                "unique" => {
-                    let label = json_string(req(&fields, "label").map_err(err)?).map_err(err)?;
-                    let keys = json_str_array(req(&fields, "keys").map_err(err)?).map_err(err)?;
-                    constraints.push((label, keys));
-                }
-                "required" => {
-                    let label = json_string(req(&fields, "label").map_err(err)?).map_err(err)?;
-                    let key = json_string(req(&fields, "key").map_err(err)?).map_err(err)?;
-                    required.push((label, key));
-                }
-                _ => return Err(err("unknown schema kind".into())),
-            }
-        } else {
-            // A data line. Two shapes are accepted so the engine is a drop-in for
-            // core's NDJSON AND keeps reading anything it wrote earlier:
-            //   core / shipped:  {"type":"node|edge", …, "labels":[…], "properties":{…}}
-            //   engine (legacy): node {"id",…,"props"}; edge {"from","to","type":"<etype>","props"}
-            // Edges are told by a `from` field (both shapes have it). Properties come
-            // from `properties` OR `props` (default empty); an edge's type SET is its
-            // `labels` array, or — legacy — a single `type` string (not "edge").
-            let props_of =
-                |f: &[(String, Json)]| match field(f, "properties").or_else(|| field(f, "props")) {
-                    Some(p) => json_props(p),
-                    None => Ok(Vec::new()),
-                };
-            if field(&fields, "from").is_some() {
-                let from = json_id(req(&fields, "from").map_err(err)?).map_err(err)?;
-                let to = json_id(req(&fields, "to").map_err(err)?).map_err(err)?;
-                let edge_id = field(&fields, "id").map(json_id).transpose().map_err(err)?;
-                let ty = field(&fields, "type")
-                    .map(json_string)
-                    .transpose()
-                    .map_err(err)?;
-                let labels: Vec<String> = match field(&fields, "labels") {
-                    Some(l) => json_str_array(l).map_err(err)?,
-                    // Legacy single-type edge: `type` is the edge type (never "edge").
-                    None => match ty.filter(|t| t != "edge") {
-                        Some(t) => vec![t],
-                        None => return Err(err("edge needs `labels` (or a legacy `type`)".into())),
-                    },
-                };
-                if labels.is_empty() {
-                    return Err(err("edge `labels` must have at least one entry".into()));
-                }
-                edges.push((from, to, edge_id, labels, props_of(&fields).map_err(err)?));
-            } else {
-                let ext = json_id(req(&fields, "id").map_err(err)?).map_err(err)?;
-                let labels = json_str_array(req(&fields, "labels").map_err(err)?).map_err(err)?;
-                nodes.push((ext, labels, props_of(&fields).map_err(err)?));
-            }
+        let rec = p.record().map_err(err)?;
+        p.ws();
+        if p.i != p.b.len() {
+            return Err(err(format!("trailing input at char {}", p.i)));
+        }
+        match rec {
+            Rec::Node(n) => nodes.push(n),
+            Rec::Edge(e) => edges.push(e),
+            Rec::Unique(label, keys) => constraints.push((label, keys)),
+            Rec::Required(label, key) => required.push((label, key)),
         }
     }
     Ok(StagedNdjson {
@@ -381,9 +404,84 @@ fn stage_ndjson(text: &str) -> Result<StagedNdjson, String> {
     })
 }
 
+/// Cut `text` into at most `parts` contiguous chunks, each a run of COMPLETE lines
+/// (every chunk ends just after a `\n`), paired with the 0-based line number of its
+/// first line. One O(n) byte scan; splits fall on the newline boundary nearest each
+/// evenly-spaced byte offset. Concatenating the chunks' staged records in order
+/// reproduces the serial parse exactly.
+#[cfg(feature = "parallel")]
+fn line_chunks(text: &str, parts: usize) -> Vec<(&str, usize)> {
+    let n = text.len();
+    if parts <= 1 || n == 0 {
+        return vec![(text, 0)];
+    }
+    let approx = (n / parts).max(1);
+    let b = text.as_bytes();
+    let mut chunks: Vec<(&str, usize)> = Vec::with_capacity(parts);
+    let mut chunk_start = 0usize;
+    let mut chunk_start_line = 0usize;
+    let mut line = 0usize;
+    let mut target = approx;
+    for i in 0..n {
+        if b[i] == b'\n' {
+            line += 1;
+            if i + 1 >= target && chunks.len() < parts - 1 {
+                chunks.push((&text[chunk_start..=i], chunk_start_line));
+                chunk_start = i + 1;
+                chunk_start_line = line;
+                target = chunk_start + approx;
+            }
+        }
+    }
+    if chunk_start < n {
+        chunks.push((&text[chunk_start..], chunk_start_line));
+    }
+    if chunks.is_empty() {
+        chunks.push((text, 0));
+    }
+    chunks
+}
+
+/// Parse an NDJSON document into staged records with up to `threads` workers: split
+/// into contiguous complete-line chunks, stage them in parallel, and concatenate the
+/// record vectors IN ORDER. Byte-identical to the serial parse — [`build_store`] then
+/// assigns dense ids in that (input) order. `threads <= 1`, a tiny doc, or a build
+/// without the `parallel` feature runs serially.
+fn stage_ndjson_threads(text: &str, threads: u32) -> Result<StagedNdjson, String> {
+    #[cfg(feature = "parallel")]
+    if threads > 1 {
+        let chunks = line_chunks(text, threads as usize * 4);
+        if chunks.len() > 1 {
+            let parts: Vec<Result<StagedNdjson, String>> =
+                crate::parallel::with_pool(threads, || {
+                    chunks
+                        .par_iter()
+                        .map(|&(chunk, line0)| stage_lines(chunk, line0))
+                        .collect()
+                });
+            let mut merged = StagedNdjson {
+                constraints: Vec::new(),
+                required: Vec::new(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            };
+            for part in parts {
+                let part = part?;
+                merged.constraints.extend(part.constraints);
+                merged.required.extend(part.required);
+                merged.nodes.extend(part.nodes);
+                merged.edges.extend(part.edges);
+            }
+            return Ok(merged);
+        }
+    }
+    let _ = threads;
+    stage_lines(text, 0)
+}
+
 /// What a [`merge_ndjson`] applied vs. skipped — so a caller (the sync demand-fill
 /// path) can surface anything that did not land cleanly. Empty skip/phantom lists
-/// mean a clean merge. Mirrors lenke-core's `MergeReport`.
+/// mean a clean merge. Mirrors the TS engine's `MergeReport`.
 #[derive(Default)]
 pub struct MergeReport {
     pub nodes_added: usize,
@@ -398,7 +496,7 @@ pub struct MergeReport {
 }
 
 /// Merge an NDJSON document into an EXISTING store with **first-wins** semantics
-/// (matching lenke-core's `ndjson::append`): a node whose id already exists is
+/// (matching the TS engine's `ndjson::append`): a node whose id already exists is
 /// SKIPPED (the graph's copy kept) and reported; an edge with an already-present
 /// explicit id is skipped; an undeclared edge endpoint is created as a bare vertex
 /// and reported as a phantom; explicit edge ids are preserved. An id-less edge is
@@ -471,7 +569,7 @@ pub fn merge_ndjson(store: &mut Store, text: &str) -> Result<MergeReport, String
 }
 
 /// An endpoint id → its node, creating a bare vertex (and recording a phantom) for
-/// an undeclared one — the lenient endpoint policy, matching core.
+/// an undeclared one — the lenient endpoint policy, matching the TS engine.
 fn resolve_or_phantom(store: &mut Store, ext: &str, report: &mut MergeReport) -> u32 {
     if let Some(id) = store.node_by_ext(ext) {
         return id;
@@ -489,14 +587,25 @@ fn resolve_or_phantom(store: &mut Store, ext: &str, report: &mut MergeReport) ->
 /// graph with deletions re-densifies on load — round-trip is exact for a gap-free
 /// dump and STABLE from the first reload otherwise.
 pub fn from_ndjson(text: &str) -> Result<Store, String> {
-    build_store(stage_ndjson(text)?)
+    from_ndjson_threads(text, 1)
+}
+
+/// Decode NDJSON into a store using up to `threads` workers. The PARSE (the dominant
+/// cost) parallelizes over line-chunks; the store build stays serial so dense ids are
+/// assigned in input order — the result is byte-identical at any thread count. Within
+/// the serial build, endpoint resolution (`node_by_ext` per edge end) also parallelizes,
+/// and nodes take the single-pass `add_node_bulk` fast path under bulk-load mode.
+/// `threads <= 1` runs fully serial. Amdahl-bounded by the remaining serial insert at
+/// ~2.5x @ 8 threads (measured).
+pub fn from_ndjson_threads(text: &str, threads: u32) -> Result<Store, String> {
+    build_store(stage_ndjson_threads(text, threads)?, threads)
 }
 
 /// Build a `Store` from staged records — the shared tail of every full-graph
 /// decoder ([`from_ndjson`] and [`crate::binary::from_binary`]). Applies schema
 /// BEFORE data (the store is empty, so declaration always succeeds — INSERT-time
 /// enforcement on the reloaded store matches), then finalizes the read overlays.
-pub(crate) fn build_store(staged: StagedNdjson) -> Result<Store, String> {
+pub(crate) fn build_store(staged: StagedNdjson, threads: u32) -> Result<Store, String> {
     let StagedNdjson {
         constraints,
         required,
@@ -512,19 +621,33 @@ pub(crate) fn build_store(staged: StagedNdjson) -> Result<Store, String> {
     for (label, key) in &required {
         store.create_required_constraint(label, key)?;
     }
+    // Bulk-load mode: defer version/epoch upkeep (a per-element hashmap op otherwise)
+    // and the `ext_to_node` reverse-map build, reconciled once at `end_bulk`. Node
+    // inserts take the single-pass `add_node_bulk` fast path (no per-property hashmap
+    // lookup); `materialize_ext` then builds the reverse map in one reserved pass BEFORE
+    // the edge loop resolves endpoints through it. Byte-identical to the serial adds.
+    store.begin_bulk();
     for (ext, labels, props) in &nodes {
         let lrefs: Vec<&str> = labels.iter().map(String::as_str).collect();
         let prefs: Vec<(&str, Value)> =
             props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-        store.add_node_with_id(&Arc::from(ext.as_str()), &lrefs, &prefs);
+        store.add_node_bulk(ext, &lrefs, &prefs);
     }
-    for (from, to, edge_id, labels, props) in &edges {
-        let f = store
-            .node_by_ext(from)
-            .ok_or_else(|| format!("edge references unknown node id {from}"))?;
-        let t = store
-            .node_by_ext(to)
-            .ok_or_else(|| format!("edge references unknown node id {to}"))?;
+    store.materialize_ext();
+    // Resolve every edge's endpoints through the reverse map — a read-only `node_by_ext`
+    // per end, so it parallelizes (the store is only READ here). The serial insert below
+    // then uses the resolved dense ids, assigning eids in input order (byte-identical).
+    let resolved = resolve_endpoints(&store, &edges, threads)?;
+    // Pre-reserve the edge vectors and each node's adjacency from the resolved degrees,
+    // so the insert loop below does zero incremental reallocation.
+    let mut outdeg = vec![0u32; store.node_count()];
+    let mut indeg = vec![0u32; store.node_count()];
+    for &(f, t) in &resolved {
+        outdeg[f as usize] += 1;
+        indeg[t as usize] += 1;
+    }
+    store.reserve_for_edges(edges.len(), &outdeg, &indeg);
+    for ((_, _, edge_id, labels, props), &(f, t)) in edges.iter().zip(&resolved) {
         let etype = &labels[0];
         let eid = match edge_id {
             Some(id) => store.add_edge_with_id(&Arc::from(id.as_str()), f, t, etype),
@@ -541,6 +664,7 @@ pub(crate) fn build_store(staged: StagedNdjson) -> Result<Store, String> {
     // Incremental loading left the CSR + numeric-edge overlays stale (edges arrive via
     // add_edge, which invalidates); rebuild both once so a loaded snapshot gets the
     // contiguous read path and the typed edge-property reads without a later rebuild.
+    store.end_bulk();
     store.rebuild_csr();
     store.rebuild_edge_num();
     // Dictionary-encode categorical string columns now that every value is in — the
@@ -549,6 +673,42 @@ pub(crate) fn build_store(staged: StagedNdjson) -> Result<Store, String> {
     // work instead of string hashing).
     store.dict_encode_columns();
     Ok(store)
+}
+
+/// Resolve each edge's `(from, to)` external ids to dense node ids through the store's
+/// reverse map. `node_by_ext` is `&self`, so this is READ-ONLY and parallelizes over the
+/// edges when `threads > 1` (a big chunk of edge-insert cost is these 2·|E| hashmap
+/// lookups). Order is preserved, so the serial insert that follows still assigns eids in
+/// input order. An unknown endpoint is an error (which edge is reported may differ under
+/// parallel, but that is the malformed-input path only).
+fn resolve_endpoints(
+    store: &Store,
+    edges: &[EdgeRec],
+    threads: u32,
+) -> Result<Vec<(u32, u32)>, String> {
+    let lookup = |from: &str, to: &str| -> Result<(u32, u32), String> {
+        let f = store
+            .node_by_ext(from)
+            .ok_or_else(|| format!("edge references unknown node id {from}"))?;
+        let t = store
+            .node_by_ext(to)
+            .ok_or_else(|| format!("edge references unknown node id {to}"))?;
+        Ok((f, t))
+    };
+    #[cfg(feature = "parallel")]
+    if threads > 1 {
+        return crate::parallel::with_pool(threads, || {
+            edges
+                .par_iter()
+                .map(|(from, to, ..)| lookup(from, to))
+                .collect()
+        });
+    }
+    let _ = threads;
+    edges
+        .iter()
+        .map(|(from, to, ..)| lookup(from, to))
+        .collect()
 }
 
 // --- a tiny dependency-free JSON parser (one value per line) -----------------
@@ -572,15 +732,6 @@ pub fn field<'a>(fields: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
 pub fn req<'a>(fields: &'a [(String, Json)], key: &str) -> Result<&'a Json, String> {
     field(fields, key).ok_or_else(|| format!("missing field `{key}`"))
 }
-/// An element id, accepted as a JSON string OR a non-negative integer (rendered as
-/// its integer text) — so both `"id":"e0"` and `"id":0` preserve a stable id.
-fn json_id(j: &Json) -> Result<String, String> {
-    match j {
-        Json::Str(s) => Ok(s.clone()),
-        Json::Num(n) if n.fract() == 0.0 => Ok((*n as i64).to_string()),
-        _ => Err("expected an id (string or integer)".into()),
-    }
-}
 /// A JSON string value, or `Err` for any other shape.
 pub fn json_string(j: &Json) -> Result<String, String> {
     match j {
@@ -593,15 +744,6 @@ pub fn json_str_array(j: &Json) -> Result<Vec<String>, String> {
     match j {
         Json::Arr(items) => items.iter().map(json_string).collect(),
         _ => Err("expected an array of strings".into()),
-    }
-}
-fn json_props(j: &Json) -> Result<Vec<(String, Value)>, String> {
-    match j {
-        Json::Obj(fields) => fields
-            .iter()
-            .map(|(k, v)| Ok((k.clone(), json_value(v)?)))
-            .collect(),
-        _ => Err("expected an object".into()),
     }
 }
 /// A JSON value as a property `Value`. There is no map type, so a nested object
@@ -673,8 +815,12 @@ pub fn params_from_obj(obj: &Json) -> Result<Vec<(String, Value)>, String> {
 
 /// Parse exactly one JSON value from `line` (trailing whitespace allowed).
 fn parse_line(line: &str) -> Result<Json, String> {
+    // Parse over the raw BYTES (`&[u8]`) — no per-line `Vec<char>` allocation, and the
+    // structural scan is single-byte ASCII. `line` is valid UTF-8, so string CONTENT
+    // (between quotes) is copied through as byte slices; only escapes are expanded. The
+    // parsed values are byte-identical to the previous char parser.
     let mut p = JsonParser {
-        b: line.chars().collect(),
+        b: line.as_bytes(),
         i: 0,
     };
     let v = p.value()?;
@@ -685,14 +831,14 @@ fn parse_line(line: &str) -> Result<Json, String> {
     Ok(v)
 }
 
-struct JsonParser {
-    b: Vec<char>,
+struct JsonParser<'a> {
+    b: &'a [u8],
     i: usize,
 }
 
-impl JsonParser {
+impl JsonParser<'_> {
     fn ws(&mut self) {
-        while self.b.get(self.i).is_some_and(|c| c.is_whitespace()) {
+        while self.b.get(self.i).is_some_and(u8::is_ascii_whitespace) {
             self.i += 1;
         }
     }
@@ -700,12 +846,12 @@ impl JsonParser {
     fn value(&mut self) -> Result<Json, String> {
         self.ws();
         match self.b.get(self.i) {
-            Some('{') => self.object(),
-            Some('[') => self.array(),
-            Some('"') => Ok(Json::Str(self.string()?)),
-            Some('t') | Some('f') => self.boolean(),
-            Some('n') => self.keyword("null", Json::Null),
-            Some(c) if *c == '-' || c.is_ascii_digit() => self.number(),
+            Some(b'{') => self.object(),
+            Some(b'[') => self.array(),
+            Some(b'"') => Ok(Json::Str(self.string()?)),
+            Some(b't') | Some(b'f') => self.boolean(),
+            Some(b'n') => self.keyword("null", Json::Null),
+            Some(c) if *c == b'-' || c.is_ascii_digit() => self.number(),
             other => Err(format!("unexpected {other:?} at char {}", self.i)),
         }
     }
@@ -714,7 +860,7 @@ impl JsonParser {
         self.i += 1; // '{'
         let mut out = Vec::new();
         self.ws();
-        if self.b.get(self.i) == Some(&'}') {
+        if self.b.get(self.i) == Some(&b'}') {
             self.i += 1;
             return Ok(Json::Obj(out));
         }
@@ -722,7 +868,7 @@ impl JsonParser {
             self.ws();
             let key = self.string()?;
             self.ws();
-            if self.b.get(self.i) != Some(&':') {
+            if self.b.get(self.i) != Some(&b':') {
                 return Err(format!("expected ':' at char {}", self.i));
             }
             self.i += 1;
@@ -730,8 +876,8 @@ impl JsonParser {
             out.push((key, val));
             self.ws();
             match self.b.get(self.i) {
-                Some(',') => self.i += 1,
-                Some('}') => {
+                Some(b',') => self.i += 1,
+                Some(b'}') => {
                     self.i += 1;
                     return Ok(Json::Obj(out));
                 }
@@ -744,7 +890,7 @@ impl JsonParser {
         self.i += 1; // '['
         let mut out = Vec::new();
         self.ws();
-        if self.b.get(self.i) == Some(&']') {
+        if self.b.get(self.i) == Some(&b']') {
             self.i += 1;
             return Ok(Json::Arr(out));
         }
@@ -752,8 +898,8 @@ impl JsonParser {
             out.push(self.value()?);
             self.ws();
             match self.b.get(self.i) {
-                Some(',') => self.i += 1,
-                Some(']') => {
+                Some(b',') => self.i += 1,
+                Some(b']') => {
                     self.i += 1;
                     return Ok(Json::Arr(out));
                 }
@@ -763,74 +909,102 @@ impl JsonParser {
     }
 
     fn string(&mut self) -> Result<String, String> {
-        if self.b.get(self.i) != Some(&'"') {
+        if self.b.get(self.i) != Some(&b'"') {
             return Err(format!("expected a string at char {}", self.i));
         }
         self.i += 1;
-        let mut s = String::new();
+        let start = self.i;
+        // Escape-free fast path: scan to the closing quote and hand back the borrowed
+        // byte slice as ONE `String` (the common case — ids, names). Only on a backslash
+        // do we fall to a byte buffer that copies runs and expands escapes.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut run = start; // start of the current unescaped run
         loop {
             match self.b.get(self.i) {
                 None => return Err("unterminated string".into()),
-                Some('"') => {
+                Some(b'"') => {
+                    if buf.is_empty() {
+                        let s = core::str::from_utf8(&self.b[start..self.i])
+                            .map_err(|_| "invalid utf-8 in string".to_string())?
+                            .to_string();
+                        self.i += 1;
+                        return Ok(s);
+                    }
+                    buf.extend_from_slice(&self.b[run..self.i]);
                     self.i += 1;
-                    return Ok(s);
+                    return String::from_utf8(buf)
+                        .map_err(|_| "invalid utf-8 in string".to_string());
                 }
-                Some('\\') => {
+                Some(b'\\') => {
+                    buf.extend_from_slice(&self.b[run..self.i]);
                     self.i += 1;
                     match self.b.get(self.i) {
-                        Some('"') => s.push('"'),
-                        Some('\\') => s.push('\\'),
-                        Some('/') => s.push('/'),
-                        Some('n') => s.push('\n'),
-                        Some('r') => s.push('\r'),
-                        Some('t') => s.push('\t'),
-                        Some('b') => s.push('\u{8}'),
-                        Some('f') => s.push('\u{c}'),
-                        Some('u') => {
-                            let hex: String =
-                                (1..=4).filter_map(|d| self.b.get(self.i + d)).collect();
-                            let cp = u32::from_str_radix(&hex, 16)
+                        Some(b'"') => buf.push(b'"'),
+                        Some(b'\\') => buf.push(b'\\'),
+                        Some(b'/') => buf.push(b'/'),
+                        Some(b'n') => buf.push(b'\n'),
+                        Some(b'r') => buf.push(b'\r'),
+                        Some(b't') => buf.push(b'\t'),
+                        Some(b'b') => buf.push(0x08),
+                        Some(b'f') => buf.push(0x0c),
+                        Some(b'u') => {
+                            let hex = self
+                                .b
+                                .get(self.i + 1..self.i + 5)
+                                .and_then(|h| core::str::from_utf8(h).ok())
+                                .ok_or_else(|| "bad \\u escape".to_string())?;
+                            let cp = u32::from_str_radix(hex, 16)
                                 .map_err(|_| "bad \\u escape".to_string())?;
-                            s.push(char::from_u32(cp).ok_or("bad code point")?);
+                            let ch = char::from_u32(cp).ok_or("bad code point")?;
+                            buf.extend_from_slice(ch.encode_utf8(&mut [0u8; 4]).as_bytes());
                             self.i += 4;
                         }
                         other => return Err(format!("bad escape {other:?}")),
                     }
                     self.i += 1;
+                    run = self.i;
                 }
-                Some(&c) => {
-                    s.push(c);
-                    self.i += 1;
-                }
+                Some(_) => self.i += 1,
             }
         }
     }
 
     fn number(&mut self) -> Result<Json, String> {
+        self.number_f64().map(Json::Num)
+    }
+
+    fn number_f64(&mut self) -> Result<f64, String> {
         let start = self.i;
         while self
             .b
             .get(self.i)
-            .is_some_and(|c| matches!(c, '0'..='9' | '-' | '+' | '.' | 'e' | 'E'))
+            .is_some_and(|c| matches!(c, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E'))
         {
             self.i += 1;
         }
-        let text: String = self.b[start..self.i].iter().collect();
+        // ASCII by construction, so `from_utf8` is infallible in practice.
+        let text =
+            core::str::from_utf8(&self.b[start..self.i]).map_err(|_| "bad number".to_string())?;
         text.parse::<f64>()
-            .map(Json::Num)
             .map_err(|_| format!("bad number `{text}`"))
     }
 
     fn boolean(&mut self) -> Result<Json, String> {
-        if self.b.get(self.i) == Some(&'t') {
-            self.keyword("true", Json::Bool(true))
+        Ok(Json::Bool(self.bool_raw()?))
+    }
+
+    fn bool_raw(&mut self) -> Result<bool, String> {
+        if self.b.get(self.i) == Some(&b't') {
+            self.keyword("true", Json::Null)?;
+            Ok(true)
         } else {
-            self.keyword("false", Json::Bool(false))
+            self.keyword("false", Json::Null)?;
+            Ok(false)
         }
     }
 
     fn keyword(&mut self, word: &str, val: Json) -> Result<Json, String> {
-        for c in word.chars() {
+        for &c in word.as_bytes() {
             if self.b.get(self.i) != Some(&c) {
                 return Err(format!("expected `{word}` at char {}", self.i));
             }
@@ -838,11 +1012,276 @@ impl JsonParser {
         }
         Ok(val)
     }
+
+    // --- direct-into-record parsing (no intermediate `Json` tree) ---------------
+    //
+    // The NDJSON decode hot path parses each line straight into a [`Rec`] and its
+    // property values straight into [`Value`], byte-identical to the old `parse_line`
+    // + field-extraction (`json_id`/`json_str_array`/`json_props`/`json_value`) it
+    // replaces — it just skips allocating the `Json` tree in between.
+
+    /// A JSON value AS a property [`Value`] — the direct twin of `json_value`
+    /// (temporal-tag and record aware).
+    fn value_as_value(&mut self) -> Result<Value, String> {
+        self.ws();
+        match self.b.get(self.i) {
+            Some(b'{') => self.object_as_value(),
+            Some(b'[') => {
+                self.i += 1; // '['
+                let mut items = Vec::new();
+                self.ws();
+                if self.b.get(self.i) == Some(&b']') {
+                    self.i += 1;
+                    return Ok(Value::List(items));
+                }
+                loop {
+                    items.push(self.value_as_value()?);
+                    self.ws();
+                    match self.b.get(self.i) {
+                        Some(b',') => self.i += 1,
+                        Some(b']') => {
+                            self.i += 1;
+                            return Ok(Value::List(items));
+                        }
+                        _ => return Err(format!("expected ',' or ']' at char {}", self.i)),
+                    }
+                }
+            }
+            Some(b'"') => Ok(Value::Str(GStr::from(self.string()?.as_str()))),
+            Some(b't') | Some(b'f') => Ok(Value::Bool(self.bool_raw()?)),
+            Some(b'n') => {
+                self.keyword("null", Json::Null)?;
+                Ok(Value::Null)
+            }
+            Some(c) if *c == b'-' || c.is_ascii_digit() => Ok(Value::Num(self.number_f64()?)),
+            other => Err(format!("unexpected {other:?} at char {}", self.i)),
+        }
+    }
+
+    /// The `{…}` case of [`value_as_value`]: a single-key `{"@<tag>":"<iso>"}` is a
+    /// tagged temporal (inverse of the egress); any other object is a record. Mirrors
+    /// `json_value`'s object branch exactly.
+    fn object_as_value(&mut self) -> Result<Value, String> {
+        let pairs = self.pairs()?;
+        if let [(key, Value::Str(s))] = pairs.as_slice() {
+            if let Some(tag) = key.strip_prefix('@') {
+                if matches!(
+                    tag,
+                    "date"
+                        | "localtime"
+                        | "datetime"
+                        | "zoned_time"
+                        | "zoned_datetime"
+                        | "duration"
+                ) {
+                    return crate::temporal::Temporal::parse(tag, s.as_str())
+                        .map(Value::Temporal)
+                        .map_err(|e| format!("bad temporal value: {e}"));
+                }
+            }
+        }
+        let pairs: Vec<(GStr, Value)> = pairs
+            .into_iter()
+            .map(|(k, v)| (GStr::from(k.as_str()), v))
+            .collect();
+        Ok(crate::value::make_record(pairs))
+    }
+
+    /// Parse a `{"k": value, …}` object into its `(key, Value)` pairs in source order
+    /// (the input to `properties` and to a record). Assumes the cursor is at `{`.
+    fn pairs(&mut self) -> Result<Vec<(String, Value)>, String> {
+        self.i += 1; // '{'
+        let mut out = Vec::new();
+        self.ws();
+        if self.b.get(self.i) == Some(&b'}') {
+            self.i += 1;
+            return Ok(out);
+        }
+        loop {
+            self.ws();
+            let key = self.string()?;
+            self.ws();
+            if self.b.get(self.i) != Some(&b':') {
+                return Err(format!("expected ':' at char {}", self.i));
+            }
+            self.i += 1;
+            let val = self.value_as_value()?;
+            out.push((key, val));
+            self.ws();
+            match self.b.get(self.i) {
+                Some(b',') => self.i += 1,
+                Some(b'}') => {
+                    self.i += 1;
+                    return Ok(out);
+                }
+                _ => return Err(format!("expected ',' or '}}' at char {}", self.i)),
+            }
+        }
+    }
+
+    /// An element id, accepted as a JSON string OR an integer-valued number (rendered
+    /// as its integer text) — `json_id` without the `Json`.
+    fn id_as_string(&mut self) -> Result<String, String> {
+        self.ws();
+        match self.b.get(self.i) {
+            Some(b'"') => self.string(),
+            Some(c) if *c == b'-' || c.is_ascii_digit() => {
+                let n = self.number_f64()?;
+                if n.fract() == 0.0 {
+                    Ok((n as i64).to_string())
+                } else {
+                    Err("expected an id (string or integer)".into())
+                }
+            }
+            _ => Err("expected an id (string or integer)".into()),
+        }
+    }
+
+    /// A JSON array of strings — `json_str_array` without the `Json`.
+    fn string_array(&mut self) -> Result<Vec<String>, String> {
+        self.ws();
+        if self.b.get(self.i) != Some(&b'[') {
+            return Err("expected an array of strings".into());
+        }
+        self.i += 1;
+        let mut out = Vec::new();
+        self.ws();
+        if self.b.get(self.i) == Some(&b']') {
+            self.i += 1;
+            return Ok(out);
+        }
+        loop {
+            self.ws();
+            out.push(self.string()?);
+            self.ws();
+            match self.b.get(self.i) {
+                Some(b',') => self.i += 1,
+                Some(b']') => {
+                    self.i += 1;
+                    return Ok(out);
+                }
+                _ => return Err(format!("expected ',' or ']' at char {}", self.i)),
+            }
+        }
+    }
+
+    /// Consume and discard one JSON value (an unknown top-level key). Rare on the
+    /// shipped shapes, so it reuses the general `value()` parser.
+    fn skip_value(&mut self) -> Result<(), String> {
+        self.value().map(|_| ())
+    }
+
+    /// Parse ONE ndjson line's top-level object directly into a [`Rec`], routing known
+    /// keys straight into typed fields. Byte-identical to `parse_line` + the field
+    /// extraction in `stage_lines` it replaces.
+    fn record(&mut self) -> Result<Rec, String> {
+        self.ws();
+        if self.b.get(self.i) != Some(&b'{') {
+            return Err("expected a JSON object".into());
+        }
+        self.i += 1;
+        let mut id: Option<String> = None;
+        let mut labels: Option<Vec<String>> = None;
+        let mut props: Option<Vec<(String, Value)>> = None;
+        let mut from: Option<String> = None;
+        let mut to: Option<String> = None;
+        let mut ty: Option<String> = None;
+        let mut schema: Option<String> = None;
+        let mut s_label: Option<String> = None;
+        let mut s_keys: Option<Vec<String>> = None;
+        let mut s_key: Option<String> = None;
+
+        self.ws();
+        if self.b.get(self.i) == Some(&b'}') {
+            self.i += 1;
+        } else {
+            loop {
+                self.ws();
+                let key = self.string()?;
+                self.ws();
+                if self.b.get(self.i) != Some(&b':') {
+                    return Err(format!("expected ':' at char {}", self.i));
+                }
+                self.i += 1;
+                match key.as_str() {
+                    "id" => id = Some(self.id_as_string()?),
+                    "labels" => labels = Some(self.string_array()?),
+                    // `properties` OR the engine's earlier `props`; last-wins if both.
+                    "properties" | "props" => props = Some(self.pairs()?),
+                    "from" => from = Some(self.id_as_string()?),
+                    "to" => to = Some(self.id_as_string()?),
+                    "type" => ty = Some(self.string()?),
+                    "schema" => schema = Some(self.string()?),
+                    "label" => s_label = Some(self.string()?),
+                    "keys" => s_keys = Some(self.string_array()?),
+                    "key" => s_key = Some(self.string()?),
+                    _ => self.skip_value()?,
+                }
+                self.ws();
+                match self.b.get(self.i) {
+                    Some(b',') => self.i += 1,
+                    Some(b'}') => {
+                        self.i += 1;
+                        break;
+                    }
+                    _ => return Err(format!("expected ',' or '}}' at char {}", self.i)),
+                }
+            }
+        }
+
+        // Route exactly like the old field-extraction: a `schema` line first, else an
+        // edge (told by `from`), else a node.
+        if let Some(kind) = schema {
+            return match kind.as_str() {
+                "unique" => Ok(Rec::Unique(
+                    s_label.ok_or("missing field `label`")?,
+                    s_keys.ok_or("missing field `keys`")?,
+                )),
+                "required" => Ok(Rec::Required(
+                    s_label.ok_or("missing field `label`")?,
+                    s_key.ok_or("missing field `key`")?,
+                )),
+                _ => Err("unknown schema kind".into()),
+            };
+        }
+        let props = props.unwrap_or_default();
+        if let Some(from) = from {
+            let to = to.ok_or("missing field `to`")?;
+            let labels = match labels {
+                Some(l) => l,
+                // Legacy single-type edge: `type` is the edge type (never "edge").
+                None => match ty.filter(|t| t != "edge") {
+                    Some(t) => vec![t],
+                    None => return Err("edge needs `labels` (or a legacy `type`)".into()),
+                },
+            };
+            if labels.is_empty() {
+                return Err("edge `labels` must have at least one entry".into());
+            }
+            return Ok(Rec::Edge((from, to, id, labels, props)));
+        }
+        Ok(Rec::Node((
+            id.ok_or("missing field `id`")?,
+            labels.ok_or("missing field `labels`")?,
+            props,
+        )))
+    }
+}
+
+/// One decoded NDJSON line routed to its destination — the direct-parse result that
+/// replaces building a `Json` tree then extracting fields.
+enum Rec {
+    Node(NodeRec),
+    Edge(EdgeRec),
+    Unique(String, Vec<String>),
+    Required(String, String),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{from_ndjson, merge_ndjson, snapshot, to_ndjson};
+    use super::{
+        from_ndjson, from_ndjson_threads, merge_ndjson, snapshot, to_ndjson, to_ndjson_threads,
+    };
     use crate::store::Builder;
     use crate::value::Value;
 
@@ -1208,5 +1647,86 @@ mod tests {
         // …and a fresh email still inserts fine.
         let ok = crate::gql::parse("INSERT (:User {email: 'c@x'})").unwrap();
         assert!(execute(&ok, &mut st2).is_ok());
+    }
+
+    /// Parallel NDJSON encode is byte-for-byte identical to serial at any thread count —
+    /// nodes/edges are split on contiguous id ranges and concatenated in order, so no
+    /// bytes move. (On a build without the `parallel` feature both run serial.)
+    #[test]
+    fn encode_is_byte_identical_across_thread_counts() {
+        let mut b = Builder::default();
+        let n = 500usize;
+        let ids: Vec<u32> = (0..n)
+            .map(|i| {
+                b.node(
+                    &["Person", if i % 3 == 0 { "Admin" } else { "User" }],
+                    &[
+                        ("name", s(&format!("p{i}"))),
+                        ("age", Value::Num(20.0 + (i % 40) as f64)),
+                    ],
+                )
+            })
+            .collect();
+        for i in 0..n {
+            b.edge(ids[i], ids[(i * 7 + 3) % n], "KNOWS");
+            b.edge(ids[i], ids[(i * 13 + 1) % n], "FOLLOWS");
+        }
+        let st = b.build();
+        let serial = to_ndjson_threads(&st, 1);
+        assert_eq!(
+            serial,
+            to_ndjson_threads(&st, 4),
+            "4-thread encode diverged"
+        );
+        assert_eq!(
+            serial,
+            to_ndjson_threads(&st, 8),
+            "8-thread encode diverged"
+        );
+        assert_eq!(
+            serial,
+            to_ndjson_threads(&st, 16),
+            "16-thread encode diverged"
+        );
+        // And the default wrapper equals the serial form on an unconfigured store.
+        assert_eq!(serial, to_ndjson(&st));
+        // Round-trips.
+        assert_eq!(serial, to_ndjson(&from_ndjson(&serial).unwrap()));
+    }
+
+    /// Parallel NDJSON decode is byte-for-byte identical to serial at any thread count:
+    /// the parse fans out over contiguous line-chunks but the store build stays serial,
+    /// so dense ids are assigned in input order. (Compared via the serial re-encode,
+    /// which is identical iff the stores hold the same ids/order/data.)
+    #[test]
+    fn decode_is_byte_identical_across_thread_counts() {
+        let n = 2000usize;
+        let mut doc = String::new();
+        for i in 0..n {
+            doc.push_str(&format!(
+                "{{\"type\":\"node\",\"id\":\"{i}\",\"labels\":[\"Person\"],\"properties\":{{\"name\":\"p{i}\",\"age\":{}}}}}\n",
+                20 + i % 40
+            ));
+        }
+        for i in 0..n {
+            for d in [1usize, 7, 13] {
+                doc.push_str(&format!(
+                    "{{\"type\":\"edge\",\"id\":\"e{}\",\"labels\":[\"KNOWS\"],\"from\":\"{i}\",\"to\":\"{}\",\"properties\":{{}}}}\n",
+                    i * 3 + d,
+                    (i * d + 3) % n
+                ));
+            }
+        }
+        let reference = to_ndjson_threads(&from_ndjson_threads(&doc, 1).unwrap(), 1);
+        for t in [2u32, 4, 8, 16] {
+            let st = from_ndjson_threads(&doc, t).unwrap();
+            assert_eq!(
+                reference,
+                to_ndjson_threads(&st, 1),
+                "decode diverged at {t} threads"
+            );
+        }
+        // The serial `from_ndjson` wrapper agrees too.
+        assert_eq!(reference, to_ndjson_threads(&from_ndjson(&doc).unwrap(), 1));
     }
 }

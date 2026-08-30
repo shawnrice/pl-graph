@@ -18,6 +18,7 @@ import {
   CONFIG_IDS,
   fromTaggedJson,
   isTemporal,
+  PARALLELISM_CONFIG_ID,
   TEMPORAL_TAG_KEYS,
   temporalLiteralParts,
 } from '@lenke/core';
@@ -52,6 +53,15 @@ export type GraphConfigOptions = {
   limits?: Partial<GraphLimits>;
   /** Shorthand for `limits.operatorChain`; the two are the same setting. */
   maxOperatorChain?: number;
+  /**
+   * Opt-in multicore for the in-engine graph algorithms: the max worker threads they
+   * may use (default `1` = serial). A value > 1 runs betweenness / closeness /
+   * PageRank / label-propagation / peer-pressure on a DEDICATED, bounded pool of that
+   * size — never the global pool, so it will not starve the host event loop. Results
+   * are byte-identical at any thread count. No effect on the wasm build (no threads);
+   * a per-call `threads` on an algorithm config overrides this graph-level default.
+   */
+  parallelism?: number;
 };
 
 /** A decoded result row: column name → cell value. */
@@ -818,8 +828,11 @@ export type RustGraph = {
   /**
    * The graph algorithms — each runs the whole computation natively and resolves a
    * `Promise` of `{ node, … }` rows in insertion order. On the Node/napi backend
-   * the run happens **off the JS thread** (on the libuv threadpool, keeping the
-   * engine's internal parallelism), so the event loop stays free; while the promise
+   * the run happens **off the JS thread** (on a libuv threadpool thread), so the
+   * event loop stays free; by default the algorithm itself runs single-threaded —
+   * pass `threads` (or set the graph's `parallelism`) to opt into a bounded multicore
+   * pool for the float-heavy ones (betweenness/closeness/PageRank/label-propagation/
+   * peer-pressure), byte-identical to serial. While the promise
    * is pending the graph is single-flight-locked (any other call on it throws until
    * it settles — the off-thread read must not race a mutation). On the bun:ffi /
    * wasm backends (no threadpool) they resolve the same rows but the run blocks;
@@ -1311,20 +1324,52 @@ const applyGraphConfig = (
       );
     }
   }
+
+  // Opt-in multicore for the graph algorithms. `1` is the serial default (the store's
+  // default too), so only a value > 1 crosses the boundary — this keeps the common
+  // case working on an older artifact that predates the `parallelism` config id.
+  if (opts.parallelism !== undefined) {
+    if (!Number.isInteger(opts.parallelism) || opts.parallelism < 1) {
+      throw new LenkeError(`parallelism must be a positive integer, got ${opts.parallelism}`, {
+        code: ErrorCode.InvalidValue,
+      });
+    }
+
+    if (
+      opts.parallelism > 1 &&
+      !backend.setConfig(handle, PARALLELISM_CONFIG_ID, opts.parallelism)
+    ) {
+      throw new LenkeError(
+        'the loaded lenke artifact does not support the `parallelism` setting; rebuild the native crate',
+        { code: ErrorCode.InvalidValue },
+      );
+    }
+  }
 };
 
 export const graphFromNdjson = (
   backend: Backend,
   input: string | Uint8Array,
+  // `parallel` is a legacy no-op (kept so old call sites still type-check); use
+  // `parallelism` — it both parallelizes THIS decode's parse AND becomes the graph's
+  // default for later algorithm/encode runs.
   opts: GraphConfigOptions & { parallel?: boolean } = {},
 ): RustGraph => {
   // Accepts the text form as well as bytes: NDJSON is a text format, and needing
   // to hand-encode it was why most callers reached for `graphFromFormat(…,
   // 'ndjson')` instead of this, the dedicated entry point.
   const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
+  // Parallelize the parse when the caller opted into multicore (a valid, >1 value);
+  // applyGraphConfig below validates `parallelism` fully and persists it on the store.
+  const threads =
+    typeof opts.parallelism === 'number' &&
+    Number.isInteger(opts.parallelism) &&
+    opts.parallelism > 1
+      ? opts.parallelism
+      : 1;
   const handle = backend.graphFromNdjson(
     bytes.byteLength === 0 ? new TextEncoder().encode('\n') : bytes,
-    opts.parallel ?? true,
+    threads,
   );
 
   applyGraphConfig(backend, handle, opts);

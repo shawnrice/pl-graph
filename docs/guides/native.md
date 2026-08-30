@@ -25,7 +25,7 @@ const rows = g.query`MATCH (p:Person) RETURN p.name AS name`;
 ```ts
 import { Graph } from '@lenke/node';
 
-const g = Graph.fromNdjson(ndjsonBuffer, /* parallel */ true);
+const g = Graph.fromNdjson(ndjsonBuffer);
 const buf = g.query('MATCH (p:Person) RETURN p.name', undefined);
 ```
 

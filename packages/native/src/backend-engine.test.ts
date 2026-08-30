@@ -34,8 +34,8 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
   describe(name, () => {
     test('load + counts + query', async () => {
       const be = await make();
-      expect(be.abiVersion).toBe(18);
-      const g = be.graphFromNdjson(NDJSON, false);
+      expect(be.abiVersion).toBe(19);
+      const g = be.graphFromNdjson(NDJSON);
       expect(be.vertexCount(g)).toBe(2);
       expect(be.edgeCount(g)).toBe(1);
       expect(rows(be.queryRows(g, 'MATCH (n:P) RETURN count(*) AS c')).rows).toEqual([[2]]);
@@ -44,7 +44,7 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
 
     test('params + gremlin', async () => {
       const be = await make();
-      const g = be.graphFromNdjson(NDJSON, false);
+      const g = be.graphFromNdjson(NDJSON);
       const r = rows(
         be.queryRows(g, 'MATCH (n:P) WHERE n.name = $nm RETURN n.age AS a', '{"nm":"alice"}'),
       );
@@ -57,7 +57,7 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
 
     test('version + index round-trip', async () => {
       const be = await make();
-      const g = be.graphFromNdjson(NDJSON, false);
+      const g = be.graphFromNdjson(NDJSON);
       const v0 = be.version(g);
       be.queryRows(g, "MATCH (n:P) WHERE n.name = 'alice' SET n.age = 31");
       expect(be.version(g)).toBeGreaterThan(v0);
@@ -68,13 +68,12 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
 
     test('unique constraint: clean ok, violation throws', async () => {
       const be = await make();
-      const g = be.graphFromNdjson(NDJSON, false);
+      const g = be.graphFromNdjson(NDJSON);
       be.createUniqueConstraint(g, 'P', 'name'); // distinct names → ok
       const dup = be.graphFromNdjson(
         enc.encode(
           '{"id":"1","labels":["P"],"props":{"e":"x"}}\n{"id":"2","labels":["P"],"props":{"e":"x"}}\n',
         ),
-        false,
       );
       let threw = false;
 
@@ -92,7 +91,7 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
 
     test('prepared statement: reuse, then use-after-free is a clean error', async () => {
       const be = await make();
-      const g = be.graphFromNdjson(NDJSON, false);
+      const g = be.graphFromNdjson(NDJSON);
       const p = be.prepare('MATCH (n:P) WHERE n.name = $nm RETURN n.age AS a');
       expect(rows(be.preparedQueryRows(p, g, '{"nm":"alice"}')).rows).toEqual([[30]]);
       expect(rows(be.preparedQueryRows(p, g, '{"nm":"bob"}')).rows).toEqual([[25]]);
@@ -103,9 +102,9 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
 
     test('snapshot round-trips (ndjson + binary)', async () => {
       const be = await make();
-      const g = be.graphFromNdjson(NDJSON, false);
+      const g = be.graphFromNdjson(NDJSON);
       const asNdjson = be.encodeNdjson(g);
-      const g2 = be.graphFromNdjson(asNdjson, false);
+      const g2 = be.graphFromNdjson(asNdjson);
       expect(be.vertexCount(g2)).toBe(2);
       const asBinary = be.serialize(g, 'binary');
       const g3 = be.deserialize(asBinary, 'binary');
@@ -116,7 +115,7 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
 
     test('textual codecs round-trip (pg-json, pg-text, graphson, csv)', async () => {
       const be = await make();
-      const g = be.graphFromNdjson(NDJSON, false);
+      const g = be.graphFromNdjson(NDJSON);
 
       for (const fmt of ['pg-json', 'pg-text', 'graphson', 'csv']) {
         const blob = be.serialize(g, fmt);
@@ -131,7 +130,7 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
 
     test('mergeNdjson is first-wins and reports skips + phantoms', async () => {
       const be = await make();
-      const g = be.graphFromNdjson(NDJSON, false); // nodes "1","2"
+      const g = be.graphFromNdjson(NDJSON); // nodes "1","2"
       const report = be.mergeNdjson(
         g,
         enc.encode(
@@ -154,14 +153,14 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
 
     test('an unknown serialization format is reported', async () => {
       const be = await make();
-      const g = be.graphFromNdjson(NDJSON, false);
+      const g = be.graphFromNdjson(NDJSON);
       expect(() => be.serialize(g, 'nope')).toThrow();
       be.graphFree(g);
     });
 
     test('constraints enforce and reject on write (type / cardinality / validator / invariant)', async () => {
       const be = await make();
-      const g = be.graphFromNdjson(NDJSON, false);
+      const g = be.graphFromNdjson(NDJSON);
       // Each declaration succeeds against the conforming seed data.
       be.createTypeConstraint(g, 'P', 'age', 'number');
       be.createValidator(g, 'P', 'p', 'p.age >= 0');
@@ -184,7 +183,7 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
 
     test('dropIndex, edge constraints, and dumpSchema round-trip', async () => {
       const be = await make();
-      const g = be.graphFromNdjson(NDJSON, false);
+      const g = be.graphFromNdjson(NDJSON);
       be.createIndex(g, 'vertex', 'hash', ['age']);
       expect(be.vertexIndexes(g)).toContain('age');
       be.dropVertexIndex(g, 'age');
@@ -201,7 +200,7 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
 
     test('direct algorithm run returns a node/result rowset', async () => {
       const be = await make();
-      const g = be.graphFromNdjson(NDJSON, false);
+      const g = be.graphFromNdjson(NDJSON);
       const out = JSON.parse(dec.decode(be.algo(g, 'degree', '{"direction":"out"}'))) as {
         columns: string[];
         rows: unknown[][];
@@ -213,7 +212,7 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
 
     test('prepared statement can return an Arrow carrier', async () => {
       const be = await make();
-      const g = be.graphFromNdjson(NDJSON, false);
+      const g = be.graphFromNdjson(NDJSON);
       const p = be.prepare('MATCH (n:P) RETURN n.age AS a');
       const arrow = be.preparedQueryArrow(p, g);
       expect(arrow.byteLength).toBeGreaterThan(0);

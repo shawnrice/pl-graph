@@ -27,7 +27,7 @@ type WasmExports = {
   lnk_dealloc: (ptr: number, len: number) => void;
   lnk_free: (ptr: number, len: number) => void;
   lnk_last_error_json: (outLen: number) => number;
-  lnk_open: (ptr: number, len: number, format: number) => number;
+  lnk_open: (ptr: number, len: number, format: number, threads: number) => number;
   lnk_close: (h: number) => void;
   lnk_clone: (h: number) => number;
   // `value` is u64 → an i64 wasm param, so it crosses the boundary as a BigInt.
@@ -165,11 +165,12 @@ export const createWasmEngineBackend = async (source: WasmSource): Promise<Backe
 
   const abi: EngineAbi = {
     abiVersion,
-    open: (bytes, format) => {
+    open: (bytes, format, threads = 1) => {
       const p = bytes ? writeBytes(bytes) : 0;
 
       try {
-        const h = ex.lnk_open(p, bytes ? bytes.byteLength : 0, format);
+        // wasm has no threads; `threads` is passed for ABI shape and ignored engine-side.
+        const h = ex.lnk_open(p, bytes ? bytes.byteLength : 0, format, threads);
 
         if (!h) {
           return fail('open', ErrorCode.InvalidJson);

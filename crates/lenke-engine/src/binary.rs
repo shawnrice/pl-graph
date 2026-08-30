@@ -416,12 +416,15 @@ pub fn from_binary(bytes: &[u8]) -> Result<Store, String> {
         None
     };
 
-    let mut store = build_store(StagedNdjson {
-        constraints,
-        required,
-        nodes,
-        edges,
-    })?;
+    let mut store = build_store(
+        StagedNdjson {
+            constraints,
+            required,
+            nodes,
+            edges,
+        },
+        1,
+    )?;
     if let Some(x) = extra {
         x.apply(&mut store)?;
     }

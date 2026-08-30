@@ -576,7 +576,7 @@ Prefer a bounded quantifier (\`->{1,5}\`) to an open \`->*\` when you can. Consu
 Prefer one aggregate or bulk operation over many wide per-node \`SET\`s. For per-node feature vectors, \`neighbor_aggregate\` writes the whole block in one pass (see the \`graph-ml\` guide).
 
 ## Memory envelope
-An in-memory graph takes **several times its NDJSON text size** in memory; a whole-graph algorithm roughly doubles peak memory over the resident graph. \`graphFromNdjson\` decodes in parallel and loads quickly.
+An in-memory graph takes **several times its NDJSON text size** in memory; a whole-graph algorithm roughly doubles peak memory over the resident graph. \`graphFromNdjson\` bulk-loads quickly, and a graph-level \`parallelism\` > 1 also parallelizes the NDJSON **decode** (~2.5x on a large document; byte-identical). The float-heavy graph algorithms (betweenness/closeness/PageRank/label-propagation/peer-pressure) and NDJSON **encode** are likewise single-threaded by default but take **opt-in multicore** on the native engine — pass \`parallelism\` (or a per-call \`threads\` on an algorithm) to run them on a bounded, dedicated pool (byte-identical to serial; never the global pool, so the host isn't starved).
 
 **Resource ceilings** are set at construction and fixed for the graph's life — they are host policy, so a query can never raise its own:
 \`\`\`ts
