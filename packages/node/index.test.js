@@ -51,8 +51,8 @@ const LANG_GQL = 0;
 const LANG_GREMLIN = 1;
 const openNdjson = () => Graph.open(NDJSON, FMT_NDJSON);
 
-test('abiVersion matches the C ABI (18)', () => {
-  assert.equal(abiVersion(), 18);
+test('abiVersion matches the C ABI (19)', () => {
+  assert.equal(abiVersion(), 19);
 });
 
 test('open decodes counts (stat: 0 = vertices, 1 = edges)', () => {
@@ -177,7 +177,7 @@ test('createNodeBackend errors are coded LenkeErrors (parity with ffi/wasm)', ()
 
 test('createNodeBackend powers the @lenke/native facade + liveQuery', () => {
   const backend = createNodeBackend();
-  assert.equal(backend.abiVersion, 18);
+  assert.equal(backend.abiVersion, 19);
 
   const g = graphFromNdjson(backend, NDJSON);
   const store = createStore(g);
