@@ -904,6 +904,16 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 }
             }
             let mut out = b.gather(&keep);
+            // Record the landed vertex into the lineage node path (not just the new slot):
+            // an endpoint move traverses no new edge, so `extend_nodes` appends the vertex
+            // and leaves the edge path alone. A following `otherV` after a branch reads this
+            // vertex as its reference — without it a reconverged `outV().inE(..)` arm keeps
+            // only the neighbour and `otherV` resolves against the wrong endpoint.
+            if track {
+                if let Some(lin) = b.lineage.as_ref() {
+                    out.lineage = Some(lin.extend_nodes(&keep, &nodes));
+                }
+            }
             out.slots.push(Col::Nodes(nodes));
             out
         }
@@ -4100,6 +4110,12 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
                 }
             }
             let mut out = b.gather(&keep);
+            // Mirror the main EdgeVertex arm: record the landed vertex into the lineage node
+            // path so a following branch-separated `otherV` reads it as its reference. A no-op
+            // on the usual streaming (`!track`) input, which carries no lineage.
+            if let Some(lin) = b.lineage.as_ref() {
+                out.lineage = Some(lin.extend_nodes(&keep, &nodes));
+            }
             out.slots.push(Col::Nodes(nodes));
             out
         }

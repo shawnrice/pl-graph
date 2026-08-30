@@ -306,6 +306,49 @@ impl Lineage {
         }
     }
 
+    /// One output path per `(keep[k], new_nodes[k])`: the input row `keep[k]`'s
+    /// node path extended by the landed VERTEX, with the edge path and step-history
+    /// carried through unchanged. This is what an endpoint move (`outV`/`inV`/
+    /// `otherV`/`bothV` off an edge frontier) produces: unlike [`extend`] it traverses
+    /// no new edge, it just moves the traverser onto an endpoint vertex — so the node
+    /// path records that vertex (a following `otherV` reads it as the reference), but
+    /// the edge path does not gain an entry. Without it a branch arm's
+    /// `outV().inE(..)` loses the pre-edge vertex and a post-branch `otherV` resolves
+    /// against the wrong endpoint.
+    #[must_use]
+    pub fn extend_nodes(&self, keep: &[usize], new_nodes: &[u32]) -> Self {
+        let mut values = Vec::new();
+        let mut offsets = vec![0usize];
+        let mut edges = Vec::new();
+        let mut edge_offsets = vec![0usize];
+        let mut steps = Vec::new();
+        let mut step_tag = Vec::new();
+        let mut step_off = vec![0usize];
+        let has_steps = self.step_off.len() > 1;
+        for (i, &k) in keep.iter().enumerate() {
+            values.extend_from_slice(self.path_at(k));
+            values.push(Value::Num(f64::from(new_nodes[i])));
+            offsets.push(values.len());
+            edges.extend_from_slice(self.edges_at(k));
+            edge_offsets.push(edges.len());
+            if has_steps {
+                let (sv, st) = self.steps_at(k);
+                steps.extend_from_slice(sv);
+                step_tag.extend_from_slice(st);
+            }
+            step_off.push(steps.len());
+        }
+        Self {
+            values,
+            offsets,
+            edges,
+            edge_offsets,
+            steps,
+            step_tag,
+            step_off,
+        }
+    }
+
     /// Concatenate several sidecars row-wise (union/coalesce branch output): each
     /// input's paths in order, so the result is row-aligned with concatenated slot
     /// columns.
