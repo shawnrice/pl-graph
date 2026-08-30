@@ -6,7 +6,7 @@ import path from 'node:path';
 // lint rule CANNOT catch: a package that depends on the compiled Rust engine by
 // loading its artifact at runtime — `createFfiEngineBackend('…/liblenke_engine.so')` or
 // the wasm module by path. There is no import, so nx's project graph sees no edge
-// to lenke-core. If such a package's nx `test` target does not key on `rustEngine`,
+// to lenke-engine. If such a package's nx `test` target does not key on `rustEngine`,
 // a Rust-only change leaves its cache key unchanged and nx serves a STALE PASS
 // (exactly the class of bug that let a broken native test cache as green).
 //

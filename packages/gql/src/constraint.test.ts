@@ -17,7 +17,7 @@ const codeOf = (fn: () => unknown): unknown => {
   throw new Error('expected a throw, got a normal return');
 };
 
-// Byte-identical with the Rust core's constraint tests
+// Byte-identical with the Rust engine's constraint tests
 // (crates/lenke-engine/src/gql/tests.rs). See docs/design/gql-extensions.md §3.
 describe('GQL: unique constraints', () => {
   test('enforced on INSERT and SET; per-label; a self-set is not a collision', () => {

@@ -1,5 +1,5 @@
 /**
- * `@lenke/native` — the Rust columnar core, callable from JS/TS.
+ * `@lenke/native` — the Rust columnar engine, callable from JS/TS.
  *
  * One C ABI, two backends over the lenke-engine C ABI behind a single
  * {@link Backend} contract. The backends live behind subpath exports so that

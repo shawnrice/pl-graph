@@ -3,7 +3,7 @@
  *
  * This is what makes the typed fluent API portable: author once as a `Plan`, run
  * it directly on the TS engine, or emit Groovy and run the identical traversal on
- * the Rust core via `graph.gremlin(text)`. It also absorbs the two dialects'
+ * the Rust engine via `graph.gremlin(text)`. It also absorbs the two dialects'
  * spelling differences (`in_`/`dedupe` here, `in`/`dedup` in the text dialect), so
  * callers never see them.
  *

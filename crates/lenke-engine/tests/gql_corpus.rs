@@ -1,7 +1,7 @@
 //! GQL conformance corpus — an engine regression snapshot.
 //!
 //! ~1200 curated GQL read/write cases (`tests/gql_corpus/*.jsonl`), each a
-//! core-dialect NDJSON `fixture` and a `query`. This was a differential against
+//! the now-removed lenke-core's dialect NDJSON `fixture` and a `query`. This was a differential against
 //! `lenke-core`; core has since been deleted, its byte-identity contract now upheld
 //! by the TS engine fuzzers. The frozen `snapshots.jsonl` — captured while core still
 //! existed and the differential was green, so each recorded outcome equals core's
@@ -107,8 +107,8 @@ fn outcome_from_json(j: &J) -> Outcome {
     Outcome::Rows(rows)
 }
 
-// ── fixture conversion: core-dialect NDJSON → engine dialect ─────────────────
-/// One core NDJSON line → the engine's dialect (`{"id","labels","props"}` for a
+// ── fixture conversion: the now-removed lenke-core's dialect NDJSON → engine dialect ──
+/// One now-removed lenke-core NDJSON line → the engine's dialect (`{"id","labels","props"}` for a
 /// node, `{"id"?,"from","to","labels","props"}` for an edge). Returns `None` to drop
 /// a line that is not node/edge data (a schema op the engine loader does not need).
 fn core_line_to_engine(line: &str) -> Option<String> {
@@ -157,13 +157,13 @@ fn core_line_to_engine(line: &str) -> Option<String> {
     }
 }
 
-/// The TinkerPop "Modern" graph (core-dialect NDJSON) — many cases set
+/// The TinkerPop "Modern" graph (the now-removed lenke-core's dialect NDJSON) — many cases set
 /// `"fixture": "@modern"` instead of inlining these lines. Vendored into the engine
 /// test tree (was `../lenke-core/src/fixtures/modern_gql.ndjson`).
 const MODERN: &str = include_str!("fixtures/modern_gql.ndjson");
 
 /// Resolve a `fixture` field: `@modern` → the Modern graph, else the string is the
-/// fixture's core-dialect NDJSON verbatim.
+/// fixture's now-removed lenke-core dialect NDJSON verbatim.
 fn resolve_fixture(fixture: &str) -> &str {
     match fixture.trim() {
         "@modern" => MODERN,

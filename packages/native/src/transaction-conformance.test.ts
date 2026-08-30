@@ -1,7 +1,7 @@
 // Cross-engine differential for transactions. The SAME transaction scripts — explicit
 // begin/commit/rollback around GQL statements, plus per-statement atomicity and
 // deferred constraint checks — run on BOTH the TS engine (@lenke/core + @lenke/gql)
-// and the Rust core (over bun:ffi), asserting the two agree on every outcome AND
+// and the Rust engine (over bun:ffi), asserting the two agree on every outcome AND
 // on the resulting graph state byte-for-byte.
 //
 // Run: bun test packages/native/src/transaction-conformance.test.ts

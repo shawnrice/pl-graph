@@ -2,7 +2,7 @@
  * ISO/IEC 39075 temporal values — `DATE`, `LOCAL TIME`, `LOCAL DATETIME`,
  * `ZONED TIME`, `ZONED DATETIME`, `DURATION`.
  *
- * A byte-for-byte port of the Rust core's `temporal` module: the calendar math
+ * A byte-for-byte port of the now-removed lenke-core's `temporal` module: the calendar math
  * is Howard Hinnant's civil-from-days algorithm and the ISO-8601 parse/format is
  * hand-rolled, so both engines produce the identical wire string. **Byte-identity
  * is defined by the ISO-8601 string (`format`) and the comparison order**, not by

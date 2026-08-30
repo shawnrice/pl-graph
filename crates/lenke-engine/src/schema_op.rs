@@ -26,7 +26,7 @@ use crate::store::Store;
 
 /// Why a schema op could not be applied. Each carries the wire code the C ABI
 /// reports (via `lnk_schema_apply`), so a host maps a declaration failure to the
-/// same `LenkeError` core would raise: `BadRequest`→`E_FFI`(-1),
+/// same `LenkeError` the TS engine would raise: `BadRequest`→`E_FFI`(-1),
 /// `Invalid`→`E_INVALID_VALUE`(-1), `Syntax`→`E_SYNTAX`(-1),
 /// `GraphOp`→`E_INVALID_GRAPH_OP`(-1), `Rejected`→`E_CONSTRAINT_VIOLATION`(-2).
 #[derive(Debug)]

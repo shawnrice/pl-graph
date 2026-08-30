@@ -1,15 +1,15 @@
 //! JSON serialization of engine query results, for the CROSS-ENGINE COMPARISON harness
 //! (`packages/native`'s `backend-engine`). The engine's `Value`s are already
-//! byte-identical to core's, so this only has to match core's JSON STRUCTURE and key
+//! byte-identical to the TS engine's, so this only has to match the TS engine's JSON STRUCTURE and key
 //! order — the differential fuzzer compares `JSON.stringify(rows)` of the decoded
 //! values, not raw bytes, so a number's exact text does not matter (it round-trips
 //! through a JS `number`), but object key order and nesting do.
 //!
 //! Two entry points mirror the two FFI result shapes:
-//!   - [`gremlin_results_json`] — a bare JSON ARRAY of per-result values (like core's
+//!   - [`gremlin_results_json`] — a bare JSON ARRAY of per-result values (like the TS engine's
 //!     `lnk_gremlin_json`).
 //!   - [`gql_rows_json`] — a JSON ARRAY of ROW OBJECTS keyed by column name (the decoded
-//!     shape of core's `lnk_query_rows`).
+//!     shape of the TS engine's `lnk_query_rows`).
 
 use crate::exec::Rows;
 use crate::value::Value;
@@ -37,7 +37,7 @@ pub fn gremlin_results_json(rows: &Rows) -> String {
     out
 }
 
-/// GQL rows: the `{columns, rows}` document core's `lnk_query_rows` returns (its
+/// GQL rows: the `{columns, rows}` document the TS engine's `lnk_query_rows` returns (its
 /// `RowSet::to_json`), which the TS `decodeRows` zips into per-row objects. `columns`
 /// is the column-name list; `rows` is a positional matrix of cells.
 #[must_use]
@@ -77,7 +77,7 @@ mod tests {
     #[test]
     fn js_number_matches_js_tostring() {
         // Byte-for-byte JavaScript `Number.prototype.toString`, incl. the fixed /
-        // exponential threshold (n > 21 or n <= -6) and -0 → "0". Same fixture as core.
+        // exponential threshold (n > 21 or n <= -6) and -0 → "0". Same fixture as the TS engine.
         let cases: &[(f64, &str)] = &[
             (0.0, "0"),
             (-0.0, "0"),
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn non_finite_numbers_are_null() {
-        // JSON has no NaN/Infinity; core emits null too (NaN policy).
+        // JSON has no NaN/Infinity; the TS engine emits null too (NaN policy).
         let mut s = String::new();
         write_number(&mut s, f64::NAN);
         write_number(&mut s, f64::INFINITY);

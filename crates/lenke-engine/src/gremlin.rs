@@ -22,7 +22,7 @@ fn etypes_of(label: Option<&str>) -> Vec<String> {
 /// Reject a malformed NAME written by `addV`/`addE`/`property`: an empty name, or one
 /// containing the GraphSON multi-label separator `::` (which would break round-tripping
 /// through the codecs). Gremlin is otherwise permissive about arbitrary label/key
-/// strings — this only guards the write steps, matching the gate core applied there.
+/// strings — this only guards the write steps, matching the gate the TS engine applied there.
 fn check_write_name(kind: &str, name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err(format!("a {kind} must not be empty"));
@@ -606,7 +606,7 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                 let mut t = String::new();
                 i += 1;
                 // Decode the common escapes (`\n \t \r`, `\\`, `\'`) rather than
-                // dropping the backslash — byte-identical to core's lexer.
+                // dropping the backslash — byte-identical to the TS engine's lexer.
                 let mut terminated = false;
                 while i < b.len() {
                     let ch = b[i];
@@ -764,7 +764,7 @@ struct Parser {
     path_ok: bool,
     /// Named side-effect bags for `aggregate`/`store` → revealed by `cap`. Each entry
     /// snapshots the plan PREFIX and the current-slot expression at the point the bag
-    /// was filled, so `cap(key)` folds exactly that stream (matching core, where the
+    /// was filled, so `cap(key)` folds exactly that stream (matching the TS engine, where the
     /// bag holds the elements as they were at aggregate/store time, not after later
     /// value projections).
     caps: std::collections::HashMap<String, (Plan, Expr)>,
@@ -947,7 +947,7 @@ impl Parser {
         // A `select('k')` sub-traversal: the sort key is the entry `k` of the current
         // Map traverser (a `project()`/`group()` row). `select` on a Map projects the
         // entry — so `project(...).order().by(select('k'))` sorts by that field rather
-        // than erroring. Byte-identical to core's `evalBy(select('k'))` on the Map.
+        // than erroring. Byte-identical to the TS engine's `evalBy(select('k'))` on the Map.
         if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("select")) {
             self.bump();
             self.expect(&Tok::LParen)?;
@@ -1092,7 +1092,7 @@ impl Parser {
     /// after the opening `(`; leaves it AT the closing `)`). Supports the same key/id/
     /// label forms as [`by_key_expr`], the bare `by()` (the element itself), and a
     /// degree sub-traversal `[__.](out|in|both|outE|inE|bothE)('L'…).count()` — a
-    /// correlated `CountSubquery`, the only nested body core's projections use here.
+    /// correlated `CountSubquery`, the only nested body the TS engine's projections use here.
     fn project_by_body(&mut self, elem_slot: usize) -> Result<Expr, String> {
         // bare by() → the element itself.
         if self.peek() == Some(&Tok::RParen) {
@@ -2845,7 +2845,7 @@ impl Parser {
             }
             "values" => {
                 // values('k', …): emit the value of each listed property that is
-                // PRESENT on the element — an ABSENT property yields nothing (core
+                // PRESENT on the element — an ABSENT property yields nothing (the TS engine
                 // skips it; a present-but-null value is kept, per the null-first-class
                 // policy). Single key: filter-present then project. Multiple keys: a
                 // per-element branch over each present key.
@@ -3078,7 +3078,7 @@ impl Parser {
                 plan.filter(pred)
             }
             "elementmap" => {
-                // elementMap() → core's FLAT element map {id, label, <props…>} (plus
+                // elementMap() → the TS engine's FLAT element map {id, label, <props…>} (plus
                 // IN/OUT for edges); elementMap('k',…) filters the properties. Lowers
                 // to the gremlin-only `element_map` exec fn (element slot + key list).
                 let mut fn_args = vec![Expr::Slot(self.current)];
@@ -3258,7 +3258,7 @@ impl Parser {
             "where" => {
                 // Tagged key form `where('a', op('b'))`: keep traversers where the
                 // value at step-label `a` relates (op) to the value at label `b` — a
-                // slot-vs-slot comparison (core's WhereKey; the predicate's rhs is a
+                // slot-vs-slot comparison (the TS engine's WhereKey; the predicate's rhs is a
                 // step-label, not a literal). Detected by a leading string + comma.
                 if matches!(self.peek(), Some(Tok::Str(_)))
                     && self.toks.get(self.pos + 1) == Some(&Tok::Comma)
@@ -3335,7 +3335,7 @@ impl Parser {
                 } else {
                     // Predicate on the current value: `where(op(v))`. If the rhs is a
                     // single bound step-label — `where(neq('me'))` after tagging `me` —
-                    // compare the current value to that TAG's value (core's tagged
+                    // compare the current value to that TAG's value (the TS engine's tagged
                     // where); otherwise fall through to the literal-predicate path.
                     let tag_form = match (self.peek(), self.toks.get(self.pos + 1)) {
                         (Some(Tok::Ident(op)), Some(Tok::LParen)) => {
@@ -3871,7 +3871,7 @@ impl Parser {
                 }
                 self.expect(&Tok::RParen)?;
                 // Trailing `.by('key')` modulators project each selected element to a
-                // property; they CYCLE across the labels (core's `bys[i % bys.len()]`).
+                // property; they CYCLE across the labels (the TS engine's `bys[i % bys.len()]`).
                 // `by('k')` only for now (a nested by-traversal is deferred).
                 // A by-modulator is a property key or an `id`/`label` element token.
                 enum SelBy {
@@ -4008,7 +4008,7 @@ impl Parser {
                         }
                     })
                 };
-                // A label that is not a bound step tag falls back to core's Scoping: if
+                // A label that is not a bound step tag falls back to the TS engine's Scoping: if
                 // the current traverser is a Map (a `project()`/`group()` row), `select(k)`
                 // projects the entry `k`. We can't statically prove the frontier is a Map,
                 // so we emit the map/record field read (`Expr::Field`) — byte-identical when
@@ -4031,7 +4031,7 @@ impl Parser {
                 }
                 if any_unbound && !incoming_is_map {
                     // An unbound tag on an element/scalar frontier (not a Map) matches
-                    // nothing — core drops the traverser, so filter it all away.
+                    // nothing — the TS engine drops the traverser, so filter it all away.
                     self.current = 0;
                     self.slots = 1;
                     return Ok(plan.filter(Expr::Lit(Value::Bool(false))));
@@ -4083,7 +4083,7 @@ impl Parser {
             "project" => {
                 // project('a','b',…).by(x).by(y) → one Map per traverser, keyed by the
                 // labels. Value for key i is the i-th `by` modulator, or the current
-                // element when there is no i-th `by` (core's `bys.get(i)` — NOT cycled).
+                // element when there is no i-th `by` (the TS engine's `bys.get(i)` — NOT cycled).
                 let mut keys = vec![self.str_arg()?];
                 while self.peek() == Some(&Tok::Comma) {
                     self.pos += 1;
@@ -4709,7 +4709,7 @@ impl Parser {
                 }
             }
             "withcomputer" => {
-                // A no-op marker (lenke always computes in-process), matching core.
+                // A no-op marker (lenke always computes in-process), matching the TS engine.
                 self.expect(&Tok::RParen)?;
                 plan
             }
@@ -4772,7 +4772,7 @@ impl Parser {
                         self.expect(&Tok::RParen)?;
                         if let Some(slot) = self.last_algo {
                             // Rename, don't alias: the default property is no longer
-                            // readable once `propertyName` redirects the result (core
+                            // readable once `propertyName` redirects the result (the TS engine
                             // writes ONLY where asked), so drop the default mapping.
                             self.algo_props.retain(|_, &mut s| s != slot);
                             self.algo_props.insert(name, slot);
@@ -4838,7 +4838,7 @@ impl Parser {
                 }
             }
             "barrier" => {
-                // A lazy-barrier is a no-op in this eager executor (matching core, where
+                // A lazy-barrier is a no-op in this eager executor (matching the TS engine, where
                 // barrier() is the identity step). Bulk-collect semantics are invisible.
                 self.expect(&Tok::RParen)?;
                 plan
@@ -4888,7 +4888,7 @@ impl Parser {
                 // A named side-effect bag: record the CURRENT stream (plan prefix +
                 // the current-slot value) under `key`, then pass through unchanged. In
                 // this eager executor aggregate and store are identical (both eagerly
-                // collect), matching core. Revealed later by cap(key).
+                // collect), matching the TS engine. Revealed later by cap(key).
                 let key = self.str_arg()?;
                 self.expect(&Tok::RParen)?;
                 self.caps
@@ -4908,7 +4908,7 @@ impl Parser {
                 // Reveal a bag. A subgraph bag → a {vertices, edges} Map (via
                 // Plan::Subgraph over the snapshot); otherwise a single list, folding
                 // the aggregate/store SNAPSHOT (AggFn::Collect keeps nulls) for
-                // byte-identity with core.
+                // byte-identity with the TS engine.
                 let key = self.str_arg()?;
                 self.expect(&Tok::RParen)?;
                 if let Some((snap, edge_slot)) = self.subgraph_caps.get(&key).cloned() {
@@ -4917,7 +4917,7 @@ impl Parser {
                     return Ok(snap.subgraph(edge_slot));
                 }
                 let Some((snap, expr)) = self.caps.get(&key).cloned() else {
-                    // An unfilled key caps to a single EMPTY list (core), not an error.
+                    // An unfilled key caps to a single EMPTY list (the TS engine), not an error.
                     self.current = 0;
                     self.slots = 1;
                     return Ok(Plan::Row.project(vec![(key, Expr::Lit(Value::List(vec![])))]));
@@ -5368,7 +5368,7 @@ impl Parser {
                     self.bump();
                     // In a FILTER-CHILD position (not/and/or), the predicate must be
                     // 2-VALUED so `not(has('n',1))` sees a definite false for a stored
-                    // null (3VL null would make Not→null→dropped, but core keeps it).
+                    // null (3VL null would make Not→null→dropped, but the TS engine keeps it).
                     // Coerce the (possibly-null) predicate to false-unless-true.
                     let pred = self.has_predicate(key)?;
                     Expr::Case {
@@ -6416,7 +6416,7 @@ impl Parser {
                 });
             }
             // `regex(pattern)` / `TextP.regex(pattern)`: a `regex_match` call. The
-            // pattern is validated at PARSE time (like core), so a bad pattern is a
+            // pattern is validated at PARSE time (like the TS engine), so a bad pattern is a
             // parse error rather than a silent no-match at runtime.
             if op_name == "regex" {
                 let val = self.literal()?;
@@ -6704,7 +6704,7 @@ impl Parser {
                               // A `repeat(identity())` walk never moves the frontier, so the ONLY thing the
                               // modulators decide is whether any depth is emittable. A post-form `until` is a
                               // do-while (min 1); with `times(0)` (max 0) min > max, so nothing survives —
-                              // matching core. Otherwise the frontier passes through.
+                              // matching the TS engine. Otherwise the frontier passes through.
         if ctx.identity_body {
             let (min, max) = if ctx.until.is_some() {
                 (1, ctx.times.unwrap_or(CAP))

@@ -218,7 +218,7 @@ fn lower_label_expr(le: &LabelExpr, slot: usize) -> Expr {
     }
 }
 
-/// The ISO/IEC 39075 reserved words (verbatim from lenke-core's list) — none may be a
+/// The ISO/IEC 39075 reserved words (verbatim from the now-removed lenke-core's list) — none may be a
 /// bare identifier (a variable or label name). See [`Parser::ident_binding`].
 const RESERVED_WORDS: &str = "abs acos all all_different and any array as asc ascending asin at atan \
 atan2 avg big bigint binary bool boolean both btrim by byte_length bytes call cardinality case cast \
@@ -259,7 +259,7 @@ fn node_prop_filters(mut plan: Plan, slot: usize, props: Vec<(String, Value)>) -
     for (k, val) in props {
         // An inline `{k: null}` constraint is an IS NULL test — it matches a node
         // whose `k` is null/absent — NOT the three-valued `k = null` (which is UNKNOWN
-        // and matches nothing). Matches core's structural constraint semantics.
+        // and matches nothing). Matches the TS engine's structural constraint semantics.
         let f = if val.is_null() {
             Expr::IsNull {
                 expr: Box::new(Expr::Prop { slot, key: k }),
@@ -366,7 +366,7 @@ fn agg_fn(name: &str) -> Option<AggFn> {
         "MIN" => AggFn::Min,
         "MAX" => AggFn::Max,
         "AVG" => AggFn::Avg,
-        // Core's list aggregate is `collect_list` (SKIPS nulls); `collect` is a
+        // The TS engine's list aggregate is `collect_list` (SKIPS nulls); `collect` is a
         // superset alias. Distinct from Gremlin fold's null-keeping `Collect`.
         "COLLECT_LIST" | "COLLECT" => AggFn::CollectList,
         "STDDEV_POP" => AggFn::StddevPop,
@@ -613,7 +613,7 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                 // A single-quoted string with backslash escapes: the simple set
                 // (`\\ \' \" \t \n \r \b \f`), `\uXXXX` (4 hex) / `\UXXXXXX` (6 hex)
                 // code points, and any other `\x` → `x` (drop the backslash). Mirrors
-                // core's lexer; a malformed `\u`/`\U` is a syntax error (kept as an
+                // the TS engine's lexer; a malformed `\u`/`\U` is a syntax error (kept as an
                 // intentional reject-parity divergence).
                 let mut t = String::new();
                 i += 1;
@@ -667,7 +667,7 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             }
             _ if c.is_ascii_digit() || c == '.' => {
                 // Radix prefixes `0x`/`0o`/`0b` — an integer in that base (value as
-                // f64, matching core). Else a decimal.
+                // f64, matching the TS engine). Else a decimal.
                 if c == '0' && i + 1 < b.len() {
                     let radix = match b[i + 1].to_ascii_lowercase() {
                         'x' => Some(16u32),
@@ -692,7 +692,7 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                 // Decimal: integer part, optional `.fraction`, optional `e[+/-]exp`.
                 // Underscores are permitted inside digit runs (`1_000`) and stripped
                 // before parsing; a leading-dot float (`.5`) has no integer part.
-                // Matches core's lexer exactly.
+                // Matches the TS engine's lexer exactly.
                 let start = i;
                 while i < b.len() && (b[i].is_ascii_digit() || b[i] == '_') {
                     i += 1;
@@ -861,10 +861,10 @@ impl Parser {
 
     /// Parse an ISO GQL transaction-control command:
     ///   `START TRANSACTION [READ ONLY | READ WRITE]` | `COMMIT [WORK]` | `ROLLBACK [WORK]`
-    /// Mirrors core's grammar — the access mode is optional (default READ WRITE), and
+    /// Mirrors the TS engine's grammar — the access mode is optional (default READ WRITE), and
     /// `WORK` is an optional ISO noise word on COMMIT/ROLLBACK. The single-program
     /// combined form (`START TRANSACTION <stmts> … COMMIT` in one query) is NOT parsed,
-    /// matching core: issue the commands as separate statements.
+    /// matching the TS engine: issue the commands as separate statements.
     fn parse_tx_control(&mut self) -> Result<Plan, String> {
         if self.eat_kw("START") {
             if !self.eat_kw("TRANSACTION") {
@@ -910,7 +910,7 @@ impl Parser {
 
     /// An identifier in a BINDING position (a variable or label name), where an ISO
     /// reserved word is not a bare identifier (`MATCH (select)` / `(n:Match)` are
-    /// rejected, matching core). Reserved words stay usable as keywords, function
+    /// rejected, matching the TS engine). Reserved words stay usable as keywords, function
     /// names, and property keys — only a fresh binding name is constrained.
     fn ident_binding(&mut self) -> Result<String, String> {
         let s = self.ident()?;
@@ -1086,7 +1086,7 @@ impl Parser {
             // that variable — index-nested-loop over its adjacency — rather than an
             // independent Scan of the whole label + hash join. The join re-scans and
             // materializes both sides (measured ~11x slower on a two-hop join,
-            // `join/tri` in vs_core_bench); the chained expand walks adjacency. Any
+            // the `join/tri` fan-out pattern); the chained expand walks adjacency. Any
             // non-foldable shape (first node unbound/relabeled, or a landing var that
             // re-binds an existing one) rewinds and takes the correct hash join.
             let saved = self.pos;
@@ -1196,7 +1196,7 @@ impl Parser {
         // and page the bound rows, then the following RETURN projects. Core allows
         // this as a standalone order-and-page clause, and allows it to REPEAT (`ORDER
         // BY … LIMIT 2 ORDER BY … DESC LIMIT 1` — page then re-page), so this loops.
-        // `SKIP` is not a valid STARTER here (only ORDER/OFFSET/LIMIT), matching core.
+        // `SKIP` is not a valid STARTER here (only ORDER/OFFSET/LIMIT), matching the TS engine.
         while self.peek_kw("ORDER") || self.peek_kw("OFFSET") || self.peek_kw("LIMIT") {
             let keys = if self.eat_kw("ORDER") {
                 if !self.eat_kw("BY") {
@@ -1326,7 +1326,7 @@ impl Parser {
         // only when there are extra (hidden) group keys to drop.
         let needs_schema_proj = (has_agg && !has_agg_expr) || !extra_group.is_empty();
         // `GROUP BY <keys>` with NO aggregate is DISTINCT over the projection (the
-        // returned items ARE the keys), matching core.
+        // returned items ARE the keys), matching the TS engine.
         let group_distinct = group_by_present && !has_agg;
         // When grouping, the non-aggregate items are the group keys; they occupy the
         // FIRST columns of the aggregate output (keys before aggregates), so an
@@ -1422,7 +1422,7 @@ impl Parser {
         } else if group_distinct && hidden.is_empty() {
             plan = plan.distinct();
         }
-        // `OFFSET` is the ISO spelling of `SKIP` — a synonym here (core accepts both).
+        // `OFFSET` is the ISO spelling of `SKIP` — a synonym here (the TS engine accepts both).
         let skip = if self.eat_kw("SKIP") || self.eat_kw("OFFSET") {
             Some(self.usize_lit()?)
         } else {
@@ -1883,7 +1883,7 @@ impl Parser {
     }
 
     /// Parse an optional `NULLS FIRST|LAST` after a sort key's ASC/DESC. The default
-    /// (no clause) is `false` (nulls sort LAST, both directions — matching core).
+    /// (no clause) is `false` (nulls sort LAST, both directions — matching the TS engine).
     fn parse_nulls_order(&mut self) -> Result<bool, String> {
         if self.eat_kw("NULLS") {
             if self.eat_kw("FIRST") {
@@ -2760,7 +2760,7 @@ impl Parser {
         if self.is_subpath_group_start() {
             if self.subpath_group_is_quantified() {
                 // Unanchored QUANTIFIED subpath group `((x)-[:R]->(y)){n,m} (t)` —
-                // synthesize an anonymous seed node (scan every node), matching core,
+                // synthesize an anonymous seed node (scan every node), matching the TS engine,
                 // then chain from it (the group lowers to a var_length hop).
                 let from = slots;
                 slots += 1;
@@ -2769,7 +2769,7 @@ impl Parser {
                 return Ok((plan, scope, slots));
             }
             // A NAMED path may not bind an unquantified subpath group (ISO: a group
-            // is a path factor only when quantified) — core rejects it, so match that
+            // is a path factor only when quantified) — the TS engine rejects it, so match that
             // rather than binding a lineage the reference engine would not.
             if !self.path_vars.is_empty() {
                 return Err(
@@ -3132,7 +3132,7 @@ impl Parser {
                     });
                 }
             }
-            // The landing node's LABEL constrains it (as core does) — a filter on the
+            // The landing node's LABEL constrains it (as the TS engine does) — a filter on the
             // node's label set, since a landing node has no seed `Scan`.
             if let Some(pred) = landing_label_filter(v2_label, v2_le, from) {
                 plan = plan.filter(pred);
@@ -3943,7 +3943,7 @@ impl Parser {
     /// would), then rebind scope so the carried output columns are a fresh slot
     /// space (`name -> column index`) for the following part. `ORDER BY/SKIP/LIMIT`
     /// ride the projection; a trailing `WHERE` is a post-projection (HAVING)
-    /// filter, matching lenke-core's `WITH … WHERE`.
+    /// filter, matching the TS engine's `WITH … WHERE`.
     /// `LET name = expr [, name = expr]*` — the ISO additive-binding clause: ADD the
     /// new bindings to the working table, carrying every existing binding forward
     /// (unlike WITH, which projects only its listed items). Distinct from the `LET …
@@ -4072,7 +4072,7 @@ impl Parser {
         } else {
             Vec::new()
         };
-        // `OFFSET` is the ISO spelling of `SKIP` — a synonym here (core accepts both).
+        // `OFFSET` is the ISO spelling of `SKIP` — a synonym here (the TS engine accepts both).
         let skip = if self.eat_kw("SKIP") || self.eat_kw("OFFSET") {
             Some(self.usize_lit()?)
         } else {
@@ -4312,7 +4312,7 @@ impl Parser {
     /// body is an INDEPENDENT query (a fresh MATCH … RETURN, aggregates allowed) run
     /// once; its rows CROSS-JOIN the outer working table, appending the yielded
     /// columns. The `()` scope imports nothing, so a reference to an outer variable is
-    /// ISOLATED — resolved to NULL (matching core's scope isolation), which lets a
+    /// ISOLATED — resolved to NULL (matching the TS engine's scope isolation), which lets a
     /// body like `WHERE c = a` compile and simply match nothing. The `CALL (` and
     /// `)` are already consumed; the outer scope is intact in `self`.
     fn call_inline_uncorrelated(&mut self, plan: Plan, outer_width: usize) -> Result<Plan, String> {
@@ -4577,7 +4577,7 @@ impl Parser {
     // rel := ('-' | '~' | '<-') '[' [var] ':' Type [ '{' props '}' ] ']' ('->' | '-' | '~')
     // Captures an optional relationship VARIABLE and inline edge PROPERTIES. `~` is
     // the undirected delimiter: like `-`, it carries NO direction, so `~[...]~`
-    // (and any `-`/`~` mix) is `Dir::Both`, exactly as core resolves it.
+    // (and any `-`/`~` mix) is `Dir::Both`, exactly as the TS engine resolves it.
     fn rel(&mut self, insert_ctx: bool) -> Result<Rel, String> {
         let incoming = self.eat(&Tok::LArrow);
         if !incoming && !self.eat(&Tok::Minus) && !self.eat(&Tok::Tilde) {
@@ -4590,7 +4590,7 @@ impl Parser {
             None
         };
         // `:Type` is OPTIONAL — `-[r]->` / `-[]->` is an UNTYPED hop (any edge type),
-        // matching core's bracketed untyped relationship. (Core's BARE `-->` has
+        // matching the TS engine's bracketed untyped relationship. (The TS engine's BARE `-->` has
         // different semantics — it matches nothing — so it is deliberately NOT
         // accepted here, to avoid a silent result divergence.)
         // `:Type` with an optional `|`-disjunction (`:A|B|C`) — an edge matches if
@@ -4799,7 +4799,7 @@ impl Parser {
 
     fn or_expr(&mut self) -> Result<Expr, String> {
         // OR and XOR share one left-associative precedence level (ISO), above AND.
-        // Binary left-nesting here is equivalent to core's flatten-same/nest-on-
+        // Binary left-nesting here is equivalent to the TS engine's flatten-same/nest-on-
         // switch: `a OR b XOR c` parses as `(a OR b) XOR c`.
         let mut left = self.and_expr()?;
         loop {
@@ -4835,7 +4835,7 @@ impl Parser {
 
     fn cmp_expr(&mut self) -> Result<Expr, String> {
         // Comparison operands are concat expressions (`||` binds tighter than a
-        // comparison, looser than `+`/`-` — the ISO precedence core uses).
+        // comparison, looser than `+`/`-` — the ISO precedence the TS engine uses).
         let left = self.concat_expr()?;
         // Postfix `IS [NOT] NULL` — a definite null test, checked before the
         // binary comparison operators (a value is one or the other, not both).
@@ -5026,7 +5026,7 @@ impl Parser {
 
     // concat_expr := add_expr ( '||' add_expr )*  — string/list concatenation, a
     // level between comparison and additive (the ISO precedence). A run of `||`
-    // folds into ONE n-ary `concat(...)` call (matching core's flat Concat node), so
+    // folds into ONE n-ary `concat(...)` call (matching the TS engine's flat Concat node), so
     // the null-propagation and js-string coercion live in the `concat` scalar fn.
     fn concat_expr(&mut self) -> Result<Expr, String> {
         let first = self.add_expr()?;
@@ -5441,7 +5441,7 @@ impl Parser {
     // WHEN/THEN/ELSE/END are contextual keywords. The SEARCHED form has no subject
     // (`WHEN <cond>`); the SIMPLE form has one (`CASE <e> WHEN <v>`), which desugars
     // to searched `WHEN e = v THEN …`. A NULL subject makes every `e = v` UNKNOWN, so
-    // no branch matches and it falls to ELSE — 3VL, matching core.
+    // no branch matches and it falls to ELSE — 3VL, matching the TS engine.
     fn case_expr(&mut self) -> Result<Expr, String> {
         let subject = if self.peek_kw("WHEN") {
             None
@@ -5492,7 +5492,7 @@ impl Parser {
         }
         // Read the target type name, joining the two-word `LOCAL`/`ZONED` temporal
         // forms (`LOCAL DATETIME` → `local_datetime`, `ZONED TIME` → `zoned_time`),
-        // matching core's `read_type_name`.
+        // matching the TS engine's `read_type_name`.
         let mut ty = self.ident()?;
         let lead = ty.to_ascii_lowercase();
         if (lead == "local" || lead == "zoned")
@@ -5503,7 +5503,7 @@ impl Parser {
             ty = format!("{lead}_{}", w.to_ascii_lowercase());
         }
         // A TEMPORAL cast DESUGARS to the matching temporal constructor function
-        // (`CAST(x AS DATE)` → `date(x)`), exactly as core does — `TIMESTAMP` is a
+        // (`CAST(x AS DATE)` → `date(x)`), exactly as the TS engine does — `TIMESTAMP` is a
         // DATETIME alias. A scalar cast keeps the throwing `CastTarget` path below.
         let temporal_fn = match ty.to_ascii_lowercase().as_str() {
             "date" => Some("date"),
@@ -5968,7 +5968,7 @@ impl Parser {
             | "cot" | "degrees" | "radians" | "upper" | "lower" | "trim" | "size"
             | "cardinality" | "head" | "last"
             // Temporal component accessors carry the leading-underscore extension sigil
-            // (`_year`), matching core; the bare ISO spellings are NOT in the grammar.
+            // (`_year`), matching the TS engine; the bare ISO spellings are NOT in the grammar.
             | "_year" | "_month" | "_day" | "_hour" | "_minute" | "_second"
             // Non-finite CLASSIFIERS (leading-underscore extensions — NOT ISO). Total
             // boolean predicates over the IEEE-754 special values that GQL has no
@@ -6018,7 +6018,7 @@ impl Parser {
     /// `LEADING`/`TRAILING`/`BOTH` (default BOTH) selects the side and desugars to
     /// `ltrim`/`rtrim`/`trim`; an optional trim character precedes `FROM src`. So
     /// `TRIM(LEADING 'x' FROM s)` → `ltrim(s, 'x')` and `TRIM(s)` → `trim(s)`. The
-    /// char, when present, is the SECOND argument, matching core.
+    /// char, when present, is the SECOND argument, matching the TS engine.
     fn trim_call(&mut self) -> Result<Expr, String> {
         let fname = if self.eat_kw("LEADING") {
             "ltrim"
@@ -6049,7 +6049,7 @@ impl Parser {
     }
 }
 
-/// An open upper bound (`+`, `*`, `{n,}`) is genuinely unbounded — matching core's
+/// An open upper bound (`+`, `*`, `{n,}`) is genuinely unbounded — matching the TS engine's
 /// transitive-closure semantics. Enumeration terminates anyway in Trail mode (a trail
 /// can't repeat an edge, so its length is bounded by the edge count), and the trail
 /// LIMIT is the anti-runaway guard: a closure too large to enumerate fails LOUDLY with
@@ -6282,7 +6282,7 @@ impl Parser {
             }
         }
         // An unaliased property access is named `binding.key` (the expression text,
-        // e.g. `n.id`), matching core — not the bare property key `id`. Resolve the
+        // e.g. `n.id`), matching the TS engine — not the bare property key `id`. Resolve the
         // binding's name from its slot; fall back to `default_name` for an unnamed slot.
         if let Expr::Prop { slot, key } = e {
             if let Some((var, _)) = self.scope.iter().find(|(_, &s)| s == *slot) {
@@ -6306,7 +6306,7 @@ fn temporal_tag(kw: &str) -> Option<&'static str> {
     Some(match kw.to_ascii_uppercase().as_str() {
         "DATE" => "date",
         "TIME" => "localtime",
-        // `TIMESTAMP` is core's alias for a (local) DATETIME literal.
+        // `TIMESTAMP` is the TS engine's alias for a (local) DATETIME literal.
         "DATETIME" | "TIMESTAMP" => "datetime",
         "DURATION" => "duration",
         _ => return None,

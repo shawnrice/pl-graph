@@ -210,7 +210,7 @@ fn sort_idx(idx: &mut [usize], key_cols: &[Col], keys: &[crate::ir::SortKey], en
 /// instead of materializing the whole frontier + key column + an index array and then
 /// partial-sorting (what `order_page` does on a pulled batch), scan the nodes once,
 /// reading the key sequentially, and keep only the best `skip+limit` in a bounded buffer
-/// (periodically trimmed with `select_nth`). O(N) time, O(k) space — matching core's
+/// (periodically trimmed with `select_nth`). O(N) time, O(k) space — matching the TS engine's
 /// streaming heap. Returns the top-K rows as the OrderPage output (a single `Col::Nodes`
 /// in sort order), so a `Project` above it builds its columns for K rows, not N.
 ///

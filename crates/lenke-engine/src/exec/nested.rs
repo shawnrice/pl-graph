@@ -33,7 +33,7 @@ pub(super) fn push_group_cols(
 /// `(rep, elem_after)` per active unit — `elem_after` is the element index the hop
 /// advanced PAST, EXCEPT that a step inside a `Sub` keeps the enclosing unit's entry
 /// pinned at that Sub's element index. This is what lets the structured binder place
-/// each variable at the right nesting depth. Mirrors core's `pathfind::StepRec`.
+/// each variable at the right nesting depth. Mirrors the TS engine's `pathfind::StepRec`.
 #[derive(Clone)]
 pub(super) struct StepRec {
     levels: Vec<(u32, usize)>,
@@ -79,7 +79,7 @@ impl Nest {
 /// one list level per enclosing quantifier. `tree_path` is the `Sub`-element indices
 /// from the top unit to THIS one, so `depth = tree_path.len()` is its nesting depth.
 /// A node/edge id is stored as `Value::Num(id)` (the group-variable convention; the
-/// `x[i].prop` element-typing reads it back). Mirrors core's `pathfind::bind_unit`
+/// `x[i].prop` element-typing reads it back). Mirrors the TS engine's `pathfind::bind_unit`
 /// with `key_start = 0`.
 pub(super) fn bind_nested(
     unit: &crate::ir::GUnit,

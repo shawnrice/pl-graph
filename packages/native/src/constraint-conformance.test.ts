@@ -1,6 +1,6 @@
 // Cross-engine differential for the unique-constraint primitive: the SAME
 // createUniqueConstraint + INSERT/SET sequence runs on BOTH the TS engine
-// (@lenke/core + @lenke/gql) and the Rust core (over bun:ffi), asserting the two
+// (@lenke/core + @lenke/gql) and the Rust engine (over bun:ffi), asserting the two
 // agree on every write outcome (the same ConstraintViolation, or both succeed)
 // AND on the resulting graph state byte-for-byte. This is the divergence
 // tripwire the parallel unit tests can't be. See docs/design/gql-extensions.md.

@@ -1,5 +1,5 @@
-//! CSV codec over the neutral model — a faithful port of lenke-core's
-//! `codec::csv`, retyped to [`GraphData`]/[`Value`]. A Neo4j-`admin-import`-style
+//! CSV codec over the neutral model — a faithful port of the now-removed
+//! lenke-core's `codec::csv`, retyped to [`GraphData`]/[`Value`]. A Neo4j-`admin-import`-style
 //! pair of typed CSVs (nodes + edges) joined by a `=== EDGES ===` sentinel line.
 //!
 //! **nodes** columns: `id`, `:LABEL` (label set, `;`-joined), then one typed

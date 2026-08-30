@@ -48,7 +48,7 @@ pub(super) fn var_length(
 ) -> Result<Batch, String> {
     // Anti-runaway budget: a per-path (WALK) `repeat`/var-length expansion fans out as
     // degree^depth, so on a dense graph it materializes billions of rows and OOM-kills
-    // the host. Cap the total emitted rows at `limits.trail` (core's guard, same
+    // the host. Cap the total emitted rows at `limits.trail` (the TS engine's guard, same
     // default); the DFS stops descending once past it and we return a loud
     // `E_RESOURCE_EXHAUSTED` rather than a truncated result.
     let budget = store.limits().trail;
@@ -283,7 +283,7 @@ impl VarlenEmit for CollectEmit<'_> {
 /// same DFS exploration — is byte-identical to materializing every path and then deduping,
 /// while never building the (potentially millions of) path rows. It also has no emit
 /// budget, so it COMPLETES the shapes the materializing walk refuses with E_RESOURCE
-/// (matching core, which completes them).
+/// (matching the TS engine, which completes them).
 pub(super) struct DistinctEndpointEmit {
     pub(super) seen: Vec<bool>,
     pub(super) out: Vec<u32>,
@@ -1308,7 +1308,7 @@ type TrailsByEnd = FnvMap<u32, Vec<(u32, Vec<u32>, Vec<u32>)>>;
 /// `SHORTEST k [GROUP]` (k >= 2): enumerate every TRAIL from each source (no edge
 /// reuse → finite), group by endpoint, order each endpoint's trails by (length,
 /// discovery), then keep the first `k` (plain) or every trail whose length is among
-/// the `k` smallest distinct lengths (`group`). Mirrors core's `shortest_k_walk`;
+/// the `k` smallest distinct lengths (`group`). Mirrors the TS engine's `shortest_k_walk`;
 /// the endpoint's own label/property filter is a `Filter` above this, so it selects
 /// k per endpoint here and the filter narrows afterward.
 #[allow(clippy::too_many_arguments)]
@@ -1527,7 +1527,7 @@ pub(super) fn first_pred_chain(
 
 /// Every distinct shortest path start..node through the predecessor DAG, each as a
 /// (node chain start..node, edge chain) pair. Exponential on a wide lattice — the
-/// same cost core's `enumerate_shortest_paths` pays; no case in scope hits it.
+/// same cost the TS engine's `enumerate_shortest_paths` pays; no case in scope hits it.
 pub(super) fn enumerate_shortest_paths(
     node: u32,
     start: u32,

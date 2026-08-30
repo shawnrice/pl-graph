@@ -9,7 +9,7 @@ import { LenkeRecord } from './LenkeRecord.js';
  * label is ambiguous there (and bare GQL can't name it); an empty label
  * collapses to "no labels" in GraphSON/CSV. Enforced at the graph's mutation
  * boundary so a name that won't round-trip can't enter the model. Mirrors the
- * Rust core's `validate_label`.
+ * Rust engine's `validate_label`.
  */
 export const validateLabel = (label: string): void => {
   if (label === '') {
@@ -26,7 +26,7 @@ export const validateLabel = (label: string): void => {
 
 /**
  * A well-formed **property key**: non-empty (an empty key has no CSV column
- * header / pg-text `key:value` form). Mirrors the Rust core's `validate_prop_key`.
+ * header / pg-text `key:value` form). Mirrors the Rust engine's `validate_prop_key`.
  */
 export const validatePropertyKey = (key: string): void => {
   if (key === '') {
@@ -36,7 +36,7 @@ export const validatePropertyKey = (key: string): void => {
 
 /**
  * A well-formed **property value**. The LPG numeric type is float64 (the Rust
- * core has no bigint; every codec + the FFI param boundary would coerce a bigint
+ * the Rust engine has no bigint; every codec + the FFI param boundary would coerce a bigint
  * to a number, losing precision above 2^53). So a JS `bigint` is rejected at the
  * mutation boundary rather than silently downgraded — pass `Number(x)` for a
  * safe-range value, or a string. Recurses into list elements so a bigint can't
@@ -46,7 +46,7 @@ export const validatePropertyKey = (key: string): void => {
  *
  * The param + FFI boundaries already reject bigint with the same code; this
  * closes the pure-JS in-process store, the one path that stored it raw. No Rust
- * mirror is needed — `bigint` is a JS-only type that cannot reach the core.
+ * mirror is needed — `bigint` is a JS-only type that cannot reach the engine.
  */
 export const validatePropertyValue = (value: unknown): void => {
   if (typeof value === 'bigint') {

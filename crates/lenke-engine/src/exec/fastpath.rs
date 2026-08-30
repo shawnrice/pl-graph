@@ -38,7 +38,7 @@ pub(super) fn try_fused_hop_num_count(input: &Plan, store: &Store) -> Option<u64
 /// Fused numeric-filtered PROJECTION over `Project(Filter(<numeric conj>, Expand(Scan)))`.
 /// The general path pulls the whole expand into an `[src, nbr]` batch, filters, and GATHERS
 /// the survivors — a fixed ~0.8ms for an 80k-edge hop no matter how few rows survive, which
-/// loses to core's streaming when the filter is mid-selective (survivors ≪ edges) but not
+/// loses to the TS engine's streaming when the filter is mid-selective (survivors ≪ edges) but not
 /// selective enough to reverse-seed. Instead STREAM the type's edges (per-type CSR), test the
 /// numeric predicate inline, collect just the surviving TARGET ids, and evaluate the projection
 /// over that survivor frontier — the survivor count of output rows, never the `[src, nbr]`
@@ -1179,7 +1179,7 @@ pub(super) enum VarStep {
     Skip,
     /// A SIMPLE closing hop (`nbr == start`): emit the endpoint but do NOT descend —
     /// the cycle is closed, and extending it would repeat an interior node (mirrors
-    /// core's `is_close` early-`continue`).
+    /// the TS engine's `is_close` early-`continue`).
     Close,
     /// Descend. `Some(id)` is pushed onto the reuse stack before recursing (Trail:
     /// the edge id; Simple/Acyclic: the node id); `None` pushes nothing (Walk).
@@ -1229,7 +1229,7 @@ pub(super) fn varlen_step(
 /// only holds for `min ≤ 1` (a node discovered at its shortest distance `< min`
 /// might still be a valid longer-walk endpoint, which BFS would miss), so deeper
 /// lower bounds fall back to the general path. The count is a set size, so it is
-/// byte-identical to core's regardless of visitation order.
+/// byte-identical to the TS engine's regardless of visitation order.
 pub(super) fn try_varlen_distinct_count(
     input: &Plan,
     keys: &[(String, Expr)],
@@ -2898,7 +2898,7 @@ pub(super) fn try_fused_count(
         // When the hop's type set matches EVERY edge (an unlabeled hop, or the
         // graph's only type), the degree is the raw adjacency length — no per-edge
         // type check. That is the common "count all my out-neighbours" shape; the
-        // per-edge walk it replaces was the one 1-hop-count regression vs core.
+        // per-edge walk it replaces was the one 1-hop-count regression vs the TS engine.
         let all_types = want_covers_all_etypes(store, &want);
         let mut total = 0f64;
         if matches!(inner.as_ref(), Plan::Expand { .. }) {
@@ -3004,7 +3004,7 @@ impl GremlinTree {
     }
 }
 
-/// A component/cluster id as the ROOT vertex's external-id string — the value core's
+/// A component/cluster id as the ROOT vertex's external-id string — the value the TS engine's
 /// `connectedComponent`/`peerPressure` write (`Value::Str(vid.arc(root))`). A root
 /// with no external id (never, for a loaded node) reads back NULL.
 pub(super) fn root_ext_id(store: &Store, root: u32) -> Value {
@@ -3214,10 +3214,10 @@ pub(super) fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
 /// Rejected optimization: for a DICT-encoded key, counting straight into per-code
 /// buckets during the traversal (`counts[codes[nbr]] += 1`), skipping this per-node
 /// intermediate and the Level-2 merge. It moved `c.city, count(*)` on the 2-hop
-/// 100k/deg-5 fixture only 24.5ms -> 23.0ms (0.54x -> 0.57x of core) — a consistent
+/// 100k/deg-5 fixture only 24.5ms -> 23.0ms (0.54x -> 0.57x of the TS engine) — a consistent
 /// ~7% but still far from parity, and it TRADES the per-node scatter for reading the
 /// property once PER PATH (2.5M reads) instead of once per distinct endpoint (100k).
-/// The shape is memory-bound on ~2.5M random accesses either way; core's remaining
+/// The shape is memory-bound on ~2.5M random accesses either way; the TS engine's remaining
 /// edge is its CSR adjacency (sequential neighbour reads), which the per-node `Vec`
 /// adjacency here cannot match without a layout change (deferred, large blast radius).
 /// Not worth a second grouped-count path for a sub-10% move that leaves it slowest.

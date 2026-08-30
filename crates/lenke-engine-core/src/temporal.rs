@@ -1,6 +1,6 @@
 //! ISO/IEC 39075 temporal values — all six kinds: `DATE`, `LOCAL TIME`,
 //! `LOCAL DATETIME`, `ZONED TIME`, `ZONED DATETIME`, `DURATION`. Ported faithfully
-//! from `lenke-core`'s `temporal.rs` so the two engines AGREE (same ISO-8601 wire
+//! from the now-removed `lenke-core`'s `temporal.rs` so the two engines AGREE (same ISO-8601 wire
 //! form, same order, same calendar arithmetic).
 //!
 //! Dependency-free: the calendar math is Howard Hinnant's civil-from-days
@@ -11,7 +11,7 @@
 use std::cmp::Ordering;
 
 /// A calendar date: days since 1970-01-01 (proleptic Gregorian), ordered
-/// chronologically. `days` is an `i32`, matching lenke-core (parse overflows the
+/// chronologically. `days` is an `i32`, matching the TS engine (parse overflows the
 /// `i32` range with an error).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Date {

@@ -10,7 +10,7 @@ use crate::value::{self, Value};
 /// body, shared by `Expr::Arith` and its scalar fast path's non-numeric fallback.
 /// Raw f64 when both are `Col::Num`; otherwise per-cell via the value contract (a
 /// NULL / non-numeric operand → NULL, a temporal operand → `temporal_arith`). Div/Rem
-/// by a zero divisor (the RIGHT operand) throws, matching core's DataException.
+/// by a zero divisor (the RIGHT operand) throws, matching the TS engine's DataException.
 fn arith_general(op: crate::ir::ArithOp, l: &Col, r: &Col) -> Result<Col, String> {
     use crate::ir::ArithOp::{Add, Div, Mul, Rem, Sub};
     if let (Col::Num(xs), Col::Num(ys)) = (l, r) {
@@ -59,7 +59,7 @@ fn arith_general(op: crate::ir::ArithOp, l: &Col, r: &Col) -> Result<Col, String
                 // A NULL operand → NULL (three-valued). A NON-null NON-numeric operand
                 // (string/bool/list/record) is a DATA EXCEPTION — arithmetic never
                 // implicitly coerces; use an explicit CAST (`CAST('1' AS INT) * n`). This
-                // is core's SQL-style rule (`'abc' + 1` throws; `1 + null` is null).
+                // is the TS engine's SQL-style rule (`'abc' + 1` throws; `1 + null` is null).
                 _ if a.is_null() || b.is_null() => Value::Null,
                 _ => return Err("arithmetic requires a number".into()),
             }
@@ -149,7 +149,7 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
             read_property(store, &col, key)
         }
         // `base[index]` — 0-based list element or record/map field. Out of range /
-        // negative / non-integer index → NULL; null-safe. Mirrors core.
+        // negative / non-integer index → NULL; null-safe. Mirrors the TS engine.
         //
         // Special case: `nodes(p)[i]` / relationships(p)[i]` (an Index over a path
         // accessor) must keep the ELEMENT typing so a following `.prop` resolves the
@@ -643,7 +643,7 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                 }
                 return Ok(Col::Gen(out));
             }
-            // `element_map(element[, 'k1', …])` → Gremlin `elementMap()`: core's FLAT
+            // `element_map(element[, 'k1', …])` → Gremlin `elementMap()`: the TS engine's FLAT
             // shape — `{id, label, <props…>}` for a node, plus `IN`/`OUT` endpoint
             // stubs for an edge — where `label` is SINGULAR (the first label / edge
             // type) and the present properties are flattened alongside the tokens
@@ -738,7 +738,7 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
             }
             // `value_map(element[, 'k1', …])` → Gremlin `valueMap()`: a Value::Map of
             // the element's PRESENT properties (no id/label tokens), with SCALAR
-            // values (core's `propertyMap()`, not built here, is the list-wrapped
+            // values (the TS engine's `propertyMap()`, not built here, is the list-wrapped
             // form). An optional trailing key list filters; no keys = every present
             // property. Keys are sorted (the engine's element-map convention; map key
             // order is set-based per policy). Gremlin-only — not in the GQL whitelist.
@@ -894,11 +894,11 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
             // `list_{sum,mean,min,max}(list)` → Gremlin's scope-LOCAL aggregates over
             // a list cell (e.g. after `fold()`): reduce the list's NUMERIC elements
             // (nulls/non-numerics skipped), yielding Null for a list with no number —
-            // matching core's `local_num`/`local_extreme` on the numeric case.
+            // matching the TS engine's `local_num`/`local_extreme` on the numeric case.
             // Gremlin-only. (Mixed numeric+non-numeric lists are the held cross-type
             // territory; here the non-numerics are simply skipped.)
             // `list_count(list)` → Gremlin `count(local)`: the number of local
-            // elements (a list's length, or 1 for a scalar cell — core's
+            // elements (a list's length, or 1 for a scalar cell — the TS engine's
             // `local_elems(v).len()`). Gremlin-only.
             if name == "list_count" {
                 let arg = eval(&args[0], store, batch)?;
@@ -1088,7 +1088,7 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                     .map(|i| match arg.value_at(i) {
                         // A node surfaces as Num(id); its keys / property_names are
                         // the SORTED present property keys, its labels the SORTED
-                        // labels — both as string lists (matching core).
+                        // labels — both as string lists (matching the TS engine).
                         Value::Num(id) if matches!(arg, Col::Nodes(_)) => {
                             let id = id as u32;
                             let mut items: Vec<Value> = if name == "labels" {
@@ -1382,7 +1382,7 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
         Expr::PropertyExists { slot, key } => {
             // Presence, not value: TRUE iff the element carries a stored value for
             // `key`, FALSE if not — but on a NON-element (the OPTIONAL null sentinel
-            // `u32::MAX`, or a computed value) the answer is NULL, matching core's
+            // `u32::MAX`, or a computed value) the answer is NULL, matching the TS engine's
             // `prop_present` (`_ => Val::Null`). A column with no sentinel keeps the
             // unboxed `Col::Bool` fast path; a sentinel forces the null-carrying `Gen`.
             // A slot past the runtime width (a branch/inject collapsed the layout) has no
@@ -1421,7 +1421,7 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                 ),
                 // A heterogeneous column (e.g. post-union `Gen` of boxed element maps):
                 // presence reads through a boxed vertex/edge's `properties`; a genuine
-                // non-element value has no property and stays NULL (core's `_ => Null`).
+                // non-element value has no property and stays NULL (the TS engine's `_ => Null`).
                 other => {
                     Col::Gen(
                         (0..other.len())
@@ -1660,7 +1660,7 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
             // Correlated scalar: same provenance-tagged sub-run, but project `scalar`
             // over the surviving sub-rows and return each outer row's single value
             // (NULL when the body matched nothing). A VALUE subquery must return AT
-            // MOST one row per outer row — more than one is an error (matching core).
+            // MOST one row per outer row — more than one is an error (matching the TS engine).
             let n = batch.rows();
             let prov = batch.slots.len();
             let mut slots = batch.slots.clone();

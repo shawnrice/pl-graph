@@ -30,8 +30,8 @@ pub(super) fn pattern_value(props: &[(String, Value)], key: &str) -> Value {
 }
 
 /// Render a batch cell (slot `col`, row `i`) to a result `Value`. A NODE frontier
-/// slot renders as core's element MAP `{id, labels, properties}` (not its bare id),
-/// so `RETURN n` / `RETURN *` match core byte-for-byte. Everything else materializes
+/// slot renders as the TS engine's element MAP `{id, labels, properties}` (not its bare id),
+/// so `RETURN n` / `RETURN *` match the TS engine byte-for-byte. Everything else materializes
 /// as its plain value. (Edge frontier rendering — `{id, from, to, labels,
 /// properties}` — needs an eid→endpoints accessor and is a separate step.)
 /// Like [`render_cell`] but keeps a graph element UNBOXED — `Value::Node`/`Value::Edge`
@@ -146,7 +146,7 @@ pub(super) fn reunfold_elements(elems: &[Value], store: &Store) -> Col {
 }
 
 /// The canonical result map for an edge — `{id, from, to, labels(sorted),
-/// properties(sorted by key)}`, byte-identical to lenke-core's `val_to_value(Edge)`.
+/// properties(sorted by key)}`, byte-identical to the TS engine's `val_to_value(Edge)`.
 /// `from`/`to` are the endpoint EXTERNAL ids.
 pub(super) fn edge_result_value(store: &Store, eid: u32) -> Value {
     use std::sync::Arc;
@@ -318,7 +318,7 @@ pub(super) fn resolve_node_cols<'a>(
 }
 
 /// The canonical result map for a node — `{id, labels(sorted), properties(sorted by
-/// key)}`, byte-identical to lenke-core's `val_to_value(Node)`.
+/// key)}`, byte-identical to the TS engine's `val_to_value(Node)`.
 /// Map a lineage node-id slice (`Value::Num(dense_id)` entries) to full vertex
 /// element maps — the materialization behind `nodes(p)` and a Path's `vertices`.
 pub(super) fn path_node_values(store: &Store, ids: &[Value]) -> Vec<Value> {
@@ -350,7 +350,7 @@ pub(super) fn node_result_value(store: &Store, id: u32) -> Value {
     labels.sort_unstable();
     let labels_list = Value::List(labels.into_iter().map(|l| Value::Str(l.into())).collect());
     // Present properties on this node, keyed in `prop_keys()` order — which is ALREADY
-    // sorted, so the filtered subset stays sorted (core's props_map ordering) with no
+    // sorted, so the filtered subset stays sorted (the TS engine's props_map ordering) with no
     // re-sort and no intermediate Vec.
     let props_map = Value::Map(Arc::new(
         store
@@ -371,7 +371,7 @@ pub(super) fn node_result_value(store: &Store, id: u32) -> Value {
 }
 
 /// A self-describing edge record `{id, label, outV, inV, properties}` — the shape
-/// core's `subgraph_edge` builds (single `label` string; endpoints as external ids;
+/// the TS engine's `subgraph_edge` builds (single `label` string; endpoints as external ids;
 /// properties sorted by key).
 pub(super) fn subgraph_edge_value(store: &Store, eid: u32) -> Value {
     use std::sync::Arc;
@@ -429,7 +429,7 @@ pub(super) fn output_names(plan: &Plan) -> Option<Vec<String>> {
         Plan::Distinct { input }
         | Plan::OrderPage { input, .. }
         | Plan::SortLocal { input, .. } => output_names(input),
-        // UNION names come from the LEFT arm (core's rule).
+        // UNION names come from the LEFT arm (the TS engine's rule).
         Plan::Union { left, .. } => output_names(left),
         _ => None,
     }

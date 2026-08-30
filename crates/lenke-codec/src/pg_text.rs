@@ -1,5 +1,5 @@
 //! The PG textual format (`.pg`) over the neutral model — a faithful port of
-//! lenke-core's `codec::pg_text`, retyped to [`GraphData`]/[`Value`]. One element
+//! the now-removed lenke-core's `codec::pg_text`, retyped to [`GraphData`]/[`Value`]. One element
 //! per line:
 //! ```text
 //! <id> :Label* key:value*          ← a node (one leading id)

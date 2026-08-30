@@ -940,7 +940,7 @@ fn fused_hop_count_matches_materialize_value() {
 /// set covers EVERY edge type (the `matching_degree` fast path), and still filters
 /// by type when it does not — the counts must agree with the per-edge walk in both
 /// cases. Regression: this shape (`(a)-[:R]->(b) RETURN count(*)`) walked every edge
-/// with a per-edge type check, ~1.8x slower than core; the raw-length path fixes it
+/// with a per-edge type check, ~1.8x slower than the TS engine; the raw-length path fixes it
 /// WITHOUT changing the value.
 #[test]
 fn one_hop_count_uses_raw_degree_only_when_type_set_is_universal() {
@@ -1364,7 +1364,7 @@ fn group_by_edge_property_counts_per_value() {
     );
 }
 
-/// K4: computed NaN/Inf are KEPT in the result value (matching lenke-core, so a
+/// K4: computed NaN/Inf are KEPT in the result value (matching the TS engine, so a
 /// caller can detect the signal), and coerced to null only at JSON egress.
 #[test]
 fn nan_and_inf_kept_in_results_coerced_at_egress() {
@@ -1398,7 +1398,7 @@ fn added_scalar_functions() {
         Value::Num(x) => x,
         o => panic!("{e} → {o:?}"),
     };
-    // constants + math (native libm, matching core)
+    // constants + math (native libm, matching the TS engine)
     assert!((num("pi()") - std::f64::consts::PI).abs() < 1e-12);
     assert!((num("e()") - std::f64::consts::E).abs() < 1e-12);
     assert_eq!(num("power(2, 10)"), 1024.0);
@@ -2386,7 +2386,7 @@ fn filter_clause_and_composed_paging() {
 
 /// An UNQUANTIFIED subpath group `(( pattern [WHERE p] ))` is a scoping paren:
 /// the inner pattern + trailing WHERE filter, no repetition. A NAMED path over
-/// one is rejected (core does). Fixture: Amy(25)->Bob(40), Bob(40)->Amy(25).
+/// one is rejected (the TS engine does). Fixture: Amy(25)->Bob(40), Bob(40)->Amy(25).
 #[test]
 fn unquantified_subpath_group() {
     let nd = concat!(
@@ -2412,7 +2412,7 @@ fn unquantified_subpath_group() {
         names("MATCH ((x:Person) WHERE x.age >= 35) RETURN x.name AS n"),
         vec!["Bob"]
     );
-    // A named path over an unquantified group is rejected (matches core).
+    // A named path over an unquantified group is rejected (matches the TS engine).
     assert!(
         crate::gql::parse("MATCH p = ((x)-[:KNOWS]->(y) WHERE x.age < y.age) RETURN p").is_err()
     );
@@ -2587,7 +2587,7 @@ fn leading_optional_match_pads_one_null_row_when_empty() {
 }
 
 /// LIMIT 0 yields the empty result WITHOUT evaluating the projection, so a
-/// faulting expression (`1/0`) under LIMIT 0 does not error (matches core).
+/// faulting expression (`1/0`) under LIMIT 0 does not error (matches the TS engine).
 #[test]
 fn limit_zero_short_circuits_before_projection() {
     let mut b = Builder::default();
@@ -2802,7 +2802,7 @@ fn in_operator_dynamic() {
 
 /// Undirected `~` traversal is `Dir::Both`: a normal edge is reached from both
 /// endpoints (two rows), but a self-loop is walked ONCE (its in-side copy is
-/// dropped), matching core's `SelfLoops::Once`.
+/// dropped), matching the TS engine's `SelfLoops::Once`.
 #[test]
 fn undirected_tilde_self_loop_counted_once() {
     let nd = concat!(
@@ -3564,7 +3564,7 @@ fn property_exists_separates_present_null_from_absent() {
 }
 
 /// PROPERTY_EXISTS works on an EDGE slot (not just nodes), and a NULL element
-/// (the OPTIONAL unmatched sentinel) yields NULL, not FALSE — matching core.
+/// (the OPTIONAL unmatched sentinel) yields NULL, not FALSE — matching the TS engine.
 #[test]
 fn property_exists_on_edges_and_null_element() {
     let nd = concat!(
@@ -3874,7 +3874,7 @@ fn where_rejects_a_non_boolean_condition() {
 }
 
 /// A temporal renders TAGGED in a query result (`{"@duration":"P1D"}`), matching
-/// core — not a bare ISO string. Covers every temporal kind.
+/// the TS engine — not a bare ISO string. Covers every temporal kind.
 #[test]
 fn query_result_renders_temporals_tagged() {
     let mut b = Builder::default();
@@ -4190,7 +4190,7 @@ fn an_immediate_fault_inside_a_transaction_isolates_to_its_own_statement() {
 
 #[test]
 fn a_deferred_constraint_violation_surfaces_at_commit_and_rolls_the_whole_transaction_back() {
-    // A DECLARED unique constraint is checked at COMMIT (deferred), matching core.
+    // A DECLARED unique constraint is checked at COMMIT (deferred), matching the TS engine.
     // So the colliding write itself SUCCEEDS mid-transaction, and the violation
     // surfaces only at COMMIT — rolling back the WHOLE transaction (you cannot
     // swallow it row-by-row, unlike an immediate fault).
@@ -4245,7 +4245,7 @@ fn a_required_violation_in_a_transaction_never_persists() {
     // A required constraint on Acct.email. A row that never fills it must NOT
     // persist — whether the engine rejects it at the statement (its per-statement
     // constraint check) or would defer to COMMIT, the invalid row leaves no trace
-    // and the transaction ends cleanly. (Engine checks per-statement; core defers
+    // and the transaction ends cleanly. (Engine checks per-statement; the TS engine defers
     // to commit — a separate constraint-deferral divergence — but both are safe.)
     let mut store = Builder::default().build();
     store.create_required_constraint("Acct", "email").unwrap();
@@ -4537,7 +4537,7 @@ fn remove_enforces_required_constraint() {
     );
 }
 
-/// GQL DELETE / DETACH DELETE, matching core: a non-DETACH delete of a node with
+/// GQL DELETE / DETACH DELETE, matching the TS engine: a non-DETACH delete of a node with
 /// relationships errors and rolls back; DETACH cascades the edges; an edge delete
 /// leaves the endpoints; a node with no edges deletes plainly.
 #[test]
@@ -4631,7 +4631,7 @@ fn arith_null_propagates() {
     assert_eq!(nulls, 1); // only the Project node lacks age
 }
 
-/// Arithmetic follows core's SQL rule: a NULL operand yields NULL, but a non-null
+/// Arithmetic follows the TS engine's SQL rule: a NULL operand yields NULL, but a non-null
 /// NON-numeric operand (string/bool) is a DATA EXCEPTION (never coerced) — an
 /// explicit CAST is the escape hatch. Aggregates sum()/avg() likewise throw over a
 /// non-numeric value.
@@ -4659,7 +4659,7 @@ fn arith_and_agg_throw_on_non_numeric() {
     assert!(ok("MATCH (p:Person) RETURN avg(p.name) AS r").is_err());
 }
 
-/// Division / modulo by zero THROWS (matches lenke-core's DataException), via
+/// Division / modulo by zero THROWS (matches the TS engine's DataException), via
 /// the fallible read path — `try_run` surfaces the error (K3).
 #[test]
 fn arith_div_or_mod_by_zero_throws() {
@@ -4675,7 +4675,7 @@ fn arith_div_or_mod_by_zero_throws() {
     }
 }
 
-/// A product that overflows f64 to +Inf is KEPT (IEEE), matching lenke-core —
+/// A product that overflows f64 to +Inf is KEPT (IEEE), matching the TS engine —
 /// NaN/Inf are coerced to null only at the JSON egress boundary, not here (K4).
 #[test]
 fn arith_overflow_keeps_inf() {
@@ -5132,7 +5132,7 @@ fn count_arg_and_count_distinct_skip_nulls() {
 }
 
 /// Over nothing, `count` and `sum` are both 0 but `avg` is NULL — matching
-/// lenke-core (the GQL/Cypher convention; the differential fuzzer flagged the
+/// the TS engine (the GQL/Cypher convention; the differential fuzzer flagged the
 /// earlier SQL-style `sum → NULL`).
 #[test]
 fn sum_over_empty_is_zero_avg_is_null() {
@@ -6111,7 +6111,7 @@ fn shortest_path_respects_max_hops() {
 
 /// A cycle does not loop forever — each node is reached once. With a `+`
 /// (min 1) quantifier the source IS a valid endpoint at the shortest CYCLE
-/// length back to it (a->b->c->a is length 3), matching core.
+/// length back to it (a->b->c->a is length 3), matching the TS engine.
 #[test]
 fn shortest_path_terminates_on_a_cycle() {
     let mut b = Builder::default();

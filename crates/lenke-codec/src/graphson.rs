@@ -1,5 +1,5 @@
 //! GraphSON v3.0 (Apache TinkerPop) codec over the neutral model — a faithful
-//! port of lenke-core's `codec::graphson`, retyped to [`GraphData`]/[`Value`].
+//! port of the now-removed lenke-core's `codec::graphson`, retyped to [`GraphData`]/[`Value`].
 //!
 //! The whole graph is one document `{ "vertices": [<g:Vertex>...], "edges":
 //! [<g:Edge>...] }`; each element uses GraphSON v3 typed values `{ "@type":…,

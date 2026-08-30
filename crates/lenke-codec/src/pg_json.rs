@@ -1,5 +1,5 @@
-//! PG-JSON codec over the neutral model — a faithful port of lenke-core's
-//! `codec::pg_json`, retyped from `Graph`/`Value` to [`GraphData`]/[`Value`].
+//! PG-JSON codec over the neutral model — a faithful port of the now-removed
+//! lenke-core's `codec::pg_json`, retyped from `Graph`/`Value` to [`GraphData`]/[`Value`].
 //!
 //! Wire shape (a single JSON document):
 //! ```text

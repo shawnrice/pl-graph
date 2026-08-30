@@ -102,7 +102,7 @@ for (const { name, make, ok } of backends) {
       ]);
       // The engine's edge-unique constraint is SELF-CONTAINED — it reconstructs its
       // own backing index on replay (the round-trip below proves it), so it dumps as
-      // a single op with NO separate createEdgeIndex (core emitted both).
+      // a single op with NO separate createEdgeIndex (the now-removed lenke-core emitted both).
       expect(by('createEdgeIndex')).toEqual([]);
       expect(by('createEdgeUniqueConstraint')).toEqual([
         { op: 'createEdgeUniqueConstraint', edgeType: 'FOLLOWS', key: 'id' },

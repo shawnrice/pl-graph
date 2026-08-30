@@ -100,7 +100,7 @@ pub fn write_number(out: &mut String, x: f64) {
 /// (`1e-7` → `0.0000001`, `1e21` → `1000000000000000000000`), which is a different STRING
 /// from JS even though it parses to the same f64 — so any number that becomes a STRING
 /// (`to_string` / `CAST AS STRING` / `||`) must route through here for byte-identity with
-/// core / the TS engine. Ported from lenke-core's `jsonfmt::js_number`. `{:e}` gives the
+/// core / the TS engine. Ported from the now-removed lenke-core's `jsonfmt::js_number`. `{:e}` gives the
 /// shortest round-tripping mantissa; this just places the decimal point per the spec.
 pub fn js_number(x: f64) -> String {
     if x == 0.0 {

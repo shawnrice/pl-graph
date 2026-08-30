@@ -1,11 +1,11 @@
 // Differential conformance for the in-engine graph algorithms: the TS core
-// (@lenke/core data-last free functions, in-process) vs the Rust core (this
+// (@lenke/core data-last free functions, in-process) vs the Rust engine (this
 // package, over bun:ffi), driven from ONE source of truth — the same NDJSON
 // loaded into both — so an algorithm's result can't drift between the two forms.
 //
 //   load once:   identical NDJSON (same ids/labels/properties, same order)
 //   TS core:     JSON.stringify(degree(config, tsGraph))
-//   Rust core:   JSON.stringify(nativeGraph.degree(config))
+//   Rust engine: JSON.stringify(nativeGraph.degree(config))
 //   assert:      the two serializations are byte-identical
 //
 // Both engines assign dense vertex ids / iterate vertices in NDJSON insertion
@@ -37,8 +37,8 @@ import { deserialize as tsDeserialize } from '@lenke/serialization';
 import { nativeBackend, NATIVE_LIB, nativeReady } from './conformance-harness.js';
 import { graphFromNdjson } from './graph.js';
 
-// --- native library bootstrap (via the drop-in harness: core by default,
-// lenke-engine under LENKE_ENGINE=1; see conformance-harness.ts) --------------
+// --- native library bootstrap (via the drop-in harness: the engine backend;
+// see conformance-harness.ts) -------------------------------------------------
 const hasLib = nativeReady;
 
 if (!hasLib) {

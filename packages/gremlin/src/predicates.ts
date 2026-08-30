@@ -82,7 +82,7 @@ const cmpOrd = (x: number | string, y: number | string): number => {
 export const compareTotal = (a: unknown, b: unknown): number => {
   // NULLS FIRST, and two nulls equal. `compareValues` has no null arm at all —
   // it falls through to `cannot order null with null` — so ordering a stream
-  // with one missing property THREW here while the Rust core sorted it, which is
+  // with one missing property THREW here while the Rust engine sorted it, which is
   // a byte-identity break on an ordinary traversal (`values('k').order()` over a
   // vertex that lacks `k`, or anything after `path().id()`).
   //

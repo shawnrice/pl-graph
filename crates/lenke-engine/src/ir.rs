@@ -62,7 +62,7 @@ pub enum GroupPos {
 }
 
 /// A subpath-group UNIT for the general (possibly NESTED) matcher — an ordered list
-/// of elements plus the unit's own source-variable slot. Mirrors core's `CUnit`. A
+/// of elements plus the unit's own source-variable slot. Mirrors the TS engine's `CUnit`. A
 /// bound variable's list-nesting depth equals the number of enclosing quantified
 /// sub-units, so `bind_nested` assembles each as a `Value::List` (of lists) keyed by
 /// the repetition counters of the units it sits inside. Used by `Plan::NestedGroup`;
@@ -493,7 +493,7 @@ pub enum AggFn {
     CollectList,
     /// Population / sample standard deviation from the one-pass moments
     /// `sqrt((Σx² − (Σx)²/n) / denom)`, denom = `n` (pop) or `n−1` (samp). `pop` is
-    /// NULL over 0 rows, `samp` over fewer than 2. Matches core's `stddev_of`.
+    /// NULL over 0 rows, `samp` over fewer than 2. Matches the TS engine's `stddev_of`.
     StddevPop,
     StddevSamp,
     /// Ordered-set aggregates `percentile_cont(x, f)` / `percentile_disc(x, f)` — the
@@ -566,7 +566,7 @@ pub enum Plan {
     /// contributes nothing. Preserves the requested id order.
     EdgeSeed { ext_ids: Vec<String> },
     /// Gremlin `sample(n)`: a seeded (fixed Mulberry32) partial Fisher-Yates shuffle of
-    /// the whole row stream, truncated to `n` — deterministic and byte-identical to core.
+    /// the whole row stream, truncated to `n` — deterministic and byte-identical to the TS engine.
     Sample { input: Box<Plan>, n: usize },
     /// Gremlin `index()`: replace each row with the 2-element list `[element, position]`
     /// where `position` is the element's 0-based index IN THE STREAM. Collapses to one
@@ -716,7 +716,7 @@ pub enum Plan {
         /// Gremlin `repeat(both())` self-loop semantics: an undirected hop crosses a
         /// self-loop TWICE. GQL undirected var-length (`-[:R]-{1,3}`) keeps it once
         /// (`false`); a Gremlin `both()` walk doubles it (`true`, only bites on
-        /// `Dir::Both`) — matching core.
+        /// `Dir::Both`) — matching the TS engine.
         double_loops: bool,
     },
     /// A quantified subpath group `((x)-[e]->(y)){min,max}` that BINDS its inner
@@ -832,7 +832,7 @@ pub enum Plan {
     /// Gremlin `subgraph('sg')` revealed by `cap('sg')`: collect the EDGE frontier at
     /// `edge_slot` (deduped) plus their endpoint vertices (deduped), emitting ONE row
     /// holding a `{vertices: [records], edges: [records]}` Map of self-describing
-    /// element records — matching core's `subgraph_vertex`/`subgraph_edge` shapes.
+    /// element records — matching the TS engine's `subgraph_vertex`/`subgraph_edge` shapes.
     Subgraph { input: Box<Plan>, edge_slot: usize },
     /// Append or overwrite ONE slot's column with `value` (evaluated per row),
     /// leaving every other slot intact — used to carry a Gremlin `sack` accumulator
@@ -862,7 +862,7 @@ pub enum Plan {
     /// run the algorithm over the whole store, then APPEND the per-node result as a
     /// new column aligned to the vertex frontier at `node_slot`, so a following
     /// `values(<property>)` (routed to this appended slot) reads it. Pass-through: the
-    /// vertex frontier is unchanged, matching core's "stream + attached property".
+    /// vertex frontier is unchanged, matching the TS engine's "stream + attached property".
     AlgoAnnotate {
         input: Box<Plan>,
         algo: GremlinAlgo,
@@ -886,7 +886,7 @@ pub enum Plan {
     },
     /// Gremlin `union(t1, t2, …)`: for each input row, run every `body` (a
     /// `Plan::Row`-rooted sub-plan continuing from the current slot) and CONCATENATE
-    /// all their sub-rows into one frontier — the columnar form of core's
+    /// all their sub-rows into one frontier — the columnar form of the TS engine's
     /// per-traverser branch-and-reconverge. The bodies land a compatible frontier
     /// (the parser scopes each to a single hop, so every branch appends its element
     /// at the same slot and the concatenated column keeps its node/edge type).
@@ -945,7 +945,7 @@ pub enum Plan {
         key_slots: Vec<usize>,
     },
     /// `<query> UNION [ALL] <query>`: run both arms and concatenate their rows. The
-    /// result's column names come from the LEFT arm (core's rule — a name mismatch
+    /// result's column names come from the LEFT arm (the TS engine's rule — a name mismatch
     /// is not an error). `UNION` (all=false) deduplicates the combined rows by the
     /// grouping key; `UNION ALL` keeps every row. A shorter arm's rows are padded
     /// with NULLs to the left arm's width.
@@ -1195,7 +1195,7 @@ pub enum SetOp {
     },
     /// Delete the bound element in `slot` — a node (GQL `DELETE`/`DETACH DELETE`,
     /// Gremlin `drop()`) or an edge. `detach` deletes a node's incident edges too;
-    /// a non-`detach` DELETE of a node that still has edges is an error (Cypher/core
+    /// a non-`detach` DELETE of a node that still has edges is an error (Cypher/the TS engine
     /// semantics). Applied in op order alongside SET/REMOVE. (Gremlin `drop()`
     /// currently only reaches node slots and sets `detach: true`.)
     Delete {
@@ -1289,7 +1289,7 @@ impl Plan {
 
     /// Like [`Self::expand_edge`] but with Gremlin `bothE()` self-loop semantics: an
     /// undirected edge hop crosses a self-loop TWICE (it is both an out- and an in-edge),
-    /// so `bothE().otherV()` on a self-loop yields the vertex twice — matching core. A
+    /// so `bothE().otherV()` on a self-loop yields the vertex twice — matching the TS engine. A
     /// directed edge hop is unaffected (`double_loops` only bites on `Dir::Both`).
     #[must_use]
     pub fn expand_edge_gremlin(self, from: usize, dir: Dir, edge_label: &[String]) -> Self {

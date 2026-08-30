@@ -19,7 +19,7 @@ const codeOf = (fn: () => unknown): unknown => {
 const ids = (g: Graph): string[] =>
   query<{ id: string }>(g, `MATCH (n:Acct) RETURN n.id AS id ORDER BY n.id`).map((r) => r.id);
 
-// Byte-identical with the Rust core's transaction-keyword tests
+// Byte-identical with the Rust engine's transaction-keyword tests
 // (crates/lenke-engine/src/gql/tests.rs) and the cross-engine differential
 // (packages/native/src/transaction-conformance.test.ts).
 describe('GQL: ISO transaction keywords (START TRANSACTION / COMMIT / ROLLBACK)', () => {

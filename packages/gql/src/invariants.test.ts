@@ -32,7 +32,7 @@ const sum = (g: Graph): number =>
 // after every write transaction. Unlike a per-element validator, it runs ONCE per
 // commit against the fully-staged graph. `false`-only-fails: VIOLATED iff any
 // result cell is boolean `false` (true/null/non-boolean/empty all hold).
-// Byte-identical to the Rust core — see the differential in
+// Byte-identical to the Rust engine — see the differential in
 // packages/native/src/constraint-conformance.test.ts.
 describe('GQL: graph-level invariants', () => {
   test('debits==credits: a balance-preserving transfer commits', () => {

@@ -1,5 +1,5 @@
 // Differential fuzzer: generate random GQL queries from a seeded PRNG, run each
-// through BOTH engines (the TS @lenke/gql engine and the Rust core over bun:ffi),
+// through BOTH engines (the TS @lenke/gql engine and the Rust engine over bun:ffi),
 // and assert byte-identical behavior — the same JSON when both succeed, and
 // both-error when either errors. Byte-identity is the hard invariant, so any value
 // that renders/compares/coerces differently between the two engines is a bug. The
@@ -566,7 +566,7 @@ const codeOf = (e: unknown): string =>
 
 type Outcome = { ok: true; json: string } | { ok: false; code: string };
 
-suite('differential fuzz: TS gql engine vs Rust core', () => {
+suite('differential fuzz: TS gql engine vs Rust engine', () => {
   const backend = nativeBackend();
   const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());

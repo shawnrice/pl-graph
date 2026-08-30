@@ -1,22 +1,22 @@
-//! lenke-core's own Gremlin tests, ported and now run on the ENGINE. Each `#[test]`
-//! body — copied verbatim from `lenke-core/src/gremlin/tests.rs` et al. — builds one
-//! traversal through the `dual` shim (a builder with the same surface core's
+//! The now-removed lenke-core's own Gremlin tests, ported and now run on the ENGINE. Each `#[test]`
+//! body — copied verbatim from the former `lenke-core/src/gremlin/tests.rs` et al. — builds one
+//! traversal through the `dual` shim (a builder with the same surface that crate's
 //! `gremlin::Traversal` had) and runs it on the engine, and the body's own
-//! `assert_eq!` checks the expected value. Core was the oracle these were dual-checked
+//! `assert_eq!` checks the expected value. The now-removed lenke-core was the oracle these were dual-checked
 //! against; core has been deleted, so the engine is now the sole engine — its
 //! byte-identity with the pure-TS engine (the property the dual-check helped police)
 //! is upheld by the TS differential fuzzers.
 //!
-//! The fixtures are core-DIALECT ndjson (as core's tests wrote them), converted to the
+//! The fixtures are the now-removed lenke-core's DIALECT ndjson (as its tests wrote them), converted to the
 //! engine dialect by `core_line_to_engine`, so the ported bodies build the exact same
 //! graphs. A value form (`GVal`) and the enums the bodies name live in `dual`.
 //!
 //! ## Triage of the surfaced divergences
 //!
 //! Flipping this suite to engine-only exposed the places where the engine's Gremlin
-//! differs from core's curated TinkerPop expectations — differences the old dual
-//! harness HID (it skipped every engine-faults-where-core-passes case, and ran the
-//! error-contract bodies on core only). Nothing here is weakened or `#[ignore]`d.
+//! differs from the now-removed lenke-core's curated TinkerPop expectations — differences the old dual
+//! harness HID (it skipped every engine-faults-where-lenke-core-passes case, and ran the
+//! error-contract bodies on the now-removed lenke-core only). Nothing here is weakened or `#[ignore]`d.
 //!
 //! **Re-asserted to green** (the engine's DELIBERATE contract, per the intentional-vs-
 //! Java-ism rule):
@@ -27,8 +27,8 @@
 //!   `project()` with a non-single-hop reducing body, `path()` over an E-source / with
 //!   `by()` modulators / after `values()`, the `fail()` step, `not(within(…))`.
 //! - *Earlier validation* — a malformed `math()` and `sack()`-without-`withSack` are
-//!   rejected at PARSE, where core faulted at run (same "is an error" contract).
-//! - *Coarser error code* — a plan fault reports `InvalidValue` where core said
+//!   rejected at PARSE, where the now-removed lenke-core faulted at run (same "is an error" contract).
+//! - *Coarser error code* — a plan fault reports `InvalidValue` where the now-removed lenke-core said
 //!   `DataException` (we don't replicate Java-era codes exactly).
 //! - *Unspecified order* — union-branch interleave and multi-key `values()` flatten
 //!   compare as a multiset (`bag()`).
@@ -73,7 +73,7 @@
 //!   engine's write model emits only via an explicit projection, like GQL
 //!   `INSERT … RETURN`); TinkerPop emits the created/mutated element. (2)
 //! - *Leniency gap* — the engine doesn't reject a malformed `addV('a::b')`/empty name
-//!   where core guarded it (Gremlin is otherwise permissive about arbitrary strings).
+//!   where the now-removed lenke-core guarded it (Gremlin is otherwise permissive about arbitrary strings).
 
 #![allow(clippy::bool_assert_comparison, clippy::approx_constant)]
 
@@ -85,8 +85,8 @@ use dual::{g, GVal, Order, Pop, Token, __, P};
 /// The graph the ported bodies thread through `run`/`try_run` — a live engine store.
 pub type EngineGraph = lenke_engine::store::Store;
 
-/// One core-dialect ndjson line → the engine dialect (`{"id","labels","props"}` node,
-/// `{"id"?,"from","to","type","props"}` edge). So a core-written fixture builds the
+/// One now-removed lenke-core dialect ndjson line → the engine dialect (`{"id","labels","props"}` node,
+/// `{"id"?,"from","to","type","props"}` edge). So a fixture written by the now-removed lenke-core builds the
 /// same engine graph.
 fn core_line_to_engine(line: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(line).expect("fixture json");
@@ -125,7 +125,7 @@ const MODERN_CORE: &str = include_str!(concat!(
     "/tests/fixtures/modern_gremlin.ndjson"
 ));
 
-/// Build an engine store from CORE-dialect ndjson (the form core's tests emit).
+/// Build an engine store from the now-removed lenke-core's dialect ndjson (the form its tests emit).
 fn engine_store_from(core_ndjson: &str) -> EngineGraph {
     let mut out = String::new();
     for line in core_ndjson.lines().filter(|l| !l.trim().is_empty()) {
@@ -140,7 +140,7 @@ fn modern() -> EngineGraph {
     engine_store_from(MODERN_CORE)
 }
 
-/// A fallible engine store from core-dialect ndjson — the drop-in the ported bodies use
+/// A fallible engine store from the now-removed lenke-core's dialect ndjson — the drop-in the ported bodies use
 /// where they wrote `decode(...)` (rewired by name). `.unwrap()` in a
 /// body panics on a genuinely malformed fixture, exactly as before.
 fn decode(core_ndjson: &str) -> Result<EngineGraph, String> {
@@ -159,7 +159,7 @@ use lenke_engine::value::Value;
 
 /// A bare vertex arrives from the engine as a `{id,labels,properties}` map (the engine
 /// has no interior `Value::Node`). Detect that exact shape so it can read back as a
-/// vertex, matching how core's tests treated `V()` output.
+/// vertex, matching how the now-removed lenke-core's tests treated `V()` output.
 fn is_bare_vertex(m: &[(EngVal, EngVal)]) -> bool {
     let keys: std::collections::BTreeSet<&str> = m
         .iter()
@@ -258,7 +258,7 @@ fn exec_query(query: &str, store: &mut EngineGraph) -> Result<Vec<GVal>, String>
 
 /// The infallible path the bodies' `.run()` / `q(...)` / `qs(...)` use: any fault —
 /// a parse rejection (a deferred step) OR a runtime fault — yields an empty result,
-/// matching core's infallible `run` (several bodies assert `run()` "must not panic"
+/// matching the now-removed lenke-core's infallible `run` (several bodies assert `run()` "must not panic"
 /// after checking the fault via `try_run`). A body that expected real rows sees an
 /// empty result — a visible assertion failure, not a panic.
 fn run_query(query: &str, store: &mut EngineGraph) -> Vec<GVal> {
@@ -384,7 +384,7 @@ fn try_run(store: &mut EngineGraph, t: &impl EngRef) -> Result<Vec<GVal>, EngErr
 }
 
 /// True when the engine REJECTS `query` — at parse time OR at run time. The engine
-/// validates several things core caught at runtime (a malformed `math()`, a `sack()`
+/// validates several things the now-removed lenke-core caught at runtime (a malformed `math()`, a `sack()`
 /// with no `withSack`) earlier, at parse; and it explicitly DEFERS a number of Gremlin
 /// steps (`addE().from(<tag>)`, a navigating `map()` body, an open `repeat()`, …). Both
 /// are "the engine refuses this input", the shape these ported error/deferral bodies
@@ -434,7 +434,7 @@ impl EngRun for ParsedT {
     }
 }
 
-/// Build once and run on a fresh Modern graph — core's `q`, now engine-only.
+/// Build once and run on a fresh Modern graph — the now-removed lenke-core's `q`, now engine-only.
 fn q<T: EngRun>(t: T) -> Vec<GVal> {
     let mut g = modern();
     t.run_on(&mut g)
@@ -489,7 +489,7 @@ fn ordered(r: Vec<GVal>) -> Vec<String> {
 
 /// A canonical MULTISET form (each value by its debug repr, sorted) — for results
 /// whose ORDER is unspecified (union-branch interleave, multi-key `values()` flatten):
-/// the engine and core produce the same bag in a different sequence.
+/// the engine and the TS engine produce the same bag in a different sequence.
 fn bag(r: Vec<GVal>) -> Vec<String> {
     let mut v: Vec<String> = r.iter().map(|g| format!("{g:?}")).collect();
     v.sort();
@@ -503,7 +503,7 @@ fn one_num(r: Vec<GVal>) -> f64 {
     }
 }
 
-// ── core's Gremlin tests, ported verbatim (bodies unchanged; builder/helpers shimmed) ──
+// ── the now-removed lenke-core's Gremlin tests, ported verbatim (bodies unchanged; builder/helpers shimmed) ──
 #[test]
 fn v_all_and_count() {
     assert_eq!(one_num(q(g().V().count())), 6.0);
@@ -1575,7 +1575,7 @@ fn qs(query: &str) -> Vec<GVal> {
     t.run(&mut g)
 }
 
-/// Alias of [`qs`] — some core step-test files name the string runner `run`.
+/// Alias of [`qs`] — some now-removed lenke-core step-test files name the string runner `run`.
 #[allow(dead_code)] // used by later ported step-test files
 fn run(query: &str) -> Vec<GVal> {
     qs(query)
@@ -1583,7 +1583,7 @@ fn run(query: &str) -> Vec<GVal> {
 
 /// Parse + run with vertex indexes declared on the CORE graph. Index seeding is a
 /// planner OPTIMIZATION — it must not change the result set — so the engine (whose
-/// planner seeks automatically) still matches core row-for-row via the dual check.
+/// planner seeks automatically) still matches the TS engine row-for-row via the dual check.
 fn q_vidx(indexes: &[&str], query: &str) -> Vec<GVal> {
     let mut g = modern();
     for k in indexes {
@@ -1610,7 +1610,7 @@ fn qs_e(query: &str) -> Vec<GVal> {
     t.run(&mut g)
 }
 
-/// Alias of [`qs_e`] — some core step-test files name the edge-id runner `qs_eids`.
+/// Alias of [`qs_e`] — some now-removed lenke-core step-test files name the edge-id runner `qs_eids`.
 #[allow(dead_code)]
 fn qs_eids(query: &str) -> Vec<GVal> {
     qs_e(query)
@@ -1800,7 +1800,7 @@ fn count_of(g: &mut EngineGraph, src: &str) -> f64 {
     )
 }
 
-/// Assert a traversal agrees with its `fold().unfold()`-streamed spelling (core-side;
+/// Assert a traversal agrees with its `fold().unfold()`-streamed spelling (the now-removed lenke-core side;
 /// each run is also dual-checked against the engine).
 #[allow(dead_code)]
 fn same_via_stream(g: &mut EngineGraph, src: &str) {
@@ -1891,7 +1891,7 @@ fn ids_of(t: dual::Traversal) -> Vec<String> {
 #[allow(dead_code)]
 fn paths_text(t: dual::Traversal) -> Vec<Vec<String>> {
     // The edge-id Modern graph, so an edge element in a path renders its stable ext-id
-    // ("8") on BOTH engines — a plain graph would have core mint a synthetic "e1" while
+    // ("8") on BOTH engines — a plain graph would have the now-removed lenke-core mint a synthetic "e1" while
     // the encoded engine store carries the real id.
     let mut g = modern_eids();
     t.run(&mut g)
@@ -1903,7 +1903,7 @@ fn paths_text(t: dual::Traversal) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// A result map as its core `MapVal`.
+/// A result map as the now-removed lenke-core's `MapVal`.
 #[allow(dead_code)]
 fn as_map(g: &GVal) -> &dual::MapVal {
     match g {
@@ -1979,7 +1979,7 @@ fn map_get<'a>(g: &'a GVal, key: &str) -> Option<&'a GVal> {
     }
 }
 
-/// Resolve element-ids in a result list of vertices/edges (core-side).
+/// Resolve element-ids in a result list of vertices/edges (the now-removed lenke-core side).
 #[allow(dead_code)]
 fn ids(_g: &EngineGraph, r: &[GVal]) -> Vec<String> {
     r.iter()
@@ -2043,7 +2043,7 @@ fn sack_folds_and_reads_the_default() {
 fn sack_without_with_sack_faults() {
     // sack() with no preceding withSack() is a usage error, not a silent empty.
     // The engine rejects `sack()` with no preceding `withSack()` at PARSE time (a
-    // static check) where core faulted at run time — same "usage error, not a silent
+    // static check) where the now-removed lenke-core faulted at run time — same "usage error, not a silent
     // empty" contract, caught earlier.
     assert!(rejects("g.V().sack()"));
 }
@@ -2712,7 +2712,7 @@ fn parser_valid_counts_still_parse() {
 fn repeat_budget_guards_runaway_on_dense_graph() {
     // The engine requires `repeat(<hop>)` to be CLOSED by times()/emit()/until() — an
     // OPEN repeat is rejected at parse. So there is no unbounded runaway to guard
-    // against: core allowed an open repeat with a default iteration cap, the engine
+    // against: the now-removed lenke-core allowed an open repeat with a default iteration cap, the engine
     // does not admit one at all.
     assert!(rejects("g.V().repeat(both())"));
 }
@@ -2739,7 +2739,7 @@ fn order_by_mixed_type_property_faults_not_panics() {
         .collect();
     let mut g = decode(&lines.join("\n")).unwrap();
     // The engine's `order()` uses a TOTAL order over mixed types (for determinism +
-    // byte-identity with the TS engine) rather than throwing like core — so a mixed
+    // byte-identity with the TS engine) rather than throwing like the now-removed lenke-core — so a mixed
     // number/string `order().by('p')` sorts every row deterministically and, above
     // all, must NOT panic (Rust's `sort_by` requires a total order).
     let t = parse("g.V().order().by('p')").unwrap();
@@ -2766,7 +2766,7 @@ fn lexer_decodes_string_escapes() {
 #[test]
 fn comparison_of_incomparable_types_faults() {
     // A string-vs-number comparison FILTERS (postgres-style no-match), consistently in
-    // GQL and Gremlin — it does NOT throw like TinkerPop/core. `is(gt(5))` over string
+    // GQL and Gremlin — it does NOT throw like TinkerPop/the now-removed lenke-core. `is(gt(5))` over string
     // names matches nothing. (The string-vs-TEMPORAL ordering throw is a separate rule.)
     assert!(qs("g.V().values('name').is(gt(5))").is_empty());
 }
@@ -2774,7 +2774,7 @@ fn comparison_of_incomparable_types_faults() {
 #[test]
 fn addv_and_property_reject_malformed_names() {
     // A `::` (the GraphSON multi-label separator, which breaks codec round-tripping) or
-    // an empty label/key is rejected — the engine guards the WRITE steps, matching core.
+    // an empty label/key is rejected — the engine guards the WRITE steps, matching the TS engine.
     // (Gremlin stays permissive about arbitrary strings elsewhere.)
     for src in [
         "g.addV('a::b')",        // GraphSON multi-label separator in a label
@@ -2791,7 +2791,7 @@ fn addv_and_property_reject_malformed_names() {
 fn order_over_mixed_types_faults() {
     // The engine's `order()` uses a TOTAL order over mixed types (numbers before
     // strings) for determinism + byte-identity with the TS engine — it does NOT throw
-    // like TinkerPop/core. `inject(3,'a',1).order()` → [1, 3, 'a'].
+    // like TinkerPop/the now-removed lenke-core. `inject(3,'a',1).order()` → [1, 3, 'a'].
     assert_eq!(
         qs("g.inject(3, 'a', 1).order()"),
         vec![GVal::Num(1.0), GVal::Num(3.0), GVal::Str("a".into())]
@@ -6275,7 +6275,7 @@ fn p5_values_filters_missing_key() {
 #[test]
 fn p5_values_multiple_keys() {
     // `values('name','age')` flatten order across vertices is unspecified (the engine
-    // groups by key, core interleaves per vertex); compare as a multiset.
+    // groups by key, the TS engine interleaves per vertex); compare as a multiset.
     assert_eq!(
         bag(q_eids(g().V().values(&["name", "age"]))),
         bag(vec![
@@ -8006,7 +8006,7 @@ fn repeat_emit_loops_predicate_offset() {
 #[test]
 fn id_of_a_path_faults_from_the_plan() {
     // The engine DEFERS `path()` over an E-source (edge steps / the E source), so
-    // `g.E().path().id()` is rejected from the plan. Core faulted here too — for a
+    // `g.E().path().id()` is rejected from the plan. The now-removed lenke-core faulted here too — for a
     // different reason (a path has no id) — so the "this is a plan fault" intent
     // holds; re-asserted as the engine's rejection.
     assert!(rejects("g.E().path().id()"));
@@ -8894,7 +8894,7 @@ fn a_temporal_has_seeks_the_temporal_index() {
 
     // The temporal predicate above must SEEK the `when` index rather than scan — the
     // observable equivalence the fix restored, asserted on rows. The engine's own
-    // index tests exercise its temporal index-key encoding; the core-internal
+    // index tests exercise its temporal index-key encoding; the now-removed lenke-core's internal
     // `Value::index_key()` probe that stood here has no engine analogue.
 }
 
@@ -9818,7 +9818,7 @@ fn a_numeric_column_cannot_hold_a_nan() {
     // Non-finite normalization to null happens on the write path (`set_prop` above,
     // the route a query cannot take). The engine stores no non-finite numeric — its
     // column-representation invariant is a private storage detail with no engine
-    // analogue to the core `Column::Num`/`Mixed` probe that stood here; the OBSERVABLE
+    // analogue to the now-removed lenke-core's `Column::Num`/`Mixed` probe that stood here; the OBSERVABLE
     // consequence is checked below: it reads back as null, not as a stale value.
 
     // And it reads back as null, not as an absent property with a stale value.

@@ -1,5 +1,5 @@
 // Table-driven GQL scalar/function differential: every query string here is run
-// on BOTH the TS engine (@lenke/gql) and the Rust core (over bun:ffi) against
+// on BOTH the TS engine (@lenke/gql) and the Rust engine (over bun:ffi) against
 // identical data, and their `JSON.stringify`d results are asserted
 // byte-identical. This is the guardrail for cross-engine function parity — a
 // divergence in any scalar function, operator, or predicate shows up as a red

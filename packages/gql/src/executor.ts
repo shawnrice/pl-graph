@@ -1745,7 +1745,7 @@ const noteCountParam = (v: CountValue | undefined): void => {
  * `ORDER BY a` IS `ORDER BY n.age` when the projection says `n.age AS a`, and it
  * must not be a different plan. Left alone it read an OUTPUT column, which
  * forces `orderNeedsOutput` and gives up the top-k — so the alias spelling both
- * ran slower (measured 1.8x in the Rust core over 20k rows) and, with a LIMIT,
+ * ran slower (measured 1.8x in the Rust engine over 20k rows) and, with a LIMIT,
  * projected every row where its twin projected only the emitted ones. That
  * second difference was observable: a faulting projection threw for one spelling
  * and not the other.

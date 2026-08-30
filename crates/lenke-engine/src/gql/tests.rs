@@ -107,7 +107,7 @@ fn present_null_survives_rollback() {
     );
 }
 
-/// A present-null interacts with constraints like core: a REQUIRED key must be
+/// A present-null interacts with constraints like the TS engine: a REQUIRED key must be
 /// present AND non-null, so `SET k = null` on it is rejected (a present-null is not a
 /// value); a UNIQUE key EXEMPTS nulls, so two present-nulls don't collide. Verifies
 /// the write-path enforcement end to end.
@@ -650,7 +650,7 @@ fn single_node_return_property() {
         label: Some("Person".into()),
     }
     .project(vec![(
-        // Unaliased `p.name` is named `p.name` (the expression text), like core.
+        // Unaliased `p.name` is named `p.name` (the expression text), like the TS engine.
         "p.name".into(),
         Expr::Prop {
             slot: 0,
@@ -1417,7 +1417,7 @@ fn temporal_component_accessors() {
         assert_eq!(num(&col(&out, 0, name)), want, "{name}");
     }
     // A component undefined for the kind FAULTS with E_INVALID_VALUE (year of a
-    // time, hour of a date) — matching core, which errors rather than NULLs.
+    // time, hour of a date) — matching the TS engine, which errors rather than NULLs.
     for q in [
         "MATCH (p:Person) RETURN _year(TIME '01:02:03') AS y",
         "MATCH (p:Person) RETURN _hour(DATE '2024-01-01') AS h",
@@ -1851,7 +1851,7 @@ fn call_on_cycle_procedure_yields_on_cycle_flag() {
             })
             .collect()
     };
-    // The triangle members are on a cycle (Bool true, matching core's `onCycle`
+    // The triangle members are on a cycle (Bool true, matching the TS engine's `onCycle`
     // type); the isolated node is not (Bool false).
     let want = vec![(0.0, true), (1.0, true), (2.0, true), (3.0, false)];
     assert_eq!(rows_of("CALL on_cycle() YIELD node, onCycle"), want);
@@ -2376,7 +2376,7 @@ fn num(v: &Value) -> f64 {
     }
 }
 // A node-id-valued procedure result (componentId / cluster / label) renders as the
-// representative node's EXTERNAL id string (matching core), not a dense index.
+// representative node's EXTERNAL id string (matching the TS engine), not a dense index.
 fn str_val(v: &Value) -> String {
     match v {
         Value::Str(s) => s.to_string(),
@@ -2389,7 +2389,7 @@ fn col(rows: &Rows, r: usize, name: &str) -> Value {
 }
 
 /// The numeric id of a NODE-element result map (`{id: "N", labels, properties}`),
-/// which is how a node binding now renders (matching core).
+/// which is how a node binding now renders (matching the TS engine).
 fn node_id(v: &Value) -> f64 {
     match v {
         Value::Map(m) => m
@@ -3035,8 +3035,8 @@ fn anchor_flip_matches_forward_and_respects_source_label() {
 
 /// A write immediately followed by a traversal must NOT cost more as the graph
 /// grows — the shape that repacked the read-side adjacency snapshot on every write
-/// in the old engine (the mistake this guards against). Ported from lenke-core's
-/// `interleaved_write_and_traverse_is_independent_of_graph_size`: run the
+/// in the old engine (the mistake this guards against). Ported from the now-removed
+/// lenke-core's `interleaved_write_and_traverse_is_independent_of_graph_size`: run the
 /// write+traverse cycle at 2k and 32k vertices and assert the cost scales
 /// sub-linearly (16x more vertices, `< 6x` time). If a read after a write rebuilds
 /// the whole adjacency instead of reading the delta, the ratio tracks graph size.
@@ -3044,7 +3044,7 @@ fn anchor_flip_matches_forward_and_respects_source_label() {
 /// Timing-based, so MIN over reps (a single ~1ms sample against a 6x bound is below
 /// this repo's noise floor); the minimum is the closest thing to an
 /// interference-free run. `#[ignore]`d because it flakes under the CPU contention of
-/// the full parallel `cargo test` run (as core's own copy notes: "failed 2 of 8 with
+/// the full parallel `cargo test` run (as the now-removed lenke-core's own copy notes: "failed 2 of 8 with
 /// the box loaded") — a scaling assertion needs an isolated harness. Run it alone:
 ///   cargo test -p lenke-engine --release --lib \
 ///     interleaved_write_and_traverse_is_independent_of_graph_size -- --ignored --exact
@@ -3649,7 +3649,7 @@ fn scalar_fn_null_and_domain() {
         &store,
     );
     assert_eq!(out.rows.iter().filter(|r| r[0].is_null()).count(), 1);
-    // sqrt of a negative KEEPS NaN (a real signal), matching lenke-core — it is
+    // sqrt of a negative KEEPS NaN (a real signal), matching the TS engine — it is
     // coerced to null only at JSON egress, not in the result value (K4).
     let out = run(
         &super::parse("MATCH (p:Person) WHERE p.name='alice' RETURN sqrt(0 - p.age) AS s").unwrap(),
@@ -3981,7 +3981,7 @@ fn string_escapes() {
     assert_eq!(val(r"RETURN '\'' AS r"), "'");
     assert_eq!(val(r"RETURN '\u0041' AS r"), "A");
     assert_eq!(val(r"RETURN '\U01F600' AS r"), "\u{1F600}");
-    // A malformed \u escape is rejected (agreeing with core).
+    // A malformed \u escape is rejected (agreeing with the TS engine).
     assert!(super::parse(r"RETURN '\uH' AS x").is_err());
 }
 
@@ -4031,7 +4031,7 @@ fn node_label_algebra() {
     assert_eq!(n("MATCH (x IS Person) RETURN count(*) AS c"), 2.0); // pa, p (= :Person)
 }
 
-/// A landing (non-seed) node's label constrains the hop, as core does — in a
+/// A landing (non-seed) node's label constrains the hop, as the TS engine does — in a
 /// plain MATCH and inside a COUNT{}/EXISTS{} subquery body.
 #[test]
 fn landing_node_label() {
@@ -4061,7 +4061,7 @@ fn landing_node_label() {
 }
 
 /// The cross-type total order (Num < Str < Bool < Temporal < compound < Null,
-/// matching core) drives ORDER BY / min / max over a mixed-type column.
+/// matching the TS engine) drives ORDER BY / min / max over a mixed-type column.
 #[test]
 fn mixed_type_total_order() {
     let nd = concat!(
@@ -4117,7 +4117,7 @@ fn grouped_order_by_group_key() {
     assert_eq!(rows, vec!["Str(\"a\"),Num(2.0)", "Str(\"z\"),Num(1.0)"]);
 }
 
-/// `TIMESTAMP '…'` is core's alias for a (local) DATETIME literal.
+/// `TIMESTAMP '…'` is the TS engine's alias for a (local) DATETIME literal.
 #[test]
 fn timestamp_is_datetime_alias() {
     let store = social();
@@ -4317,7 +4317,7 @@ fn substring_edges() {
     assert!(matches!(col(&out, 0, "tail"), Value::Str(x) if &*x == "ice")); // ISO 1-based, from unit 2
     assert!(matches!(col(&out, 0, "past"), Value::Str(x) if x.is_empty())); // clamped
                                                                             // A start <= 0 shrinks the window from the front (SQL semantics), so it
-                                                                            // returns the whole string — matching core, NOT NULL.
+                                                                            // returns the whole string — matching the TS engine, NOT NULL.
     let neg = run(
         &super::parse("MATCH (p:Person) WHERE p.name='alice' RETURN substring(p.name, -1) AS x")
             .unwrap(),
@@ -4419,7 +4419,7 @@ fn union_and_union_all() {
 }
 
 /// `collect_list(x)` gathers a group's values into a list in row order, SKIPPING
-/// nulls (core's semantics — distinct from Gremlin fold, which keeps them).
+/// nulls (the TS engine's semantics — distinct from Gremlin fold, which keeps them).
 #[test]
 fn collect_list_aggregate_skips_nulls() {
     let mut b = Builder::default();
@@ -4490,7 +4490,7 @@ fn order_by_unprojected_expression() {
     );
 }
 
-/// `RETURN r` (a bound edge) renders core's edge element map —
+/// `RETURN r` (a bound edge) renders the TS engine's edge element map —
 /// `{id, from, to, labels, properties}`.
 #[test]
 fn return_edge_renders_element_map() {
@@ -4537,7 +4537,7 @@ fn return_star_expands_bound_vars() {
     assert_eq!(out2.names, vec!["n".to_string(), "nm".to_string()]);
 }
 
-/// `RETURN n` (a bare node binding) renders the element MAP core produces —
+/// `RETURN n` (a bare node binding) renders the element MAP the TS engine produces —
 /// `{id, labels(sorted), properties(sorted)}` — not the bare node id.
 #[test]
 fn return_node_renders_element_map() {

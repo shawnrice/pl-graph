@@ -36,7 +36,7 @@ import { applySource } from './sources.js';
  * operation", which is what this is. Not a syntax error: the traversal parses
  * fine. Not `InvalidValue`: that means a value outside the LPG property-value
  * model, and a path is a perfectly good value that simply has no id. The Rust
- * core raises the same code from the same check.
+ * engine raises the same code from the same check.
  *
  * Only through steps that pass the traverser's value on UNCHANGED — `unfold()`
  * turns a path into its elements, and `id()` on those is fine, so a scan that

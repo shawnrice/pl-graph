@@ -199,7 +199,7 @@ const outcome = (run: () => unknown): string => {
   }
 };
 
-suite('differential fuzz: write path (TS engine vs Rust core)', () => {
+suite('differential fuzz: write path (TS engine vs Rust engine)', () => {
   const backend = createFfiEngineBackend(LIB);
   const SEED_COUNT =
     process.env.FUZZ_SEED === undefined

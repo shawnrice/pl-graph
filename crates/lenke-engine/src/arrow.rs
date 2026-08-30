@@ -1,11 +1,11 @@
 //! Columnar result egress in the `ARW1` blob format — the dependency-free carrier
-//! lenke-core lays a query result out in: a validity bitmap plus a typed
+//! the TS engine lays a query result out in: a validity bitmap plus a typed
 //! values/offsets buffer per column, inside one self-describing blob whose buffers
 //! ARE Apache Arrow's physical column layout (little-endian, 8-byte aligned,
-//! LSB-first validity bitmap, `i32` Utf8 offsets). Ported to match lenke-core's
+//! LSB-first validity bitmap, `i32` Utf8 offsets). Ported to match the TS engine's
 //! byte layout for the scalar column types.
 //!
-//! ## Blob layout (all integers little-endian), from lenke-core's `arrow.rs`:
+//! ## Blob layout (all integers little-endian), from the now-removed lenke-core's `arrow.rs`:
 //! ```text
 //! header (24 bytes):  magic "ARW1" | version:u32=1 | nrows:u64 | ncols:u64
 //! column descriptors (ncols × 40 bytes), each 10×u32:
@@ -22,8 +22,8 @@
 //! [`to_arrow_ipc`] layers the standard Apache Arrow IPC framing (flatbuffer
 //! `Schema`/`RecordBatch`/`Footer` messages) over these exact buffers — stream or
 //! file/Feather-v2 — so DuckDB/Polars/pandas consume the result directly. It is a
-//! verbatim port of lenke-core's framing over the identical ARW1 blob, so the
-//! bytes match lenke-core (and thus the TS/apache-arrow encoder) exactly.
+//! verbatim port of the now-removed lenke-core's framing over the identical ARW1 blob, so the
+//! bytes match the TS/apache-arrow encoder exactly.
 
 use crate::exec::Rows;
 use crate::value::Value;
@@ -44,7 +44,7 @@ pub const T_FIXED_LIST: u32 = 4;
 /// the descriptor array in pre-order (a child may itself be a struct → nesting).
 /// The header's `ncols` counts only TOP-LEVEL columns. A scalar-only blob has no
 /// struct descriptors, so its bytes are unchanged (byte-identical to before this
-/// type existed — and to lenke-core's scalar blob).
+/// type existed — and to the TS engine's scalar blob).
 pub const T_STRUCT: u32 = 5;
 
 const HEADER_LEN: usize = 24;
@@ -56,7 +56,7 @@ fn align8(v: usize) -> usize {
 }
 
 /// Render a cell as Utf8 text for the mixed-column fallback (validity carries the
-/// null, so a null is an empty span). Scalars match lenke-core (`Num` via `{n}`,
+/// null, so a null is an empty span). Scalars match the TS engine (`Num` via `{n}`,
 /// `Temporal` via its ISO form). A record/map/list only reaches here in a
 /// type-MIXED column; a uniform one becomes a real `Struct`/`FixedSizeList`.
 fn cell_str(c: &Value, out: &mut String) {
@@ -110,7 +110,7 @@ fn cell_str(c: &Value, out: &mut String) {
 /// The sorted union of a struct column's field names + a per-cell field lookup.
 /// A cell is "struct-like" if it is a `Record` (ISO record; keys already sorted,
 /// string names) or a `Map` whose keys are all strings (the Gremlin map that can
-/// name struct fields). This mirrors lenke-core, whose result-side `Map` (the
+/// name struct fields). This mirrors the TS engine, whose result-side `Map` (the
 /// serialized record form) is what it turns into a `Struct`.
 fn struct_fields(cell: &Value) -> Option<Vec<(&str, &Value)>> {
     match cell {
@@ -162,7 +162,7 @@ fn fixed_numeric_dim(cells: &[Value]) -> Option<usize> {
 }
 
 /// A single result column in typed form (the Arrow physical types we emit),
-/// mirroring lenke-core's `ArrowColumn` so the assembled bytes match. `valid =
+/// mirroring the TS engine's `ArrowColumn` so the assembled bytes match. `valid =
 /// None` means no nulls.
 enum ArrowColumn {
     Num {
@@ -194,7 +194,7 @@ enum ArrowColumn {
 }
 
 impl ArrowColumn {
-    /// Infer a column's physical type from its cells, matching lenke-core:
+    /// Infer a column's physical type from its cells, matching the TS engine:
     /// all-record/map → `Struct`; all-numeric-same-length-list → `FixedSizeList`;
     /// present Nums → Float64; present Bools → Bool; else Utf8.
     fn from_values(cells: &[Value]) -> Self {
@@ -433,7 +433,7 @@ fn flatten_descs<'a>(
 }
 
 /// Encode a query result as an `ARW1` columnar blob. Byte-for-byte identical to
-/// lenke-core's `to_arrow` for the same logical table (asserted by the
+/// the TS engine's `to_arrow` for the same logical table (asserted by the
 /// cross-engine `arrow_parity` test).
 #[must_use]
 pub fn to_arrow(rows: &Rows) -> Vec<u8> {
@@ -508,10 +508,10 @@ pub fn to_arrow(rows: &Rows) -> Vec<u8> {
 
 // ── Apache Arrow IPC framing ────────────────────────────────────────────────
 //
-// Ported verbatim from lenke-core's `arrow.rs`: the ARW1 buffers above already ARE
+// Ported verbatim from the now-removed lenke-core's `arrow.rs`: the ARW1 buffers above already ARE
 // Arrow's physical column layout, so real Arrow IPC is those buffers concatenated
 // (the RecordBatch body) plus the standard flatbuffer Schema / RecordBatch / Footer
-// messages. Because lenke-engine's ARW1 blob is byte-identical to lenke-core's,
+// messages. Because lenke-engine's ARW1 blob is byte-identical to the TS engine's,
 // this framing yields byte-identical IPC (asserted by `tests/arrow_parity.rs`).
 
 const METADATA_V5: i16 = 4; // MetadataVersion.V5
@@ -1031,7 +1031,7 @@ pub fn arrow_ipc_from_blob(blob: &[u8], file: bool) -> Vec<u8> {
 
 /// Encode a query result directly as Apache Arrow IPC bytes (the pure-Rust egress
 /// path). `file` selects the file / Feather-v2 layout, else the IPC stream. The
-/// bytes are byte-for-byte identical to lenke-core's `to_arrow_ipc` for the same
+/// bytes are byte-for-byte identical to the TS engine's `to_arrow_ipc` for the same
 /// logical table (the ARW1 blob is identical, and this framing is a verbatim port).
 #[must_use]
 pub fn to_arrow_ipc(rows: &Rows, file: bool) -> Vec<u8> {
@@ -1267,7 +1267,7 @@ mod tests {
     }
 
     /// A Gremlin map with all-string keys becomes a Struct too (mirrors how
-    /// lenke-core turns a result-side map into a struct).
+    /// the TS engine turns a result-side map into a struct).
     #[test]
     fn string_keyed_map_becomes_struct() {
         let map = Value::Map(Arc::new(vec![(s("a"), n(1.0)), (s("b"), n(2.0))]));

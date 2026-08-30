@@ -722,7 +722,7 @@ fn fold_grouped(
         AggFn::Collect | AggFn::CollectList => {
             // Gather each group's values into a list, in row order (a preceding sort
             // carries through). `Collect` (Gremlin fold) KEEPS nulls; `CollectList`
-            // (GQL collect_list) SKIPS them, matching core. An empty (or all-null,
+            // (GQL collect_list) SKIPS them, matching the TS engine. An empty (or all-null,
             // for CollectList) group folds to the empty list.
             let skip_nulls = agg.func == AggFn::CollectList;
             let mut lists: Vec<Vec<Value>> = vec![Vec::new(); n_groups];
@@ -781,7 +781,7 @@ fn fold_grouped(
         }
         AggFn::StddevPop | AggFn::StddevSamp => {
             // One-pass moments per group: a present non-null value contributes as a
-            // number (a non-numeric one as NaN, which propagates — matching core's
+            // number (a non-numeric one as NaN, which propagates — matching the TS engine's
             // stddev over a non-numeric column). NULLs are skipped.
             let sample = agg.func == AggFn::StddevSamp;
             let mut sum = vec![0f64; n_groups];
@@ -807,7 +807,7 @@ fn fold_grouped(
         AggFn::PercentileCont | AggFn::PercentileDisc => {
             // Ordered-set: gather each group's finite numeric values, sort, and take
             // the `frac`-th percentile (interpolated for cont, discrete for disc) —
-            // replicated from core's `percentile`. Empty group → NULL.
+            // replicated from the TS engine's `percentile`. Empty group → NULL.
             let cont = agg.func == AggFn::PercentileCont;
             let frac = agg.frac.unwrap_or(0.0);
             let mut per_group: Vec<Vec<f64>> = vec![Vec::new(); n_groups];
@@ -832,7 +832,7 @@ fn fold_grouped(
 }
 
 /// The `frac`-th percentile of `nums` — interpolated (`cont`) or discrete (`disc`) —
-/// replicated exactly from core's `percentile`. Empty input → NULL.
+/// replicated exactly from the TS engine's `percentile`. Empty input → NULL.
 fn percentile_of(mut nums: Vec<f64>, frac: f64, cont: bool) -> Value {
     if nums.is_empty() {
         return Value::Null;
@@ -858,7 +858,7 @@ fn percentile_of(mut nums: Vec<f64>, frac: f64, cont: bool) -> Value {
 }
 
 /// Population / sample standard deviation from one-pass moments — replicated exactly
-/// from core's `stddev_of`. `pop` is NULL over 0 rows, `samp` over fewer than 2; the
+/// from the TS engine's `stddev_of`. `pop` is NULL over 0 rows, `samp` over fewer than 2; the
 /// summed squared deviation is clamped at 0 (preserving NaN) so f64 cancellation
 /// can't slip a tiny negative into `sqrt`.
 fn stddev_of(n: u64, sum: f64, sum_sq: f64, sample: bool) -> Value {

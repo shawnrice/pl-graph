@@ -141,7 +141,7 @@ fn repeat_times_one_equals_explicit_hop() {
 /// `has(k, neq(v))` desugars to `Not(And(PropertyExists{k}, Eq{k,v}))`; the raw fast
 /// path must match that 3VL exactly — an absent-`k` node IS kept (false AND null =
 /// false, Not = true), a present `k != v` is kept, a present `k == v` is dropped.
-/// The GQL differential engine already pins this against core; here we lock the row
+/// The GQL differential engine already pins this against the TS engine; here we lock the row
 /// set directly on a graph where some nodes lack the key.
 #[test]
 fn has_neq_keeps_absent_and_unequal() {
@@ -441,7 +441,7 @@ fn reachability_count_is_bfs_not_walk_enumeration() {
 /// Streaming a var-length endpoint projection to JSON must be (1) BYTE-IDENTICAL to
 /// serializing the materialized result — including `values()`'s drop-if-absent
 /// semantics (some nodes here lack `name`) — and (2) able to COMPLETE a closure larger
-/// than the row cap, since it never materializes the batch (the memory win over core's
+/// than the row cap, since it never materializes the batch (the memory win over the TS engine's
 /// materialize-then-serialize).
 #[test]
 fn streamed_varlen_values_matches_and_bypasses_the_row_cap() {
@@ -580,7 +580,7 @@ fn deep_traversal_runs_on_a_large_stack() {
 
 /// A runaway per-path `repeat` must trip the `trail` limit with a loud
 /// `E_RESOURCE_EXHAUSTED` — never a truncated result, never an OOM — and the ceiling
-/// must be configurable (the same anti-runaway contract, and defaults, as core).
+/// must be configurable (the same anti-runaway contract, and defaults, as the TS engine).
 #[test]
 fn trail_limit_caps_runaway_traversal_and_is_configurable() {
     use crate::store::ConfigId;
@@ -598,7 +598,7 @@ fn trail_limit_caps_runaway_traversal_and_is_configurable() {
             ));
     }
     let mut st = crate::ndjson::from_ndjson(&nd).unwrap();
-    assert_eq!(st.limits().trail, 1_000_000); // core-matching default
+    assert_eq!(st.limits().trail, 1_000_000); // TS-engine-matching default
 
     let run_q = |st: &crate::store::Store, q: &str| {
         let plan = crate::opt::optimize_indexed(super::parse(q).unwrap(), st);
@@ -851,7 +851,7 @@ fn gremlin_is_value_predicate() {
 
 /// `g.V('id', …)` is a READ source: seed the frontier with exactly the vertices
 /// carrying those external ids (dense-id strings here), then traverse as usual.
-/// A missing id contributes nothing — like core's `g.V(<absent>)`.
+/// A missing id contributes nothing — like the TS engine's `g.V(<absent>)`.
 #[test]
 fn gremlin_v_by_external_id_read_source() {
     let store = social();
@@ -926,7 +926,7 @@ fn gremlin_has_label_forms() {
     );
 }
 
-/// `elementMap()` is core's FLAT element map — `{id, label, <props…>}` for a
+/// `elementMap()` is the TS engine's FLAT element map — `{id, label, <props…>}` for a
 /// node, plus `IN`/`OUT` endpoint stubs for an edge — with a SINGULAR label and
 /// the properties flattened alongside the tokens. `elementMap('k',…)` filters the
 /// properties. This is the Gremlin/TinkerPop shape (distinct from the nested
@@ -951,7 +951,7 @@ fn gremlin_element_map_flat_shape() {
         ],
     );
     // Edge: id + type label + IN (destination) / OUT (source) stubs, matching
-    // core's element_map_val (IN = e_dst, OUT = e_src). alice(0)→bob(1) KNOWS = e0.
+    // the TS engine's element_map_val (IN = e_dst, OUT = e_src). alice(0)→bob(1) KNOWS = e0.
     let edge = value_bag(&gremlin_rows("g.V('0').outE('KNOWS').elementMap()", &store));
     assert!(edge.iter().any(|s| s.contains(
         "(Str(\"id\"), Str(\"e0\")), (Str(\"label\"), Str(\"KNOWS\")), \
@@ -1011,7 +1011,7 @@ fn gremlin_coalesce_choose_optional() {
 
 /// `union(<hop>, …)` concatenates each branch's frontier per element and — unlike
 /// GQL's materializing UNION — keeps it a node frontier, so the traversal
-/// CONTINUES (`.values()`, `.count()`, another hop). This is core's per-traverser
+/// CONTINUES (`.values()`, `.count()`, another hop). This is the TS engine's per-traverser
 /// branch-and-reconverge, expressed columnar via Plan::Branch over pull_body.
 #[test]
 fn gremlin_union_of_hops() {
@@ -1361,7 +1361,7 @@ fn gremlin_group_by_key_and_value() {
                 &store
             )),
             // group() folds to ONE Gremlin Map {name: [elements]} (first-seen key
-            // order), matching core.
+            // order), matching the TS engine.
             vec![
                 "Map([(Str(\"alice\"), List([Map([(Str(\"id\"), Str(\"0\")), (Str(\"labels\"), List([Str(\"Person\")])), (Str(\"properties\"), Map([(Str(\"age\"), Num(30.0)), (Str(\"name\"), Str(\"alice\"))]))])])), (Str(\"bob\"), List([Map([(Str(\"id\"), Str(\"1\")), (Str(\"labels\"), List([Str(\"Person\")])), (Str(\"properties\"), Map([(Str(\"age\"), Num(25.0)), (Str(\"name\"), Str(\"bob\"))]))])])), (Str(\"carol\"), List([Map([(Str(\"id\"), Str(\"2\")), (Str(\"labels\"), List([Str(\"Person\")])), (Str(\"properties\"), Map([(Str(\"age\"), Num(40.0)), (Str(\"name\"), Str(\"carol\"))]))])]))]);",
             ],
@@ -1383,7 +1383,7 @@ fn gremlin_group_by_key_and_value() {
 
 /// `project('a','b').by(x).by(y)` builds one insertion-ordered Map per traverser:
 /// key i takes the i-th `by` modulator, or the current element when there is no
-/// i-th `by` (core's `bys.get(i)`, not cycled). `by('key')` reads a property; a
+/// i-th `by` (the TS engine's `bys.get(i)`, not cycled). `by('key')` reads a property; a
 /// key with no `by` yields the element as its id, consistent with `select()`.
 #[test]
 fn gremlin_project_by_modulators() {
@@ -1483,7 +1483,7 @@ fn gremlin_path_vertex_hop_chain() {
 /// `valueMap()` projects a PROPERTIES-only map (no id/label tokens) with scalar
 /// values; `valueMap('k',…)` filters keys. Present-properties only — the Project
 /// node has no `age`, so its map omits it. The maps equal the `properties`
-/// sub-map of the engine's GQL element render, which is byte-identical to core.
+/// sub-map of the engine's GQL element render, which is byte-identical to the TS engine.
 #[test]
 fn gremlin_valuemap_properties_only() {
     let store = social();
@@ -1629,7 +1629,7 @@ fn gremlin_edge_hops_and_endpoint_moves() {
 /// `g.E()` is an all-edges READ source: it seeds the frontier with every live
 /// edge (`social()` has 4: three KNOWS + one WORKS_ON). Cross-checked against the
 /// engine's own GQL front-end — the anonymous directed pattern `()-[r]->()` — so
-/// both lowerings of "every edge" agree; the GQL side is itself proven vs core by
+/// both lowerings of "every edge" agree; the GQL side is itself proven vs the TS engine by
 /// the differential fuzzer. Counting through g.E() exercises the Col::Edges
 /// frontier end to end.
 #[test]
@@ -1645,7 +1645,7 @@ fn gremlin_e_all_edges_read_source() {
 }
 
 /// `has(k)` filters elements that CARRY property `k`; `hasNot(k)` those that
-/// don't — matching core. Only the `Project` node (graphdb) lacks `age`.
+/// don't — matching the TS engine. Only the `Project` node (graphdb) lacks `age`.
 #[test]
 fn gremlin_has_key_existence_and_hasnot() {
     let store = social();
@@ -1660,7 +1660,7 @@ fn gremlin_has_key_existence_and_hasnot() {
     assert!(super::parse("g.V().has('age', gt(28)).values('name')").is_ok());
 }
 
-/// Argless `out()`/`in()`/`both()` traverse edges of ANY type (matching core),
+/// Argless `out()`/`in()`/`both()` traverse edges of ANY type (matching the TS engine),
 /// where a labelled hop is narrower — alice's WORKS_ON target only shows up
 /// through the untyped hop.
 #[test]
@@ -1997,7 +1997,7 @@ fn local_count_is_per_element() {
 
 /// `project(...)` rows are Maps; `order().by(select('k'))` sorts by the entry `k`
 /// (a sub-traversal that reads the Map), and the trailing `select('name')` projects
-/// the entry from the Map via the tag-fallback. Byte-identical to core's Scoping.
+/// the entry from the Map via the tag-fallback. Byte-identical to the TS engine's Scoping.
 #[test]
 fn order_by_select_sorts_project_rows_and_select_reads_the_map_entry() {
     let store = social();
@@ -2019,7 +2019,7 @@ fn order_by_select_sorts_project_rows_and_select_reads_the_map_entry() {
 }
 
 /// `select('k')` on a Map traverser (a `project()` row) with no step labelled `k`
-/// projects the entry rather than dropping every row (core's Scoping fallback).
+/// projects the entry rather than dropping every row (the TS engine's Scoping fallback).
 #[test]
 fn select_key_falls_back_to_the_map_entry() {
     let store = social();
@@ -2120,7 +2120,7 @@ fn olap_annotate_steps_attach_a_readable_property() {
             &store,
         ));
     assert_eq!(cc.len(), 1, "one component id (all connected): {cc:?}");
-    // The component id is an external-id STRING (the root vertex), like core.
+    // The component id is an external-id STRING (the root vertex), like the TS engine.
     assert!(
         cc[0].starts_with("Str("),
         "component id is a string: {cc:?}"
@@ -2158,7 +2158,7 @@ fn aggregate_store_cap_side_effect_bag() {
             &store
         )),
     );
-    // cap of an unfilled key yields a single EMPTY list (core), not an error.
+    // cap of an unfilled key yields a single EMPTY list (the TS engine), not an error.
     assert_eq!(
         value_bag(&gremlin_rows("g.V('1').cap('nope')", &store)),
         vec!["List([]);"],
@@ -2281,7 +2281,7 @@ fn bare_group_count_groups_by_the_current_element() {
 
 #[test]
 fn select_errors() {
-    // A select over an UNKNOWN label drops every traverser (core yields nothing),
+    // A select over an UNKNOWN label drops every traverser (the TS engine yields nothing),
     // rather than erroring — whether alone or inside a multi-select.
     assert!(super::parse("g.V().as('p').select('q')").is_ok());
     assert!(super::parse("g.V().as('a').out('R').as('b').select('a','z')").is_ok());

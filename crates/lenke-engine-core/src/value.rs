@@ -204,7 +204,7 @@ pub fn as_num(v: &Value) -> Option<f64> {
 
 /// Any `Num`, INCLUDING NaN / ±Inf — the operand gate for IEEE arithmetic and the
 /// numeric scalar functions, which propagate non-finite results (a computed NaN is
-/// a real signal — e.g. `sqrt(-1)` — kept internally like lenke-core, and coerced
+/// a real signal — e.g. `sqrt(-1)` — kept internally like the TS engine, and coerced
 /// to null only at the JSON egress boundary). Contrast [`as_num`], which is
 /// finite-only for callers that need a usable index/count (`substring`, `left`).
 #[must_use]
@@ -443,7 +443,7 @@ pub fn group_key_into(v: &Value, out: &mut Vec<u8>) {
 /// or a NaN operand (IEEE-unordered). This is distinct from [`cmp_total`], which
 /// imposes a deterministic TOTAL order for sort/min/max/grouping; the operators
 /// must instead yield UNKNOWN (→ NULL, → a dropped WHERE row) on incomparable
-/// operands, matching lenke-core and SQL/Cypher 3VL. Only same-type scalars are
+/// operands, matching the TS engine and SQL/Cypher 3VL. Only same-type scalars are
 /// comparable here; temporals compare only within the same kind.
 #[must_use]
 pub fn cmp_partial(a: &Value, b: &Value) -> Option<Ordering> {

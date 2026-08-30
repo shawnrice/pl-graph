@@ -1,13 +1,13 @@
-//! An engine Gremlin builder: every method has the SAME signature core's
+//! An engine Gremlin builder: every method has the SAME signature the now-removed lenke-core's
 //! `gremlin::Traversal` had, but each call only appends the equivalent engine query
 //! fragment — `query()` hands back the string, which the harness parses and runs on
-//! the engine. Core's Gremlin test bodies were written against a builder of this
+//! the engine. The now-removed lenke-core's Gremlin test bodies were written against a builder of this
 //! shape, so they still compile and run verbatim; the engine is now the sole engine
 //! (the `lenke-core` oracle it was dual-checked against has been deleted, its
 //! byte-identity contract now upheld by the TS differential fuzzers).
 //!
 //! `GVal`, `Order`, `Column`, `Pop`, `Token`, `Scope`, `SackOp` are small local
-//! mirrors of core's types (the bodies name them); the engine speaks query strings,
+//! mirrors of the now-removed lenke-core's types (the bodies name them); the engine speaks query strings,
 //! not a builder, so it has no equivalents of its own.
 //!
 //! A method whose engine spelling is not yet handled still builds the string; the
@@ -22,10 +22,10 @@
 
 // ── local value + enum mirrors (the bodies name these) ───────────────────────
 
-/// A Gremlin value, mirroring the variants core's `Value`/`GVal` exposed to the test
+/// A Gremlin value, mirroring the variants the now-removed lenke-core's `Value`/`GVal` exposed to the test
 /// bodies. `Node` carries a vertex's EXTERNAL id string (the engine has no interior
 /// `Value::Node`; a bare vertex arrives as a `{id,labels,properties}` map, which the
-/// result converter collapses to `Node(ext_id)` so `V()` reads like core's).
+/// result converter collapses to `Node(ext_id)` so `V()` reads like the now-removed lenke-core's).
 #[derive(Clone, Debug, PartialEq)]
 pub enum GVal {
     Null,
@@ -39,7 +39,7 @@ pub enum GVal {
     /// An edge, by external id.
     Edge(String),
     /// A Gremlin `Property` result: `(owner, key, value)` — owner ignored by equality,
-    /// mirroring core's `PropertyVal`.
+    /// mirroring the now-removed lenke-core's `PropertyVal`.
     Property(Box<GVal>, String, Box<GVal>),
 }
 
@@ -75,7 +75,7 @@ impl MapVal {
     }
 }
 
-// Insertion-ordered equality (positional), like core's Gremlin `MapVal`.
+// Insertion-ordered equality (positional), like the now-removed lenke-core's Gremlin `MapVal`.
 impl PartialEq for MapVal {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0

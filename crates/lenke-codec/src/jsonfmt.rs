@@ -1,6 +1,6 @@
 //! Serde-free JSON serialization primitives — one number formatter, one string
-//! escaper, one value writer — byte-identical to `lenke-core`'s `jsonfmt` (so the
-//! shared codecs emit exactly what core did before they moved here).
+//! escaper, one value writer — byte-identical to the TS engine's `jsonfmt` (so the
+//! shared codecs emit exactly what the now-removed lenke-core did before they moved here).
 
 use crate::model::Value;
 use std::fmt::Write as _;

@@ -1,17 +1,17 @@
 // Differential conformance for GQL rich results: the TS GQL engine
-// (@lenke/gql, in-process over @lenke/core) vs the Rust core (this package,
+// (@lenke/gql, in-process over @lenke/core) vs the Rust engine (this package,
 // over bun:ffi), driven from ONE source of truth — the same NDJSON loaded into
 // both — so a `RETURN n` / `RETURN r` shape can't drift between the two forms.
 //
 //   load once:   identical NDJSON (same ids/labels/properties)
 //   TS engine:   JSON.stringify(query(tsGraph, q))
-//   Rust core:   JSON.stringify(nativeGraph.query(q))
+//   Rust engine: JSON.stringify(nativeGraph.query(q))
 //   assert:      the two serializations are byte-identical
 //
 // This pins the "rich results" contract: a returned node serializes to
 // `{id, labels, properties}` and a returned edge to
 // `{id, from, to, labels, properties}`, with labels and property keys in
-// sorted order (the columnar core has no per-element key order, so both
+// sorted order (the columnar engine has no per-element key order, so both
 // engines canonicalize to sorted). A bare-id regression on either side, or a
 // key-ordering divergence, shows up here as a red diff.
 //
@@ -30,7 +30,7 @@ import { graphFromNdjson } from './graph.js';
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
 // The curated GQL function/operator conformance runs pure-TS (@lenke/gql) against the
-// Rust ENGINE. (It formerly also compared the retiring lenke-core, whose Model A
+// Rust ENGINE. (It formerly also compared the now-removed lenke-core, whose Model A
 // non-finite → null the engine and pure-TS both dropped for Model B — a distinct value.)
 const ENGINE_LIB = new URL(
   `../../../crates/lenke-engine/target/release/liblenke_engine.${LIB_EXT}`,
@@ -150,7 +150,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     // hex `'0x10'` — or a list is NOT coerced: it is a data exception in BOTH engines
     // (strict typing, like SQL and the arithmetic operators). JS `Number('0x10')` is 16 and
     // `Number([5])` is 5 would silently succeed; lenke rejects. Asserted against the ENGINE
-    // (the retiring core still coerced these to null).
+    // (the now-removed lenke-core still coerced these to null).
     const eng = graphFromNdjson(createFfiEngineBackend(ENGINE_LIB), MODERN_NDJSON);
 
     for (const q of [`RETURN abs('0x10') AS a`, `RETURN abs([5]) AS a`, `RETURN abs('12') AS a`]) {
@@ -197,7 +197,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
   test('string→number is strict: functions/aggregates throw; conversions null (byte-identical)', () => {
     // A numeric function or aggregate on a non-finite / hex STRING is a data exception —
     // never coerced (JS `Number('0x10')`=16 / `Number('inf')`=±Inf are rejected). You can't
-    // `sum` a string. Both engines throw. Asserted against the ENGINE (retiring core coerced).
+    // `sum` a string. Both engines throw. Asserted against the ENGINE (the now-removed lenke-core coerced).
     const eng = graphFromNdjson(createFfiEngineBackend(ENGINE_LIB), MODERN_NDJSON);
 
     for (const q of [
@@ -516,7 +516,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     // result), NOT a bare scalar literal — so `5[0]` / `'x'[0]` / `true[0]` / `null[0]`
     // are PARSE ERRORS, the same way `5.foo` and Cypher's `5[0]` are. A non-list VALUE
     // reached through a paren/property stays null-safe. Asserted against the ENGINE — the
-    // retiring core still returns null for the bare-literal form (model-aligned, like D1).
+    // the now-removed lenke-core still returns null for the bare-literal form (model-aligned, like D1).
     const eng = graphFromNdjson(createFfiEngineBackend(ENGINE_LIB), MODERN_NDJSON);
 
     for (const bad of [
@@ -2493,7 +2493,7 @@ suite('GQL differential: LIMIT/OFFSET $param + label-test predicate (TS vs nativ
 // --- Non-finite numbers are DISTINCT present values (Model B), not null. A non-finite
 // (±Infinity from overflow, NaN from an invalid op) is a real IEEE-754 value: ordered
 // (−∞ < finite < +∞), comparable, present to `IS NULL` and aggregates — exactly like
-// PostgreSQL / Neo4j / MS Fabric GQL, and unlike the retiring lenke-core, which collapses
+// PostgreSQL / Neo4j / MS Fabric GQL, and unlike the now-removed lenke-core, which collapses
 // it to null. It converts to null ONLY at JSON egress (JSON has no NaN/Infinity), which is
 // expected and lossy. GQL has no NaN/Infinity literal or `IS NAN` predicate, so the
 // `_is_nan` / `_is_infinite` / `_is_finite` extension functions (leading-underscore sigil,

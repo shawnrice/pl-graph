@@ -9,7 +9,7 @@ use crate::value::{self, Value};
 /// total, but a temporal component accessor of a kind that lacks that component
 /// (`_year` of a time, `_hour` of a date) FAULTS with `E_INVALID_VALUE`. A non-null
 /// NON-temporal argument (a number or string — never coerced) is ALSO a data
-/// exception (matching core); only a NULL arg yields NULL (nullish propagation).
+/// exception (matching the TS engine); only a NULL arg yields NULL (nullish propagation).
 pub(super) fn call_scalar_checked(name: &str, args: &[Value]) -> Result<Value, String> {
     if matches!(
         name,
@@ -147,7 +147,7 @@ pub(super) fn call_scalar_checked(name: &str, args: &[Value]) -> Result<Value, S
 
 /// Does the (non-null) value `v` match the IS TYPED scalar category `category`?
 /// `integer` requires an integral finite number; `float` any number. Replicates
-/// core's `category_matches`/`value_is_typed_ty`.
+/// the now-removed lenke-core's `category_matches`/`value_is_typed_ty`.
 fn scalar_is_typed(category: &str, v: &Value) -> bool {
     match category {
         "any" => true,
@@ -249,7 +249,7 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         // `x IS [NOT] TYPED <type> [NOT NULL]` desugars here: args are (value,
         // category, not_null). A NULL value conforms to any nullable type (so it is
         // `!not_null`); else the value's runtime type must match the category —
-        // replicated from core's `category_matches`/`value_is_typed_ty`.
+        // replicated from the now-removed lenke-core's `category_matches`/`value_is_typed_ty`.
         "__is_typed" => {
             let v = &args[0];
             let category = match &args[1] {
@@ -279,7 +279,7 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             Value::Bool(record_matches_schema(v, schema))
         }
         // `a || b || …` — left-associative concat (the parser folds a `||` run into
-        // one call). Matches core's `concat_step` fold: ANY null operand → NULL; two
+        // one call). Matches the TS engine's `concat_step` fold: ANY null operand → NULL; two
         // lists concatenate element-wise; otherwise both sides JS-string-coerce (via
         // `to_string_fn`) and join.
         "concat" => {
@@ -307,7 +307,7 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         | "degrees" | "radians" => scalar_num_fn(name, &args[0]),
         // `round(x)` rounds to an integer; `round(x, digits)` to `digits` decimal
         // places (negative rounds left of the point). Half away from zero, matching
-        // core; the `(x*f).round()/f` form is bit-identical (do not reformulate).
+        // the TS engine; the `(x*f).round()/f` form is bit-identical (do not reformulate).
         "round" => match value::num_of(&args[0]) {
             Some(x) => {
                 let digits = args
@@ -320,8 +320,8 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             None => Value::Null,
         },
         // numeric (2 args). `log(a, b)` is log-base-a of b = ln(b)/ln(a) (matches
-        // core's argument order); `mod` is the fn form of `%` (NaN on a zero
-        // divisor — it does NOT throw like the `%` OPERATOR, which core reserves for
+        // the TS engine's argument order); `mod` is the fn form of `%` (NaN on a zero
+        // divisor — it does NOT throw like the `%` OPERATOR, which the TS engine reserves for
         // the operator); `atan2(y, x)` is the two-argument arctangent. NaN/Inf
         // results are KEPT (K4), coerced only at JSON egress.
         "log" | "power" | "mod" | "atan2" => {
@@ -356,7 +356,7 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         "to_boolean" | "toboolean" => to_boolean_fn(&args[0]),
         // `to_list`: a list → itself; a string → its UTF-16 code-unit chars (the JS
         // `split('')` model, kept for byte-identity); a non-nullish scalar → a
-        // singleton list; null / non-finite number → null. Matches core's ToList.
+        // singleton list; null / non-finite number → null. Matches the TS engine's ToList.
         "to_list" | "tolist" => match &args[0] {
             Value::List(_) => args[0].clone(),
             Value::Str(s) => Value::List(
@@ -372,15 +372,15 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         "upper" => str_map(&args[0], str::to_uppercase),
         "lower" => str_map(&args[0], str::to_lowercase),
         // `trim` is both-sides; a 2nd (char-set) arg from the SQL-spec form is
-        // honored by routing through btrim (identical to core's Trim).
+        // honored by routing through btrim (identical to the TS engine's Trim).
         "trim" => trim_fn("btrim", args),
         // ltrim/rtrim/btrim: 1 arg trims WHITESPACE from that side; a 2nd string
         // arg is the set of characters to strip instead.
         "ltrim" | "rtrim" | "btrim" => trim_fn(name, args),
         // reverse is polymorphic: a string reverses by char, a list by element;
-        // anything else is NULL (matches core, e.g. reverse(number) → NULL).
+        // anything else is NULL (matches the TS engine, e.g. reverse(number) → NULL).
         // reverse: a string reverses by UTF-16 unit (JS model — a surrogate pair
-        // reversed decodes lossily to U+FFFD, byte-identical to core), a list by
+        // reversed decodes lossily to U+FFFD, byte-identical to the TS engine), a list by
         // element; anything else is NULL.
         "reverse" => match &args[0] {
             Value::Str(s) => {
@@ -407,7 +407,7 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             _ => Value::Null,
         },
         // split(s, delim) → a list of substrings. An EMPTY delimiter splits into one
-        // element per UTF-16 unit (JS model), matching core — NOT Rust's `split("")`.
+        // element per UTF-16 unit (JS model), matching the TS engine — NOT Rust's `split("")`.
         "split" => match (&args[0], &args[1]) {
             (Value::Str(s), Value::Str(d)) => {
                 let parts: Vec<Value> = if d.is_empty() {
@@ -422,7 +422,7 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             _ => Value::Null,
         },
         // Length of a string in UTF-16 code units (JS `.length` model), matching
-        // core; `byte_length`/`octet_length` count UTF-8 bytes. (`length` is NOT an ISO
+        // the TS engine; `byte_length`/`octet_length` count UTF-8 bytes. (`length` is NOT an ISO
         // GQL function — the standard has CHAR_LENGTH/OCTET_LENGTH/PATH_LENGTH/CARDINALITY
         // — so it is rejected as unknown, not aliased here.)
         "char_length" | "character_length" => match &args[0] {
@@ -438,8 +438,8 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         "ends_with" => str_bool(&args[0], &args[1], |s, sub| s.ends_with(sub)),
         "contains" => str_bool(&args[0], &args[1], |s, sub| s.contains(sub)),
         "regex_match" => regex_match(&args[0], &args[1]),
-        // replace(s, from[, to]) — `to` defaults to "" (core); an EMPTY search
-        // returns the string unchanged (core), NOT Rust's insert-everywhere.
+        // replace(s, from[, to]) — `to` defaults to "" (the TS engine); an EMPTY search
+        // returns the string unchanged (the TS engine), NOT Rust's insert-everywhere.
         "replace" => match (&args[0], &args[1]) {
             (Value::Str(s), Value::Str(f)) => {
                 let t = match args.get(2) {
@@ -458,7 +458,7 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         // substring(s, start[, len]) — ISO 1-based, UTF-16-unit indexed
         "substring" => substring(args),
         // `size` (and its ISO/SQL alias `cardinality`) is polymorphic over a collection OR
-        // a string (UTF-16 units), like lenke-core; a non-collection non-string is NULL.
+        // a string (UTF-16 units), like the TS engine; a non-collection non-string is NULL.
         "size" | "cardinality" => match &args[0] {
             Value::List(v) => Value::Num(v.len() as f64),
             Value::Str(s) => Value::Num(utf16_len(s) as f64),
@@ -483,14 +483,14 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             _ => Value::Null,
         },
         // list_contains(list, x) → 1.0 if any element equals x, else 0.0 (a NUMBER,
-        // not a bool — matching core; `null` matches `null` via `equals`).
+        // not a bool — matching the TS engine; `null` matches `null` via `equals`).
         "list_contains" => match &args[0] {
             Value::List(v) => Value::Num(f64::from(v.iter().any(|e| value::equals(e, &args[1])))),
             _ => Value::Null,
         },
         // list_sort(list, [order], [nullOrder]) — the value contract's total order,
         // reversed for `'desc'`, with absolute null placement (`'first'`/`'last'`,
-        // default last). Mirrors ORDER BY / core's compare_sort byte-for-byte. A
+        // default last). Mirrors ORDER BY / the TS engine's compare_sort byte-for-byte. A
         // stored list never holds NaN (it becomes null at ingest), so `is_null`
         // covers every nullish element.
         "list_sort" => {
@@ -532,7 +532,7 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
                 _ => Value::Null,
             }
         }
-        // Set algebra over lists — all DEDUPED (by value equality), matching core.
+        // Set algebra over lists — all DEDUPED (by value equality), matching the TS engine.
         // union: a's elements then b's, deduped. intersection: elements of a also
         // in b, deduped. difference: elements of a not in b, deduped.
         "list_union" | "difference" | "intersection" => match (&args[0], &args[1]) {
@@ -541,7 +541,7 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         },
         // range(start, end[, step]) — INCLUSIVE of both ends; default step 1; a
         // zero step is NULL; a start past end with the wrong sign yields an empty
-        // list (matches core).
+        // list (matches the TS engine).
         "range" => {
             let step = if args.len() == 3 {
                 value::as_num(&args[2]).map(f64::trunc)
@@ -558,7 +558,7 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
                     // once `cur` reaches 2^53 (a no-op in f64), so a `while cur <= b`
                     // loop never terminates even when the count is tiny — e.g.
                     // range(9007199254740992, 9007199254740994) has just 3 elements.
-                    // Compute the count up front (matching core), and cap the
+                    // Compute the count up front (matching the TS engine), and cap the
                     // allocation. The emitted values still come from repeated addition.
                     let count = ((b - a) / st).floor() + 1.0;
                     if count.is_nan() || count <= 0.0 {
@@ -615,7 +615,7 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
 /// component is undefined for that kind (`year`/`month`/`day` of a time-only
 /// value, or `hour`/`minute`/`second` of a date). Zoned values decompose in their
 /// stored offset (the local wall clock), as they render; euclidean division so
-/// pre-epoch instants floor correctly. Ported from lenke-core for agreement.
+/// pre-epoch instants floor correctly. Ported from the now-removed lenke-core for agreement.
 fn date_part(func: &str, t: crate::temporal::Temporal) -> Option<i64> {
     use crate::temporal::{civil_from_days, Temporal};
     const SPD: i64 = 86_400;
@@ -658,7 +658,7 @@ fn date_part(func: &str, t: crate::temporal::Temporal) -> Option<i64> {
 /// coerce another temporal into it (`date(datetime)` → the date part,
 /// `datetime(date)` → midnight, `local_time(datetime)` → the time-of-day). A
 /// bare `YYYY-MM-DD` string to a datetime target coerces to midnight. Anything
-/// with no sensible conversion → NULL. Ported from lenke-core for agreement.
+/// with no sensible conversion → NULL. Ported from the now-removed lenke-core for agreement.
 pub(crate) fn temporal_ctor(v: &Value, kind: &str) -> Value {
     use crate::temporal::{Date, DateTime, Temporal, Time};
     const SPD: i64 = 86_400;
@@ -699,7 +699,7 @@ pub(crate) fn temporal_ctor(v: &Value, kind: &str) -> Value {
 
 /// The EXACT span from `a` to `b` (b − a), in fixed units only: whole days for
 /// two dates, seconds+nanos for two datetimes. Any cross-kind pair (or a
-/// duration operand) → NULL. Ported from lenke-core.
+/// duration operand) → NULL. Ported from the now-removed lenke-core.
 fn duration_between(a: crate::temporal::Temporal, b: crate::temporal::Temporal) -> Value {
     use crate::temporal::{Duration, Temporal};
     match (a, b) {
@@ -731,7 +731,7 @@ fn duration_between(a: crate::temporal::Temporal, b: crate::temporal::Temporal) 
 /// (anchored — months clamped, then days, then time), instant − instant (the
 /// exact span), duration ± duration (component-wise), duration × integer. An
 /// undefined combination is `Ok(Null)`; a result outside the representable
-/// range is a THROWN fault (`Err`) — not a silent null. Ported from lenke-core.
+/// range is a THROWN fault (`Err`) — not a silent null. Ported from the now-removed lenke-core.
 pub(super) fn temporal_arith(
     op: crate::ir::ArithOp,
     lv: &Value,
@@ -801,14 +801,14 @@ fn str_bool(a: &Value, b: &Value, f: impl Fn(&str, &str) -> bool) -> Value {
 }
 
 thread_local! {
-    /// Compiled-regex cache for the Gremlin `regex()` predicate, bounded like core's.
+    /// Compiled-regex cache for the Gremlin `regex()` predicate, bounded like the TS engine's.
     static REGEX_CACHE: std::cell::RefCell<std::collections::HashMap<String, regex::Regex>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// `regex_match(value, pattern)` → Gremlin `regex(pattern)`: true when `value` is a
 /// string the pattern finds a match in. A non-string is false; an invalid pattern
-/// (already rejected at parse time) is false. Byte-identical to core's `regex_is_match`
+/// (already rejected at parse time) is false. Byte-identical to the TS engine's `regex_is_match`
 /// — same `regex` crate, same bounded thread-local cache.
 fn regex_match(v: &Value, pat: &Value) -> Value {
     let (Value::Str(s), Value::Str(p)) = (v, pat) else {
@@ -833,9 +833,9 @@ fn regex_match(v: &Value, pat: &Value) -> Value {
 
 /// Slice `s` by UTF-16 code UNITS `[start, start+len)` (JS `String.slice` /
 /// `.length` model), decoding back to UTF-8. A slice that splits a surrogate pair
-/// yields U+FFFD there (lossy) — byte-identical to lenke-core (`utf16_slice`) and
-/// the TS engine. The whole string model here counts UTF-16 units, NOT `chars()`,
-/// so `size('😀')` is 2 (a surrogate pair), matching core.
+/// yields U+FFFD there (lossy) — byte-identical to the TS engine
+/// (`utf16_slice`). The whole string model here counts UTF-16 units, NOT `chars()`,
+/// so `size('😀')` is 2 (a surrogate pair), matching the TS engine.
 fn utf16_slice(s: &str, start: usize, len: usize) -> String {
     let units: Vec<u16> = s.encode_utf16().collect();
     let end = start.saturating_add(len).min(units.len());
@@ -843,13 +843,13 @@ fn utf16_slice(s: &str, start: usize, len: usize) -> String {
     String::from_utf16_lossy(&units[start..end])
 }
 
-/// Length of `s` in UTF-16 code units — the JS `.length` model core uses.
+/// Length of `s` in UTF-16 code units — the JS `.length` model the TS engine uses.
 fn utf16_len(s: &str) -> usize {
     s.encode_utf16().count()
 }
 
 /// `substring(s, start[, len])` — ISO/SQL **1-based** start, indexed by UTF-16 code
-/// UNIT (matching lenke-core exactly). A `start <= 0` shrinks the window from the
+/// UNIT (matching the TS engine exactly). A `start <= 0` shrinks the window from the
 /// front (SQL semantics); an omitted `len` runs to the end. NULL for a null string
 /// or start.
 fn substring(args: &[Value]) -> Value {
@@ -874,7 +874,7 @@ fn substring(args: &[Value]) -> Value {
 
 /// Apply a unary numeric scalar function. A NULL / non-numeric argument yields
 /// NULL; a computed NaN/Inf result (e.g. `sqrt(-1)`, `ln(0)`) is KEPT (IEEE, like
-/// lenke-core — coerced to null only at JSON egress). `sign(0)` is 0 and `sign(NaN)`
+/// the TS engine — coerced to null only at JSON egress). `sign(0)` is 0 and `sign(NaN)`
 /// is NaN (unlike `f64::signum`, which is ±1 for both); rounding is f64's
 /// round-half-away-from-zero.
 /// The finite→finite unary numeric functions, as raw `f64 -> f64` closures that
@@ -927,9 +927,9 @@ fn scalar_num_fn(name: &str, v: &Value) -> Value {
         "ceil" | "ceiling" => x.ceil(),
         "round" => x.round(),
         "sqrt" => x.sqrt(),
-        // Transcendentals — native libm, matching lenke-core's native build. A
+        // Transcendentals — native libm, matching the TS engine's native build. A
         // domain-invalid result (e.g. `ln(-1)`, `cot(0)`) is NaN/Inf and, for now,
-        // falls to NULL through the finite gate below (K4 will KEEP it, like core).
+        // falls to NULL through the finite gate below (K4 will KEEP it, like the TS engine).
         "exp" => x.exp(),
         "ln" => x.ln(),
         "log10" => x.log10(),
@@ -944,14 +944,14 @@ fn scalar_num_fn(name: &str, v: &Value) -> Value {
         "tanh" => x.tanh(),
         "cot" => 1.0 / x.tan(),
         // Multiply-then-divide, NOT `to_degrees`/`to_radians`: the latter pre-round
-        // the 180/PI (resp. PI/180) constant and land one ULP off core's byte-exact
+        // the 180/PI (resp. PI/180) constant and land one ULP off the TS engine's byte-exact
         // `(n*180)/PI` / `(n*PI)/180`.
         "degrees" => (x * 180.0) / std::f64::consts::PI,
         "radians" => (x * std::f64::consts::PI) / 180.0,
         _ => return Value::Null, // parser rejects unknown names; defensive
     };
     // NaN/Inf are KEPT (K4) — a computed NaN (`sqrt(-1)`, `ln(-1)`) is a real
-    // signal, coerced to null only at the JSON egress boundary, matching core.
+    // signal, coerced to null only at the JSON egress boundary, matching the TS engine.
     Value::Num(r)
 }
 
@@ -965,7 +965,7 @@ fn to_number(v: &Value, integer: bool) -> Value {
         Value::Num(x) => *x,
         Value::Bool(b) => f64::from(u8::from(*b)),
         // A string that parses to a NON-finite value (`'1e1000'` → inf, `'nan'`) is
-        // NULL — the fn form never yields inf/NaN, matching core's `.filter(is_finite)`.
+        // NULL — the fn form never yields inf/NaN, matching the TS engine's `.filter(is_finite)`.
         Value::Str(s) => match s.trim().parse::<f64>() {
             Ok(x) if x.is_finite() => x,
             _ => return Value::Null,
@@ -985,7 +985,7 @@ fn to_number(v: &Value, integer: bool) -> Value {
 
 /// `to_string` FUNCTION: NULL→NULL, finite Num→its egress text, Bool→"true"/
 /// "false", Str→itself, Temporal→its ISO form; a non-finite number is NULL.
-/// One step of the `||` fold, matching core's `concat_step`: null propagates, two
+/// One step of the `||` fold, matching the TS engine's `concat_step`: null propagates, two
 /// lists concatenate, otherwise both operands JS-string-coerce and join.
 fn concat_step(l: &Value, r: &Value) -> Value {
     if l.is_null() || r.is_null() {
@@ -996,7 +996,7 @@ fn concat_step(l: &Value, r: &Value) -> Value {
     }
     match (to_string_fn(l), to_string_fn(r)) {
         (Value::Str(a), Value::Str(b)) => Value::Str(format!("{a}{b}").into()),
-        // A non-stringable operand (e.g. a map) → NULL, as core's js_str-of-unknown does.
+        // A non-stringable operand (e.g. a map) → NULL, as the TS engine's js_str-of-unknown does.
         _ => Value::Null,
     }
 }
@@ -1012,7 +1012,7 @@ fn to_string_fn(v: &Value) -> Value {
         Value::Num(x) if x.is_finite() => Value::Str(crate::json::js_number(*x).into()),
         Value::Temporal(t) => Value::Str(t.format().into()),
         // A LIST joins its elements' string form (a null element → "", like JS
-        // `Array.join`); a RECORD/MAP renders as its canonical JSON — matching core's
+        // `Array.join`); a RECORD/MAP renders as its canonical JSON — matching the TS engine's
         // `js_str`, which serializes composites rather than returning NULL.
         Value::List(_) | Value::Record(_) | Value::Map(_) => {
             Value::Str(crate::json::js_str(v).into())

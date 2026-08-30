@@ -347,7 +347,7 @@ describe('Graph Tests', () => {
       expect(() => g.addLabelToVertex('a::b', v)).toThrow(/::/);
     });
 
-    // The numeric model is float64 (the Rust core has no bigint; every codec +
+    // The numeric model is float64 (the Rust engine has no bigint; every codec +
     // the FFI param boundary already reject it). A raw JS bigint used to be
     // stored as-is in the pure-JS graph, then handled inconsistently downstream
     // (a `WHERE bigint > n` silently dropped every row). Reject it at the gate.

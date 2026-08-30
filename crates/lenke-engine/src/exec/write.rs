@@ -116,7 +116,7 @@ pub(super) fn run_update(
         }
     }
     // Pass 2: node deletes. A non-DETACH delete of a node that still has
-    // relationships is an error (Cypher/core semantics); DETACH deletes the
+    // relationships is an error (Cypher/TS-engine semantics); DETACH deletes the
     // incident edges too (delete_node cascades). A node matched by several
     // rows is deleted once (skip if already gone).
     for (node, detach) in node_deletes {
@@ -400,7 +400,7 @@ pub(super) fn execute_merge_edge(
 /// Whether node `n`'s `id` PROPERTY is its identity — a string equal to its external
 /// id (as set by `INSERT (:P {id: 'x'})`). Such an id is fixed at creation, so a
 /// `SET n.id` is rejected; a numeric / absent / divergent `id` is an ordinary,
-/// SET-able property. Stateless, matching core's `vertex_id_is_identity`.
+/// SET-able property. Stateless, matching the TS engine's `vertex_id_is_identity`.
 fn node_id_is_identity(store: &Store, n: u32) -> bool {
     if let Value::Str(s) = store.prop(n, "id") {
         store
@@ -411,7 +411,7 @@ fn node_id_is_identity(store: &Store, n: u32) -> bool {
     }
 }
 
-/// The edge analogue of [`node_id_is_identity`] — matching core's `edge_id_is_identity`.
+/// The edge analogue of [`node_id_is_identity`] — matching the TS engine's `edge_id_is_identity`.
 fn edge_id_is_identity(store: &Store, e: u32) -> bool {
     if let Value::Str(s) = store.edge_prop(e, "id") {
         store
@@ -423,7 +423,7 @@ fn edge_id_is_identity(store: &Store, e: u32) -> bool {
 }
 
 /// Create a node for an INSERT, honoring a string `id` property as the element's
-/// EXTERNAL identity (like core's `insert_vertex_with_id`): a string `id` becomes the
+/// EXTERNAL identity (like the TS engine's `insert_vertex_with_id`): a string `id` becomes the
 /// node's external id — unique across the graph, a duplicate is a constraint violation
 /// — AND is still stored as an ordinary property (`RETURN n.id` works). A non-string
 /// or absent `id` mints a synthetic external id. (Numeric `id` stays a plain property.)
@@ -443,7 +443,7 @@ fn insert_node_with_identity(
 }
 
 /// Create an edge for an INSERT, honoring a string `id` property as its external
-/// identity (like core's `insert_edge_with_id`): a string `id` becomes the edge's
+/// identity (like the TS engine's `insert_edge_with_id`): a string `id` becomes the edge's
 /// external id — unique among edges, a duplicate is a constraint violation — and is
 /// still stored as a property. A non-string / absent `id` mints a synthetic edge id.
 /// Sets the edge's properties in either case.

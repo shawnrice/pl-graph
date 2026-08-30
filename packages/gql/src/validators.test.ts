@@ -19,7 +19,7 @@ const codeOf = (fn: () => unknown): unknown => {
 // A declarative validator attaches a pure ISO GQL boolean predicate (WHERE-clause
 // syntax) to a label; every element carrying the label must satisfy it at the
 // mutation boundary. SQL-`CHECK` semantics: a write fails only on a *definite*
-// `false`; a null/unknown result passes. Byte-identical to the Rust core — see
+// `false`; a null/unknown result passes. Byte-identical to the Rust engine — see
 // the differential in packages/native/src/constraint-conformance.test.ts.
 describe('GQL: declarative validators', () => {
   test('declare-time scan rejects already-violating data', () => {

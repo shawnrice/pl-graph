@@ -50,7 +50,7 @@ export function order(
 ): ByableStep<Extract<Step, { kind: 'order' }>> {
   // `order(desc)` is a superset — TinkerPop's `order()` takes only a Scope and
   // the direction belongs in the modulator — accepted because it is written, and
-  // because the Rust core accepts it. There it used to PARSE the direction and
+  // because the Rust engine accepts it. There it used to PARSE the direction and
   // then drop it, sorting ascending in silence; here it threw "Expected
   // Scope.local or Scope.global". Both now sort descending.
   const sym = typeof arg === 'symbol' ? arg : undefined;
