@@ -442,16 +442,19 @@ export const createSyncEngine = (options: SyncEngineOptions): SyncEngine => {
         // Even an empty load changes what `complete` means for standing
         // queries — hosts must re-push. (A non-empty load also bumped the
         // version, but the flip itself must be observable either way.)
-        notifyChange();
+        // `safeNotify`, not `notifyChange`: this reaches `host.refresh` → `send`,
+        // which can throw on a dead socket — and a throw here would reject the
+        // load and escape as an unhandled rejection (the scheduler runs it as
+        // `void job.run().finally(...)`, with no `.catch`).
+        safeNotify();
       },
       (e) => {
-        // The load failed. Report it, and — while attempts remain — hand the
-        // scheduler the NEXT attempt (timer-driven backoff). This scheduled job
-        // is the ONLY retry path: no refresh/push re-triggers a load, so a
-        // failure can never storm. Attempts run 0,1,…,loadAttempts-1.
+        // The load failed. Record the error and — while attempts remain — hand the
+        // scheduler the NEXT attempt (timer-driven backoff) FIRST, so a throwing
+        // `onLoadError` can't abort the retry/bookkeeping. This scheduled job is the
+        // ONLY retry path: no refresh/push re-triggers a load, so a failure can never
+        // storm. Attempts run 0,1,…,loadAttempts-1.
         states.set(match.stateKey, 'error');
-        options.onLoadError?.(match.name, e);
-
         loadErrors.set(match.stateKey, toWireError(e));
 
         const next = (attemptOf.get(match.stateKey) ?? 0) + 1;
@@ -462,7 +465,17 @@ export const createSyncEngine = (options: SyncEngineOptions): SyncEngine => {
           attemptOf.delete(match.stateKey); // budget spent; next demand starts fresh
         }
 
-        notifyChange();
+        // The user callback and `notifyChange` (→ host `refresh` → `send`) are
+        // side-channels that can throw — contain both, exactly as the write-back
+        // path does (`reportWriteError`/`safeNotify`), so a throw never rejects this
+        // load and escapes as an unhandled rejection.
+        try {
+          options.onLoadError?.(match.name, e);
+        } catch {
+          // best-effort: a user callback fault must not abort load bookkeeping
+        }
+
+        safeNotify();
       },
     );
   };

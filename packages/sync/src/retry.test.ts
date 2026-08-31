@@ -129,6 +129,43 @@ suite('demand-fill retry · storm safety', () => {
     expect(engine.collectionState('people')).toBe('error');
   });
 
+  test('a throwing onLoadError does not abort retry scheduling', async () => {
+    const man = manualScheduler();
+    let calls = 0;
+    const engine = mkEngine({
+      collections: {
+        people: {
+          labels: ['Person'],
+          load: () => {
+            calls += 1;
+
+            return Promise.reject(new Error('backend down'));
+          },
+        },
+      },
+      loadRetry: { attempts: 5 },
+      loadScheduler: man.scheduler,
+      // A user callback that throws: it used to run BEFORE the retry was scheduled,
+      // so a throw aborted the whole chain (and escaped as an unhandled rejection).
+      // The error path now records + schedules first and contains the callback.
+      onLoadError: () => {
+        throw new Error('user callback boom');
+      },
+    });
+
+    engine.ensure(['Person']);
+
+    for (let i = 0; i < 20 && man.jobs.length > calls; i += 1) {
+      const job = man.jobs[man.jobs.length - 1];
+      await job.run().catch(() => {});
+    }
+
+    // Despite the throwing callback, the full bounded retry chain still runs.
+    expect(calls).toBe(5);
+    expect(man.jobs.map((j) => j.attempt)).toEqual([0, 1, 2, 3, 4]);
+    expect(engine.collectionState('people')).toBe('error');
+  });
+
   test('pushes and refreshes never re-trigger a failed load (the storm footgun)', async () => {
     const man = manualScheduler();
     let calls = 0;
