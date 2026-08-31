@@ -203,7 +203,11 @@ export class Trie<T> {
    */
   public *entries(): Generator<[string, T]> {
     for (const node of this.root.descendants()) {
-      if (node.word && node.value !== null) {
+      // `isEndOfWord` is the real word marker (and what `has`/`remove` use): gating
+      // on `value !== null` instead would both hide a word stored with a `null`
+      // value (`add(k, null)` — null is a first-class value) and duplicate the
+      // tombstone logic incorrectly.
+      if (node.word && node.isEndOfWord) {
         yield [node.word, node.value];
       }
     }
