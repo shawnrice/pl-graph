@@ -128,6 +128,24 @@ describe('runMeta', () => {
     expect(lines.at(-1)).toContain('usage');
   });
 
+  test('\\o and \\r go through runMeta (so they work in \\i scripts, not "unknown command")', () => {
+    const state = stateWith();
+    const { out, lines } = capture();
+
+    // \o sets the output tee on state — previously only the interactive handler knew it,
+    // so a script's \o fell through to the unknown-command default.
+    expect(runMeta(state, '\\o out.txt', out)).toBe(false);
+    expect(state.outFile).toBe('out.txt');
+    expect(lines.at(-1)).toContain('out.txt');
+
+    expect(runMeta(state, '\\o off', out)).toBe(false);
+    expect(state.outFile).toBeUndefined();
+
+    // \r (multi-line buffer reset) is interactive-only → a recognized no-op, not an error.
+    expect(runMeta(state, '\\r', out)).toBe(false);
+    expect(lines.join('\n')).not.toContain('unknown command');
+  });
+
   test('\\c loads a bundled sample', () => {
     const state = stateWith();
 

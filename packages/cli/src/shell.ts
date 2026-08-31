@@ -53,6 +53,8 @@ export type State = {
   labels: string[];
   last: readonly unknown[];
   clock: ClockDesc;
+  /** `\o` output tee: a file every line is appended to, or undefined for stdout only. */
+  outFile?: string;
 };
 
 export const makeState = (ctx: ShellContext): State => {
@@ -313,6 +315,13 @@ const metaInclude = (state: State, file: string, out: (s: string) => void): bool
   return false;
 };
 
+/** Point (or clear) the `\o` output tee, returning the status line to echo. */
+const setOutputTee = (state: State, arg: string): string => {
+  state.outFile = !arg || arg === 'off' ? undefined : arg;
+
+  return `output: ${state.outFile ?? 'stdout only'}`;
+};
+
 /** Handlers for `\` meta-commands. Returns true when the session should quit. */
 export const runMeta = (state: State, raw: string, out: (s: string) => void): boolean => {
   const [cmd, ...rest] = raw.trim().split(/\s+/);
@@ -428,6 +437,17 @@ export const runMeta = (state: State, raw: string, out: (s: string) => void): bo
 
       return false;
     }
+    case '\\o':
+      // The output tee. Interactively this is intercepted before `runMeta` (to
+      // refresh the prompt), but routing it through here too means it also works
+      // inside an `\i` script instead of erroring as an unknown command.
+      out(setOutputTee(state, arg));
+
+      return false;
+    case '\\r':
+      // Reset the pending multi-line buffer — an interactive-only concept (a script
+      // runs one complete line at a time), so it's a no-op here rather than an error.
+      return false;
     default:
       out(`unknown command '${cmd}' — try \\?`);
 
@@ -443,13 +463,12 @@ export const runMeta = (state: State, raw: string, out: (s: string) => void): bo
 export const runShell = async (ctx: ShellContext): Promise<void> => {
   const state = makeState(ctx);
 
-  let outFile: string | undefined;
   const emit = (s: string): void => {
     stdout.write(`${s}\n`);
 
-    if (outFile) {
+    if (state.outFile) {
       try {
-        appendFileSync(outFile, `${s}\n`);
+        appendFileSync(state.outFile, `${s}\n`);
       } catch {
         // tee is best-effort
       }
@@ -486,12 +505,10 @@ export const runShell = async (ctx: ShellContext): Promise<void> => {
   rl.on('line', (line) => {
     const trimmed = line.trim();
 
-    // A `\o <file>|off` tee is handled here so `emit` can see it immediately.
+    // `\o` sets the output tee (on `state`, so `runMeta` owns the logic and `\i`
+    // scripts can use it too); the interactive path just adds the prompt refresh.
     if (buffer === '' && /^\\o(\s|$)/.test(trimmed)) {
-      const [, target] = trimmed.split(/\s+/);
-
-      outFile = !target || target === 'off' ? undefined : target;
-      emit(`output: ${outFile ?? 'stdout only'}`);
+      runMeta(state, trimmed, emit);
       setPrompt();
       rl.prompt();
 
