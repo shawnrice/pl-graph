@@ -116,11 +116,11 @@ suite('unique-constraint differential (TS vs native)', () => {
       g: {
         createUniqueConstraint: (l: string, k: string) => void;
         createEdgeUniqueConstraint: (t: string, k: string) => void;
-        createIndex: (spec: {
-          on: 'vertex' | 'edge';
-          kind: 'hash' | 'interval';
-          keys: string[];
-        }) => void;
+        createIndex: (
+          spec:
+            | { on: 'vertex'; kind: 'hash'; keys: string[] }
+            | { on: 'edge'; kind: 'interval'; keys: string[] },
+        ) => void;
         dropVertexIndex: (k: string) => void;
         dropEdgeIndex: (k: string) => void;
       };

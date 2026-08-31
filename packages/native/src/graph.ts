@@ -24,14 +24,7 @@ import {
 } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
-import type {
-  Backend,
-  GraphHandle,
-  IndexKind,
-  IndexTarget,
-  MergeReport,
-  PreparedHandle,
-} from './backend.js';
+import type { Backend, GraphHandle, MergeReport, PreparedHandle } from './backend.js';
 import { ensureDisposeSymbol } from './dispose.js';
 
 /**
@@ -70,15 +63,15 @@ export type Row = Record<string, unknown>;
 export type { IndexKind, IndexTarget } from './backend.js';
 
 /**
- * The spec passed to {@link RustGraph.createIndex}: which element (`on`), the
- * index `kind`, and the property `keys` (`[k]` for a hash index, `[loKey, hiKey]`
- * for an interval index).
+ * The spec passed to {@link RustGraph.createIndex}. A discriminated union of the
+ * combinations the engine actually supports — a vertex `hash` index (`[k]`) or an
+ * edge `interval` index (`[loKey, hiKey]`). Cross products the `on`/`kind` types
+ * would otherwise allow (e.g. `edge` + `hash`) have no engine arm and are a
+ * compile error here rather than a runtime throw.
  */
-export type IndexSpec = {
-  on: IndexTarget;
-  kind: IndexKind;
-  keys: string[];
-};
+export type IndexSpec =
+  | { on: 'vertex'; kind: 'hash'; keys: string[] }
+  | { on: 'edge'; kind: 'interval'; keys: string[] };
 
 /**
  * The tagged wire form of a temporal — what `toJSON` emits and what comes back
@@ -100,7 +93,6 @@ export type TaggedTemporal = Readonly<Record<`@${string}`, string>>;
  */
 export type SchemaOp =
   | { op: 'createVertexIndex'; key: string }
-  | { op: 'createEdgeIndex'; key: string }
   | { op: 'createEdgeIntervalIndex'; loKey: string; hiKey: string }
   | { op: 'dropVertexIndex'; key: string }
   | { op: 'dropEdgeIndex'; key: string }
@@ -131,9 +123,6 @@ export const applySchemaOp = (g: RustGraph, s: SchemaOp): void => {
   switch (s.op) {
     case 'createVertexIndex':
       g.createIndex({ on: 'vertex', kind: 'hash', keys: [s.key] });
-      break;
-    case 'createEdgeIndex':
-      g.createIndex({ on: 'edge', kind: 'hash', keys: [s.key] });
       break;
     case 'createEdgeIntervalIndex':
       g.createIndex({ on: 'edge', kind: 'interval', keys: [s.loKey, s.hiKey] });
