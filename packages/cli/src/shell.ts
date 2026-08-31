@@ -5,11 +5,12 @@ import { stderr, stdout } from 'node:process';
 import { createInterface, type Interface } from 'node:readline';
 
 import { LocalDateTime } from '@lenke/core';
-import { describe as inspectDescribe, formatGraph, formatRows, type Row } from '@lenke/inspect';
+import { describe as inspectDescribe, formatGraph, formatRows } from '@lenke/inspect';
 import type { RustGraph } from '@lenke/native';
 
 import { complete, type Mode } from './completion.js';
 import { type Backend, formatFor, loadGraph, saveGraph } from './io.js';
+import { asRows, classify } from './query.js';
 import { findSample, loadSample, SAMPLES } from './samples.js';
 
 export type ShellContext = { graph: RustGraph; backend: Backend; color: boolean };
@@ -81,14 +82,6 @@ const freeGraph = (graph: RustGraph): void => {
     // already freed / backend gone
   }
 };
-
-// Gremlin/JS produce heterogeneous streams; wrap bare scalars so any array is a table.
-const asRows = (items: readonly unknown[]): Row[] =>
-  items.map((item) =>
-    item !== null && typeof item === 'object' && !Array.isArray(item)
-      ? (item as Row)
-      : { value: item },
-  );
 
 const labelsOf = (graph: RustGraph): string[] => {
   try {
@@ -586,7 +579,7 @@ export const runShell = async (ctx: ShellContext): Promise<void> => {
         stderr.write(`${(e as Error).message}\n`);
 
         // A common wrong-mode slip: a Gremlin traversal typed at the GQL prompt.
-        if (state.mode === 'gql' && /^g\s*\./.test(stmt)) {
+        if (state.mode === 'gql' && classify(stmt) === 'gremlin') {
           stderr.write('(that looks like Gremlin — switch with \\gremlin)\n');
         }
       }

@@ -10,7 +10,7 @@ export const classify = (text: string): Lang =>
 
 // Gremlin returns a heterogeneous stream (elements, maps, scalars); wrap bare
 // scalars in a `value` column so anything renders as a table.
-const asRows = (items: readonly unknown[]): Row[] =>
+export const asRows = (items: readonly unknown[]): Row[] =>
   items.map((item) =>
     item !== null && typeof item === 'object' && !Array.isArray(item)
       ? (item as Row)
