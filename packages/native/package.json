@@ -31,6 +31,7 @@
     "engine:build:wasm": "cargo build --release --target wasm32-unknown-unknown --no-default-features --features capi,codecs --manifest-path ../../crates/lenke-engine/Cargo.toml",
     "test": "bun test",
     "test:engine": "LENKE_ENGINE=1 bun test",
+    "fuzz": "bun fuzz.ts",
     "bench": "bun bench.ts",
     "bench:usage": "bun bench-usage.ts"
   },

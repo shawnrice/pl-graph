@@ -110,21 +110,28 @@ exit status from `grep`, which succeeds when it finds errors. That has let broke
 lint through twice.
 
 Byte-identity between the TS and Rust engines is a hard invariant. Any change to
-storage, ordering or codecs needs the fuzzers, not just the unit tests:
+storage, ordering or codecs needs the fuzzers, not just the unit tests. Run them
+through the unified runner (`packages/native/fuzz.ts`), which rebuilds exactly the
+artifacts the selected fuzzers need before running — so you cannot fuzz a stale
+build:
 
 ```
-cd packages/native && FUZZ_SEED=<n> bun test src/codec-fuzz.test.ts \
-  src/differential-fuzz.test.ts src/write-fuzz.test.ts src/injection-fuzz.test.ts
+cd packages/native
+bun run fuzz                      # all seven, random seeds — the regression sweep
+bun run fuzz gremlin --seed 2977  # one fuzzer, deterministic replay
+bun run fuzz codec differential --seed 7   # a subset, one shared seed
+bun run fuzz --list               # names + what each needs
 ```
 
-`backend-parity-fuzz` compares the wasm build against the FFI build, and
-**neither `bun run build` nor `cargo build` rebuilds the wasm** — only
-`cd packages/native && bun run build:wasm` does. A stale `lenke_engine.wasm`
-turns that fuzzer into a comparison between your change and an old copy of
-itself: it reports failures you did not cause and passes you did not earn.
-Found with the artifact two days behind the `.so`, after chasing a `max()`
-"divergence" that was the previous build. Rebuild it before trusting that
-suite, and check the timestamps if it says something surprising:
+The runner exists mostly to defuse one trap: `backend-parity-fuzz` compares the
+wasm build against the FFI build, and **neither `bun run build` nor `cargo build`
+rebuilds the wasm** — only `bun run build:wasm` does. A stale `lenke_engine.wasm`
+turns that fuzzer into a comparison between your change and an old copy of itself:
+failures you did not cause, passes you did not earn (found once with the artifact
+two days behind the `.so`, after chasing a `max()` "divergence" that was the
+previous build). The runner rebuilds the wasm (and the `@lenke/gremlin` dist for
+`gremlin`) itself; pass `--no-build` only when you just built. If a result still
+surprises you, check the timestamps:
 
 ```
 stat -c '%y %n' crates/lenke-engine/target/release/liblenke_engine.so \
