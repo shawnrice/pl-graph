@@ -119,6 +119,11 @@ for (let i = 0; i < args.length; i++) {
 
   if (a === '--seed' || a === '-s') {
     seed = args[++i];
+
+    if (seed === undefined) {
+      console.error('--seed needs a value, e.g. --seed 2977');
+      process.exit(2);
+    }
   } else if (a.startsWith('--seed=')) {
     seed = a.slice('--seed='.length);
   } else if (a === '--no-build') {
@@ -133,7 +138,10 @@ for (let i = 0; i < args.length; i++) {
     continue;
   } else if (a === 'all') {
     targets.push(...Object.keys(FUZZERS));
-  } else if (a in FUZZERS) {
+  } else if (Object.hasOwn(FUZZERS, a)) {
+    // `Object.hasOwn`, NOT `a in FUZZERS`: the latter matches prototype keys
+    // (`toString`, `constructor`, …), which then filter out to an empty selection
+    // and make `bun test` run the WHOLE suite.
     targets.push(a);
   } else {
     console.error(`unknown fuzzer '${a}'. Run \`bun run fuzz --list\`.`);
@@ -144,6 +152,12 @@ for (let i = 0; i < args.length; i++) {
 // Default is the whole sweep. Dedup while preserving the registry's run order.
 const wanted = new Set(targets.length > 0 ? targets : Object.keys(FUZZERS));
 const selected = Object.keys(FUZZERS).filter((n) => wanted.has(n));
+
+// Never fall through to a bare `bun test` (which would run the ENTIRE suite).
+if (selected.length === 0) {
+  console.error('no fuzzers selected. Run `bun run fuzz --list`.');
+  process.exit(2);
+}
 
 if (seed !== undefined && !/^\d+$/.test(seed)) {
   console.error(`--seed must be a non-negative integer, got '${seed}'`);
