@@ -1,13 +1,13 @@
 # Benchmarks
 
 The `lenke-engine` bench corpus. **Look here before writing a new one** — the
-suite is indexed by *question*, and the answer to yours is very likely already a
+suite is indexed by _question_, and the answer to yours is very likely already a
 case in one of the group binaries.
 
 Two kinds of entry point:
 
 - **Themed group binaries** (`ingest_bench`, `query_bench`, …) — each groups a
-  subsystem's questions as selectable *cases*. This is the consolidation: one
+  subsystem's questions as selectable _cases_. This is the consolidation: one
   binary per subsystem instead of one per question.
 - **`bench_all`** — runs every group in one process. This is the **regression
   sweep**: run it to catch a slowdown in a subsystem you did not think you
@@ -38,24 +38,24 @@ comparison, use `cd packages/native && bun run bench` instead.
 
 ## By question
 
-| If you are asking…                                                  | Run                                |
-| ------------------------------------------------------------------- | ---------------------------------- |
-| Where does NDJSON decode time go?                                   | `ingest_bench -- phases`           |
-| How close is decode to the raw-scan ceiling?                        | `ingest_bench -- ceiling`          |
-| What does parallel decode / encode buy?                             | `ingest_bench -- threads` / `encode` |
-| How many resident bytes does an element cost?                       | `ingest_bench -- mem`              |
-| What does a GQL / Gremlin query shape cost?                         | `query_bench -- gql` / `gremlin`   |
-| Which counts still enumerate vs shortcut?                           | `query_bench -- counts`            |
-| What does a row cost, by what is returned?                          | `query_bench -- perrow`            |
-| What does turning query text into a plan cost?                      | `query_bench -- plan`              |
-| Does an indexed key seek beat a scan?                               | `query_bench -- seeded`            |
-| What does a bulk write (SET) pay?                                   | `storage_bench -- write`           |
-| What does a second label on every edge cost?                        | `storage_bench -- multilabel`      |
-| What do the graph algorithms cost, and how do they parallelize?     | `algo_bench -- run` / `parallel`   |
-| What does neighborAggregate / a CALL cost?                          | `algo_bench -- neighboragg` / `call` |
-| What does a map/record property cost vs flat scalars (stored, codec)? | `value_bench -- maps` / `codec`  |
-| How do shapes scale across the cache transition?                    | `scale_bench -- sweep`             |
-| What does content-derived CDC scope extraction cost per write?      | `scale_bench -- cdc`               |
+| If you are asking…                                                    | Run                                  |
+| --------------------------------------------------------------------- | ------------------------------------ |
+| Where does NDJSON decode time go?                                     | `ingest_bench -- phases`             |
+| How close is decode to the raw-scan ceiling?                          | `ingest_bench -- ceiling`            |
+| What does parallel decode / encode buy?                               | `ingest_bench -- threads` / `encode` |
+| How many resident bytes does an element cost?                         | `ingest_bench -- mem`                |
+| What does a GQL / Gremlin query shape cost?                           | `query_bench -- gql` / `gremlin`     |
+| Which counts still enumerate vs shortcut?                             | `query_bench -- counts`              |
+| What does a row cost, by what is returned?                            | `query_bench -- perrow`              |
+| What does turning query text into a plan cost?                        | `query_bench -- plan`                |
+| Does an indexed key seek beat a scan?                                 | `query_bench -- seeded`              |
+| What does a bulk write (SET) pay?                                     | `storage_bench -- write`             |
+| What does a second label on every edge cost?                          | `storage_bench -- multilabel`        |
+| What do the graph algorithms cost, and how do they parallelize?       | `algo_bench -- run` / `parallel`     |
+| What does neighborAggregate / a CALL cost?                            | `algo_bench -- neighboragg` / `call` |
+| What does a map/record property cost vs flat scalars (stored, codec)? | `value_bench -- maps` / `codec`      |
+| How do shapes scale across the cache transition?                      | `scale_bench -- sweep`               |
+| What does content-derived CDC scope extraction cost per write?        | `scale_bench -- cdc`                 |
 
 **Deferred** (need crate-private access or a large bespoke fixture, so not in a
 group binary yet): the eval-vs-columnar floor (`eval_vec` is crate-private — it
