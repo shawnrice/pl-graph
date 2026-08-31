@@ -12,7 +12,7 @@
 //!   cdc   — the cost of reading a content-derived scope off the last write's
 //!           touched elements (`last_write_scope_json`), the per-write CDC tax.
 
-use crate::harness::{best_ms, section, social_store, Cfg};
+use crate::harness::{best_ms, section, social_store, time_query, Cfg};
 
 pub fn run(cfg: &Cfg) {
     if cfg.want("scale/sweep") {
@@ -33,11 +33,7 @@ pub fn run(cfg: &Cfg) {
             let store = social_store(n, 5);
             let mut us = [0.0f64; 3];
             for (k, q) in shapes.iter().enumerate() {
-                let plan = lenke_engine::opt::optimize_indexed(
-                    lenke_engine::gql::parse(q).unwrap(),
-                    &store,
-                );
-                us[k] = best_ms(cfg.reps, || lenke_engine::exec::run(&plan, &store)) * 1e3;
+                us[k] = time_query(q, false, &store, cfg.reps).map_or(f64::NAN, |(u, _)| u);
             }
             println!("{n:>10} {:>12.1} {:>12.1} {:>12.1}", us[0], us[1], us[2]);
         }
@@ -45,8 +41,7 @@ pub fn run(cfg: &Cfg) {
 
     if cfg.want("scale/cdc") {
         section("scale/cdc (content-derived scope extraction per write)");
-        let n = cfg.scale.unwrap_or(200_000).min(200_000) as u32;
-        let mut store = social_store(n, 5);
+        let mut store = social_store(cfg.nodes(200_000), 5);
         // A write, so the last-write touched set is populated; then time reading a
         // scope (`city`) off it — the per-write CDC tax the serving path pays.
         let plan = lenke_engine::gql::parse("MATCH (p:Person) WHERE p.age = 42 SET p.age = 43")

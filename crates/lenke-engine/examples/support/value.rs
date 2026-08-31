@@ -12,9 +12,8 @@
 //!   codec  — NDJSON decode + encode of a map graph vs the same fields flat: the
 //!            map overhead in the codec.
 
-use crate::harness::{best_ms, section, Cfg};
+use crate::harness::{best_ms, section, time_query, Cfg, DEFAULT_NODES};
 use lenke_engine::ndjson::{from_ndjson, to_ndjson};
-use lenke_engine::store::Store;
 
 const CITIES: [&str; 4] = ["NYC", "LA", "SF", "CHI"];
 
@@ -46,13 +45,9 @@ fn map_ndjson(n: usize) -> String {
         .join("\n")
 }
 
-fn time_gql(q: &str, store: &Store, reps: usize) -> Result<f64, String> {
-    let plan = lenke_engine::opt::optimize_indexed(lenke_engine::gql::parse(q)?, store);
-    Ok(best_ms(reps, || lenke_engine::exec::run(&plan, store)) * 1e3)
-}
-
 pub fn run(cfg: &Cfg) {
-    let n = cfg.scale.unwrap_or(200_000).min(200_000);
+    // Decode is linear, so no cap is needed — a large BENCH_N just decodes more.
+    let n = cfg.scale.unwrap_or(DEFAULT_NODES);
 
     if cfg.want("value/maps") {
         section("value/maps (scalar regression + map-field access)");
@@ -66,8 +61,8 @@ pub fn run(cfg: &Cfg) {
             ("scalar age (map graph)", scalar, &maps),
             ("map field meta.city", field, &maps),
         ] {
-            match time_gql(q, store, cfg.reps) {
-                Ok(us) => println!("{name:30} {us:>10.1}"),
+            match time_query(q, false, store, cfg.reps) {
+                Ok((us, _)) => println!("{name:30} {us:>10.1}"),
                 Err(e) => println!("{name:30} {:>10}  ({})", "n/a", e.trim()),
             }
         }

@@ -53,7 +53,27 @@ impl Cfg {
             .as_ref()
             .is_none_or(|f| label.contains(f.as_str()))
     }
+
+    /// The fixture node count: the `BENCH_N` override (or the 200k default),
+    /// capped at `cap` so a huge `BENCH_N` cannot blow up an O(V·E) case. The one
+    /// place every store-building group derives its size, instead of repeating
+    /// `cfg.scale.unwrap_or(200_000).min(cap) as u32`.
+    #[must_use]
+    pub fn nodes(&self, cap: u32) -> u32 {
+        self.scale.unwrap_or(DEFAULT_NODES).min(cap as usize) as u32
+    }
+
+    /// Sample count for a HEAVY case (a whole-graph algorithm whose single pass is
+    /// hundreds of ms): fewer than `reps` so the case does not dominate the run.
+    #[must_use]
+    pub fn heavy_reps(&self) -> usize {
+        self.reps.min(3)
+    }
 }
+
+/// The default fixture size when `BENCH_N` is unset — the low end of the cache
+/// transition CLAUDE.md calls out (sweep past it for the cache-resident question).
+pub const DEFAULT_NODES: usize = 200_000;
 
 /// A section header for a group's output, so a `bench_all` run reads as a
 /// sequence of clearly separated tables.
@@ -80,6 +100,33 @@ pub fn best_ms<T>(reps: usize, mut f: impl FnMut() -> T) -> f64 {
 /// would round to zero in milliseconds.
 pub fn best_us<T>(reps: usize, mut f: impl FnMut() -> T) -> f64 {
     best_ms(reps, &mut f) * 1e3
+}
+
+/// Time a GQL or Gremlin query the way the FFI runs one: parse → the store-aware
+/// `optimize_indexed` (which is where an equality/range seek is chosen against the
+/// store's indexes) → `exec::run`. Optimize is one-time, so it sits OUTSIDE the
+/// timing loop — the returned microseconds are the per-run exec cost. Returns
+/// `(best_us, rows)`, or the parse/lower error so a caller can print `n/a` rather
+/// than abort. The single query-timing path every group shares.
+pub fn time_query(
+    q: &str,
+    gremlin: bool,
+    store: &lenke_engine::store::Store,
+    reps: usize,
+) -> Result<(f64, usize), String> {
+    let raw = if gremlin {
+        lenke_engine::gremlin::parse(q)?
+    } else {
+        lenke_engine::gql::parse(q)?
+    };
+    let plan = lenke_engine::opt::optimize_indexed(raw, store);
+    let mut rows = 0;
+    let us = best_us(reps, || {
+        let r = lenke_engine::exec::run(&plan, store);
+        rows = r.rows.len();
+        r
+    });
+    Ok((us, rows))
 }
 
 /// A tiny deterministic LCG (Numerical Recipes constants). Reproducible target

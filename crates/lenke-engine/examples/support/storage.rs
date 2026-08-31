@@ -13,13 +13,15 @@
 //!   multilabel  — single-label vs two-label edges: resident bytes/edge and the
 //!                 1-hop query cost, i.e. what a second label on every edge costs.
 
-use crate::harness::{best_ms, rss_bytes, section, social_store, Cfg};
+use crate::harness::{
+    best_ms, rss_bytes, section, social_store, time_query, Cfg, Lcg, DEFAULT_NODES,
+};
 use lenke_engine::ndjson::from_ndjson;
 
 pub fn run(cfg: &Cfg) {
     if cfg.want("storage/write") {
         section("storage/write (bulk SET throughput)");
-        let n = cfg.scale.unwrap_or(200_000).min(200_000) as u32;
+        let n = cfg.nodes(200_000);
         let mut store = social_store(n, 5);
         let q = "MATCH (p:Person) SET p.age = p.age + 1";
         let ms = best_ms(cfg.reps, || {
@@ -39,7 +41,9 @@ pub fn run(cfg: &Cfg) {
 
     if cfg.want("storage/multilabel") {
         section("storage/multilabel (a second label on every edge)");
-        let n = cfg.scale.unwrap_or(200_000).min(100_000);
+        // Capped below the default: the RSS delta and 1-hop are what matter, and a
+        // huge graph only makes the resident-set reading noisier.
+        let n = cfg.scale.unwrap_or(DEFAULT_NODES).min(100_000);
         // Same nodes and edge endpoints; only the edge label set differs.
         let build = |labels: &str| -> String {
             let mut lines: Vec<String> = (0..n)
@@ -50,7 +54,7 @@ pub fn run(cfg: &Cfg) {
                     )
                 })
                 .collect();
-            let mut rng = crate::harness::Lcg::seeded();
+            let mut rng = Lcg::seeded();
             for i in 0..n {
                 let to = rng.next(n as u32);
                 lines.push(format!(
@@ -74,9 +78,7 @@ pub fn run(cfg: &Cfg) {
             drop(text);
             let after = rss_bytes().unwrap_or(before);
             let used = after.saturating_sub(before) as f64;
-            let plan =
-                lenke_engine::opt::optimize_indexed(lenke_engine::gql::parse(hop).unwrap(), &store);
-            let us = best_ms(cfg.reps, || lenke_engine::exec::run(&plan, &store)) * 1e3;
+            let us = time_query(hop, false, &store, cfg.reps).map_or(f64::NAN, |(u, _)| u);
             println!(
                 "{name:22} {:>12.1} {:>12.1} {us:>10.1}",
                 used / (1024.0 * 1024.0),

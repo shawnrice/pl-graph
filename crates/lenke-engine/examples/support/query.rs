@@ -14,30 +14,8 @@
 //!   plan     — lex+parse+lower only, no graph, no exec: the cost of the text.
 //!   seeded   — an equality filter on an indexed key: seek vs full scan.
 
-use crate::harness::{best_us, section, social_store, Cfg};
+use crate::harness::{best_us, section, social_store, time_query, Cfg};
 use lenke_engine::store::Store;
-
-/// Time a GQL or Gremlin query the way the FFI runs one: parse, then the
-/// store-aware `optimize_indexed` (which is where an equality/range seek is
-/// chosen against the store's indexes), then `exec::run`. Optimize is one-time,
-/// so it sits OUTSIDE the timing loop — the number is the per-run exec cost.
-/// Returns `(best_us, rows)` or a parse error — a bad shape prints `n/a` instead
-/// of aborting the whole group.
-fn time_query(q: &str, gremlin: bool, store: &Store, reps: usize) -> Result<(f64, usize), String> {
-    let raw = if gremlin {
-        lenke_engine::gremlin::parse(q)?
-    } else {
-        lenke_engine::gql::parse(q)?
-    };
-    let plan = lenke_engine::opt::optimize_indexed(raw, store);
-    let mut rows = 0;
-    let us = best_us(reps, || {
-        let r = lenke_engine::exec::run(&plan, store);
-        rows = r.rows.len();
-        r
-    });
-    Ok((us, rows))
-}
 
 fn table(title: &str, store: &Store, gremlin: bool, cfg: &Cfg, shapes: &[(&str, &str)]) {
     section(title);
@@ -53,8 +31,7 @@ fn table(title: &str, store: &Store, gremlin: bool, cfg: &Cfg, shapes: &[(&str, 
 pub fn run(cfg: &Cfg) {
     // Cap the fixture: 2-hop over deg-5 is quadratic in degree, so a huge graph
     // makes the group slow without changing the shape being measured.
-    let nodes = cfg.scale.unwrap_or(200_000).min(200_000) as u32;
-    let store = social_store(nodes, 5);
+    let store = social_store(cfg.nodes(200_000), 5);
 
     if cfg.want("query/gql") {
         table(
@@ -194,8 +171,8 @@ pub fn run(cfg: &Cfg) {
         // literal is a seekable spelling; per the equal-spellings rule it must
         // cost the same as the `$param` form.)
         let q = "MATCH (p:Person) WHERE p.name = 'name12345' RETURN p.age";
-        let scan = social_store(nodes, 5);
-        let mut indexed = social_store(nodes, 5);
+        let scan = social_store(cfg.nodes(200_000), 5);
+        let mut indexed = social_store(cfg.nodes(200_000), 5);
         indexed.create_index("name");
         let scan_us = time_query(q, false, &scan, cfg.reps).map_or(f64::NAN, |(u, _)| u);
         let seek_us = time_query(q, false, &indexed, cfg.reps).map_or(f64::NAN, |(u, _)| u);

@@ -15,17 +15,18 @@
 //!             speedup, and round-trip MiB/s.
 //!   mem     — resident bytes per element for nodes-only and 5-edges/node graphs.
 
-use crate::harness::{best_ms, rss_bytes, section, social_ndjson, Cfg};
+use crate::harness::{best_ms, rss_bytes, section, social_ndjson, Cfg, DEFAULT_NODES};
 use lenke_engine::ndjson::{from_ndjson, from_ndjson_threads, to_ndjson, to_ndjson_threads};
 use std::time::Instant;
 
 type Record = (String, Vec<String>, Vec<(String, String)>);
 
 pub fn run(cfg: &Cfg) {
-    section("ingest");
-    let base = cfg.scale.unwrap_or(200_000);
+    // Decode is linear, so no cap is needed — a large BENCH_N just decodes more.
+    let base = cfg.scale.unwrap_or(DEFAULT_NODES);
 
     if cfg.want("ingest/phases") {
+        section("ingest/phases");
         println!(
             "{:26} {:>7}  {:>10} {:>12} {:>10} {:>10}",
             "phases", "MiB", "decode_ms", "recmat_ms", "teardn_ms", "free_ms"
