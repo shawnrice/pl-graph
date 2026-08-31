@@ -7,22 +7,10 @@ import { rando } from '@lenke/utils';
 
 import { deserialize } from './deserialize.js';
 import { serialize } from './serialize.js';
+import type { SerializedTreeNode, TreeNodeJSON } from './types.js';
 
 type UnaryFn<T = any, R = T> = (x0: T) => R;
 type BinaryFn<A = any, B = A, R = A> = (x0: A, x1: B) => R;
-
-export type TreeNodeJSON = {
-  id: string;
-  value: any;
-  parentId: string | null;
-  children: TreeNodeJSON[];
-};
-
-export type SerializedTreeNode<T> = {
-  id: string;
-  value: T; // well a stringified version of this
-  parentId: string | null;
-};
 
 /**
  * A simple tree class with a few bells

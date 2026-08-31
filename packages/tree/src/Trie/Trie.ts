@@ -208,7 +208,10 @@ export class Trie<T> {
       // value (`add(k, null)` — null is a first-class value) and duplicate the
       // tombstone logic incorrectly.
       if (node.word && node.isEndOfWord) {
-        yield [node.word, node.value];
+        // `value` is typed `T | null` only because `null` doubles as the tombstone
+        // sentinel; `isEndOfWord` guarantees this is a real stored value (and a null
+        // is only present when the user stored one, i.e. `T` admits null).
+        yield [node.word, node.value as T];
       }
     }
   }
