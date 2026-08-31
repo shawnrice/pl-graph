@@ -323,7 +323,10 @@ export const decode = (input: string, graph: Graph): Graph => {
       }
     }
 
-    graph.addVertex({ id: v.id, labels: splitLabels(v.label), properties });
+    // Ids are opaque string keys in the store (matching the Rust codec, which keeps
+    // even a numeric ingest id as text, and pg-json's `String(...)`). Coerce foreign
+    // GraphSON numeric ids so they land — and are looked up — as strings.
+    graph.addVertex({ id: String(v.id), labels: splitLabels(v.label), properties });
   }
 
   for (const wrapper of (edges as Array<{ '@value'?: unknown }> | undefined) ?? []) {
@@ -339,8 +342,8 @@ export const decode = (input: string, graph: Graph): Graph => {
       shapeError('edge @value.label must be a string');
     }
 
-    const from = graph.getVertexById(e.outV);
-    const to = graph.getVertexById(e.inV);
+    const from = graph.getVertexById(String(e.outV));
+    const to = graph.getVertexById(String(e.inV));
 
     if (from === null || to === null) {
       throw new LenkeError(
@@ -358,7 +361,7 @@ export const decode = (input: string, graph: Graph): Graph => {
       properties[key] = decodeValue(e.properties![key]?.['@value']?.value);
     }
 
-    graph.addEdge({ id: e.id, from, to, labels: splitLabels(e.label), properties });
+    graph.addEdge({ id: String(e.id), from, to, labels: splitLabels(e.label), properties });
   }
 
   if (wasEnabled) {
