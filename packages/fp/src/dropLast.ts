@@ -32,5 +32,7 @@ export function dropLast<T>(
   count: number,
   iterable?: Iterable<T>,
 ): UnaryFn<Iterable<T>> | Iterable<T> {
-  return iterable ? internalDropLast(count, iterable) : (x0) => internalDropLast(count, x0);
+  return iterable === undefined
+    ? (x0) => internalDropLast(count, x0)
+    : internalDropLast(count, iterable);
 }

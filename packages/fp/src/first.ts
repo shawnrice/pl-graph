@@ -24,5 +24,5 @@ export function first<T>(iterable: Iterable<T>): T | undefined;
 export function first<T>(
   iterable?: Iterable<T>,
 ): UnaryFn<Iterable<T>, T | undefined> | T | undefined {
-  return iterable ? internalFirst(iterable) : internalFirst;
+  return iterable === undefined ? internalFirst : internalFirst(iterable);
 }

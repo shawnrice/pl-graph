@@ -14,7 +14,9 @@ export function filter<T>(
   predicate: Predicate<T>,
   iterable?: Iterable<T>,
 ): UnaryFn<Iterable<T>> | Iterable<T> {
-  return iterable ? internalFilter(predicate, iterable) : (x0) => internalFilter(predicate, x0);
+  return iterable === undefined
+    ? (x0) => internalFilter(predicate, x0)
+    : internalFilter(predicate, iterable);
 }
 
 export const select = filter;

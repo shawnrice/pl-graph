@@ -39,4 +39,14 @@ describe('functional iterator tests', () => {
 
     expect(x1).toEqual([200, 202, 204, 206, 208]);
   });
+
+  test('the empty string is data-first input, not a missing iterable', () => {
+    // `''` is a valid (empty) indexed iterable but falsy — the dispatch must key on
+    // `iterable === undefined`, not truthiness, or `map(fn, '')` returns the CURRIED
+    // function instead of an empty result.
+    expect([...map((c: string) => c.toUpperCase(), '')]).toEqual([]);
+    expect([...map((c: string) => c.toUpperCase(), 'ab')]).toEqual(['A', 'B']);
+    // the curried (data-last) form still returns a function
+    expect(typeof map((c: string) => c)).toBe('function');
+  });
 });

@@ -11,5 +11,5 @@ export function flatten<T>(iterable: Iterable<Iterable<T>>): Iterable<T>;
 export function flatten<T>(
   iterable?: Iterable<Iterable<T>>,
 ): UnaryFn<Iterable<Iterable<T>>, Iterable<T>> | Iterable<T> {
-  return iterable ? internalFlatten(iterable) : (x0) => internalFlatten(x0);
+  return iterable === undefined ? (x0) => internalFlatten(x0) : internalFlatten(iterable);
 }

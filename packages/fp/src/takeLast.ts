@@ -34,5 +34,7 @@ export function takeLast<T>(
   count: number,
   iterable?: Iterable<T>,
 ): UnaryFn<Iterable<T>> | Iterable<T> {
-  return iterable ? internalTakeLast(count, iterable) : (x0) => internalTakeLast(count, x0);
+  return iterable === undefined
+    ? (x0) => internalTakeLast(count, x0)
+    : internalTakeLast(count, iterable);
 }

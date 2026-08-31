@@ -18,5 +18,7 @@ export function before<T>(
   predicate: Predicate<T>,
   iterable?: Iterable<T>,
 ): UnaryFn<Iterable<T>> | Iterable<T> {
-  return iterable ? internalBefore(predicate, iterable) : (x0) => internalBefore(predicate, x0);
+  return iterable === undefined
+    ? (x0) => internalBefore(predicate, x0)
+    : internalBefore(predicate, iterable);
 }

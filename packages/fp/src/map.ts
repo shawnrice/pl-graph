@@ -14,5 +14,7 @@ export function map<T, R = T>(
   mapper: MapFn<T, R>,
   iterable?: Iterable<T>,
 ): UnaryFn<Iterable<T>, Iterable<R>> | Iterable<R> {
-  return iterable ? internalMap(mapper, iterable) : (x0: Iterable<T>) => internalMap(mapper, x0);
+  return iterable === undefined
+    ? (x0: Iterable<T>) => internalMap(mapper, x0)
+    : internalMap(mapper, iterable);
 }

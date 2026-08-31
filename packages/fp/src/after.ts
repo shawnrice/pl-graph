@@ -18,5 +18,7 @@ export function after<T>(
   predicate: Predicate<T>,
   iterable?: Iterable<T>,
 ): UnaryFn<Iterable<T>> | Iterable<T> {
-  return iterable ? internalAfter(predicate, iterable) : (x0) => internalAfter(predicate, x0);
+  return iterable === undefined
+    ? (x0) => internalAfter(predicate, x0)
+    : internalAfter(predicate, iterable);
 }

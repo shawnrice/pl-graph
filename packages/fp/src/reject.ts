@@ -9,5 +9,5 @@ export function reject<T>(
 ): UnaryFn<Iterable<T>> | Iterable<T> {
   const fn = (x: T) => !predicate(x);
 
-  return iterable ? filter(fn, iterable) : (x0) => filter(fn, x0);
+  return iterable === undefined ? (x0) => filter(fn, x0) : filter(fn, iterable);
 }

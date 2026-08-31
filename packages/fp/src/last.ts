@@ -19,5 +19,5 @@ const internalLast = boundary(<T>(iterable: Iterable<T>): T | undefined => {
 export function last<T>(): Boundary<UnaryFn<Iterable<T>, T | undefined>>;
 export function last<T>(iterable: Iterable<T>): T | undefined;
 export function last<T>(iterable?: Iterable<T>) {
-  return iterable ? internalLast(iterable) : internalLast;
+  return iterable === undefined ? internalLast : internalLast(iterable);
 }

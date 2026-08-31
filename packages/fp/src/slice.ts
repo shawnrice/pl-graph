@@ -25,5 +25,7 @@ export function slice<T>(
   end: number,
   iterable?: Iterable<T>,
 ): UnaryFn<Iterable<T>> | Iterable<T> {
-  return iterable ? internalSlice(start, end, iterable) : (x0) => internalSlice(start, end, x0);
+  return iterable === undefined
+    ? (x0) => internalSlice(start, end, x0)
+    : internalSlice(start, end, iterable);
 }
