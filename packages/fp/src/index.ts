@@ -5,7 +5,6 @@ export * from './boundary.js';
 export * from './bounded.js';
 export * from './chunk.js';
 export * from './count.js';
-export * from './distinct.js';
 export * from './first.js';
 export * from './last.js';
 export * from './takeLast.js';

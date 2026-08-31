@@ -1,16 +1,16 @@
 import { describe, expect, mock, test } from 'bun:test';
 
-import { distinct } from './distinct.js';
 import { map } from './map.js';
 import { pipe } from './pipe.js';
 import { take } from './take.js';
 import { toArray } from './toArray.js';
+import { uniq } from './uniq.js';
 
 describe('functional iterator tests', () => {
   test('we can pipe', () => {
     const isOdd = mock((x: number): boolean => !!(x % 2));
 
-    const fn = pipe(map(isOdd), distinct, take(3), toArray);
+    const fn = pipe(map(isOdd), uniq, take(3), toArray);
 
     const iterable = Array.from({ length: 100 }).map((_, i) => i + 1);
 
