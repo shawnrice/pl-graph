@@ -49,20 +49,22 @@ comparison, use `cd packages/native && bun run bench` instead.
 | What does a row cost, by what is returned?                          | `query_bench -- perrow`            |
 | What does turning query text into a plan cost?                      | `query_bench -- plan`              |
 | Does an indexed key seek beat a scan?                               | `query_bench -- seeded`            |
-| _(coming)_ Should adjacency storage change, and what do writes pay? | `storage_bench`                    |
-| _(coming)_ How far is WHERE from a columnar kernel?                 | `storage_bench -- eval`            |
-| _(coming)_ Does the type / property / temporal index seed a seek?   | `index_bench`                      |
-| What do the graph algorithms cost, and how do they parallelize?     | `algo_bench -- run` / `parallel` |
+| What does a bulk write (SET) pay?                                   | `storage_bench -- write`           |
+| What does a second label on every edge cost?                        | `storage_bench -- multilabel`      |
+| What do the graph algorithms cost, and how do they parallelize?     | `algo_bench -- run` / `parallel`   |
 | What does neighborAggregate / a CALL cost?                          | `algo_bench -- neighboragg` / `call` |
-| _(coming)_ What do map / record / temporal-column values cost?      | `value_bench`                      |
-| _(coming)_ How do shapes scale with size? CDC? AML / HRIS shapes?   | `scale_bench`                      |
+| What does a map/record property cost vs flat scalars (stored, codec)? | `value_bench -- maps` / `codec`  |
+| How do shapes scale across the cache transition?                    | `scale_bench -- sweep`             |
+| What does content-derived CDC scope extraction cost per write?      | `scale_bench -- cdc`               |
 
-The _(coming)_ rows are groups being ported from the retired `lenke-core` corpus;
-they land in follow-up commits. The moot ones are **not** coming back: the
-core-vs-engine (`cross_engine_shortcuts`) and Gremlin-arm-vs-IR audits
-(`arm_audit`, `migration_arm_price_audit`, …) priced migrations that are now
-complete, and query-parallelism benches (`bench_parallel_query_speedup`) target
-an evaluator the engine does not have.
+**Deferred** (need crate-private access or a large bespoke fixture, so not in a
+group binary yet): the eval-vs-columnar floor (`eval_vec` is crate-private — it
+lives as an ignored test), temporal-column cost (`temporal_bench`, needs host
+`Temporal` construction), and the AML / HRIS domain-shaped workloads. **Not
+coming back** — the core-vs-engine (`cross_engine_shortcuts`) and Gremlin-arm-vs-IR
+audits (`arm_audit`, `migration_arm_price_audit`, …) priced migrations that are
+complete, and query-parallelism benches (`bench_parallel_query_speedup`) target an
+evaluator the engine does not have.
 
 ## The focused probes (stay their own binary)
 

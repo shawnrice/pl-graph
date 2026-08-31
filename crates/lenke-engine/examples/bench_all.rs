@@ -21,11 +21,20 @@ mod harness;
 mod ingest;
 #[path = "support/query.rs"]
 mod query;
+#[path = "support/scale.rs"]
+mod scale;
+#[path = "support/storage.rs"]
+mod storage;
+#[path = "support/value.rs"]
+mod value;
 
 fn main() {
     let cfg = harness::Cfg::from_env();
-    // Groups are added here as each is built; every group honours `cfg.filter`.
+    // Every group honours `cfg.filter`, so `bench_all -- <case>` narrows the sweep.
     ingest::run(&cfg);
     query::run(&cfg);
+    storage::run(&cfg);
+    value::run(&cfg);
     algo::run(&cfg);
+    scale::run(&cfg);
 }

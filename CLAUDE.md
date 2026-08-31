@@ -2,9 +2,16 @@
 
 ## Benchmarks: look before you build
 
-The engine has a few native Rust benchmark examples under
-`crates/lenke-engine/examples/`. Read their module headers before writing a new
-one — each opens with the exact question it answers:
+The engine's benchmarks live under `crates/lenke-engine/examples/`, indexed by
+question in `examples/README.md`. **Read the README (and the relevant module
+header) before writing a new one** — your question is very likely already a case.
+
+The corpus is a small set of themed group binaries (`ingest_bench`, `query_bench`,
+`storage_bench`, `value_bench`, `algo_bench`, `scale_bench`), each with selectable
+cases (`-- <substring>`), plus **`bench_all`** which runs every group in one
+process for a regression sweep. They share one harness (`examples/support/`:
+min-of-N timing, a dep-free deterministic LCG, common fixtures). Three focused
+probes stay standalone because each has a bespoke fixture:
 
 - `expand_bench` — the adjacency / edge-type question: what does a type-filtered
   `expand` pay to scan a node's whole adjacency and filter by edge type? It scales
@@ -22,9 +29,12 @@ like overhead. It is the other way round — re-deriving a question one of these
 already answers is the expensive path. Add a new example only when the question
 genuinely is not covered.
 
-(A larger benchmark corpus, indexed by a README, lived in the retired `lenke-core`
-crate and went with it when it was deleted; rebuilding the parts that still matter
-against `lenke-engine` is open work.)
+(This corpus is the consolidation of the ~40 separate example/ignored-test benches
+that lived in the retired `lenke-core` crate. A few questions are still deferred —
+the eval-vs-columnar floor needs crate-private `eval_vec`, temporal-column cost
+needs host `Temporal` construction, and the AML/HRIS domain workloads are large
+bespoke fixtures; see `examples/README.md`. The migration-era A/B benches
+[`cross_engine_shortcuts`, the `arm_audit` family] are not coming back.)
 
 ### Three engines, two harnesses
 
