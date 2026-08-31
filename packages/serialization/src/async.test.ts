@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import { Graph } from '@lenke/core';
 
-import { deserializeAsync, serializeAsync } from './index.js';
+import { deserializeAsync, serialize, serializeAsync } from './index.js';
 import { graphContentEqual, randomLpgGraph } from './testkit.js';
 
 /** A graph big enough that (de)serialization takes well over a timer tick. */
@@ -77,5 +77,17 @@ describe('serializeAsync / deserializeAsync', () => {
     // single-document JSON falls back (yields once); still correct.
     const json = await serializeAsync(g, 'pg-json');
     expect(graphContentEqual(await deserializeAsync(json, 'pg-json', new Graph()), g)).toBe(true);
+  });
+
+  // The streaming path must be BYTE-IDENTICAL to the sync `serialize` (which
+  // codec-fuzz pins to the Rust codec). `bigGraph` crosses the 1024-line batch
+  // boundary, so the multi-chunk separator logic is exercised; the empty graph
+  // guards the zero-chunk edge.
+  test('serialize === serializeAsync byte-for-byte across the streaming formats', async () => {
+    for (const g of [new Graph(), randomLpgGraph(1), bigGraph()]) {
+      for (const format of ['ndjson', 'pg-text', 'csv'] as const) {
+        expect(await serializeAsync(g, format)).toBe(serialize(g, format));
+      }
+    }
   });
 });

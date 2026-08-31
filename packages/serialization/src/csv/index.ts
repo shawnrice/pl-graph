@@ -950,7 +950,10 @@ export async function* encodeNodesStream(graph: Graph): AsyncGenerator<string> {
 
   const { keys, types } = computeColumns(bags);
 
-  yield `${nodeHeaderLine(keys, types)}\n`;
+  // The header is always first, so row batches carry a LEADING `\n` separator and
+  // no chunk carries a trailing one — the concatenation is byte-identical to the
+  // sync `encodeNodes` (`rows.join('\n')`), which the sentinel composition relies on.
+  yield nodeHeaderLine(keys, types);
 
   let batch: string[] = [];
   let i = 0;
@@ -960,13 +963,13 @@ export async function* encodeNodesStream(graph: Graph): AsyncGenerator<string> {
     i += 1;
 
     if (batch.length >= BATCH) {
-      yield `${batch.join('\n')}\n`;
+      yield `\n${batch.join('\n')}`;
       batch = [];
     }
   }
 
   if (batch.length > 0) {
-    yield `${batch.join('\n')}\n`;
+    yield `\n${batch.join('\n')}`;
   }
 }
 
@@ -980,7 +983,8 @@ export async function* encodeEdgesStream(graph: Graph): AsyncGenerator<string> {
 
   const { keys, types } = computeColumns(bags);
 
-  yield `${edgeHeaderLine(keys, types)}\n`;
+  // Header first, row batches carry a LEADING `\n`, no trailing — see encodeNodesStream.
+  yield edgeHeaderLine(keys, types);
 
   let batch: string[] = [];
   let i = 0;
@@ -1002,13 +1006,13 @@ export async function* encodeEdgesStream(graph: Graph): AsyncGenerator<string> {
     i += 1;
 
     if (batch.length >= BATCH) {
-      yield `${batch.join('\n')}\n`;
+      yield `\n${batch.join('\n')}`;
       batch = [];
     }
   }
 
   if (batch.length > 0) {
-    yield `${batch.join('\n')}\n`;
+    yield `\n${batch.join('\n')}`;
   }
 }
 
@@ -1156,14 +1160,15 @@ export const decode = (input: string, graph: Graph): Graph => {
 };
 
 /**
- * Stream the combined single-string form: the nodes stream, then the sentinel
- * line, then the edges stream. Each piece already ends in `\n`, so the sentinel
- * lands on its own line between the two sub-documents.
+ * Stream the combined single-string form: the nodes stream, the sentinel, then
+ * the edges stream. The sub-streams carry no trailing newline, so they are joined
+ * by `SEPARATOR` (`\n=== EDGES ===\n`) — byte-identical to the sync `encode`
+ * (`encodeNodes + SEPARATOR + encodeEdges`).
  */
 export async function* encodeStream(graph: Graph): AsyncGenerator<string> {
   yield* encodeNodesStream(graph);
 
-  yield `${SENTINEL_LINE}\n`;
+  yield SEPARATOR;
 
   yield* encodeEdgesStream(graph);
 }

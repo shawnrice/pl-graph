@@ -205,17 +205,29 @@ export const decode = (input: string, graph: Graph): Graph => {
   return graph;
 };
 
-/** Stream the document in batched line chunks, without building the whole string. */
+/**
+ * Stream the document in batched line chunks, without building the whole string.
+ * The concatenation of the chunks is BYTE-IDENTICAL to `encode` (the codec-fuzz
+ * canonical) — lines are `\n`-separated with NO trailing newline, so the `\n`
+ * is emitted as a separator BEFORE each chunk except the first.
+ */
 export async function* encodeStream(graph: Graph): AsyncGenerator<string> {
   const batchSize = 1024;
   let batch: string[] = [];
+  let first = true;
+  const flush = (): string => {
+    const chunk = first ? batch.join('\n') : `\n${batch.join('\n')}`;
+    first = false;
+    batch = [];
+
+    return chunk;
+  };
 
   for (const vertex of graph.vertices) {
     batch.push(nodeLine(vertex));
 
     if (batch.length >= batchSize) {
-      yield `${batch.join('\n')}\n`;
-      batch = [];
+      yield flush();
     }
   }
 
@@ -223,13 +235,12 @@ export async function* encodeStream(graph: Graph): AsyncGenerator<string> {
     batch.push(edgeLine(edge));
 
     if (batch.length >= batchSize) {
-      yield `${batch.join('\n')}\n`;
-      batch = [];
+      yield flush();
     }
   }
 
   if (batch.length > 0) {
-    yield `${batch.join('\n')}\n`;
+    yield flush();
   }
 }
 

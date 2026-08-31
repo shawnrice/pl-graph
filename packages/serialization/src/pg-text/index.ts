@@ -429,13 +429,20 @@ export const decode = (input: string, graph: Graph): Graph => {
 export async function* encodeStream(graph: Graph): AsyncGenerator<string> {
   const batchSize = 1024;
   let batch: string[] = [];
+  let first = true;
+  const flush = (): string => {
+    const chunk = first ? batch.join('\n') : `\n${batch.join('\n')}`;
+    first = false;
+    batch = [];
+
+    return chunk;
+  };
 
   for (const vertex of graph.vertices) {
     batch.push(elementTokens([vertex.id], vertex.labels, vertex.properties));
 
     if (batch.length >= batchSize) {
-      yield `${batch.join('\n')}\n`;
-      batch = [];
+      yield flush();
     }
   }
 
@@ -443,13 +450,12 @@ export async function* encodeStream(graph: Graph): AsyncGenerator<string> {
     batch.push(elementTokens([edge.from.id, edge.to.id], edge.labels, edge.properties));
 
     if (batch.length >= batchSize) {
-      yield `${batch.join('\n')}\n`;
-      batch = [];
+      yield flush();
     }
   }
 
   if (batch.length > 0) {
-    yield `${batch.join('\n')}\n`;
+    yield flush();
   }
 }
 
