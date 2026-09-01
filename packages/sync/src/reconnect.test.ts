@@ -126,6 +126,37 @@ suite('createReconnectingClient', () => {
     return { connect, cut, goOffline, goOnline, connects: () => connects };
   };
 
+  test('a connection that closes synchronously during connect() is released, not leaked', () => {
+    let dials = 0;
+    let closes = 0;
+
+    const client = createReconnectingClient({
+      // First dial's transport fails immediately: it calls closed() SYNCHRONOUSLY
+      // during connect(). Before the fix, `held.c` was still null inside that
+      // callback, so the just-returned conn was orphaned and its close() never ran.
+      connect: ({ closed }) => {
+        dials += 1;
+
+        const close = (): void => {
+          closes += 1;
+        };
+
+        if (dials === 1) {
+          closed();
+        }
+
+        return { send: () => {}, close };
+      },
+      // Long backoff so the scheduled re-dial can't fire during this synchronous test.
+      retry: { baseMs: 100_000, maxMs: 100_000 },
+    });
+
+    expect(dials).toBe(1);
+    expect(closes).toBe(1); // the orphaned conn was closed, not leaked
+
+    client.close();
+  });
+
   test('re-subscribes a standing query after a reconnect', async () => {
     const store = createStore(
       graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),

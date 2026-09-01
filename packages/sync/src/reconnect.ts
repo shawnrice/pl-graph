@@ -213,7 +213,16 @@ export const createReconnectingClient = (
       },
     });
 
-    goLive(); // if opened fired synchronously during connect(), run it now
+    if (held.settled) {
+      // `closed()` fired SYNCHRONOUSLY during connect() (e.g. an immediate failure):
+      // `held.c` was still null inside that callback, so its `conn === held.c` check
+      // could not null it and the just-returned conn is orphaned. Release it now
+      // (the redial is already scheduled by that callback).
+      held.c?.close();
+      held.c = null;
+    } else {
+      goLive(); // if opened fired synchronously during connect(), run it now
+    }
   };
 
   dial();
