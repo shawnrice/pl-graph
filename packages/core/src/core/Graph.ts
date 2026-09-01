@@ -1056,6 +1056,11 @@ export class Graph {
    * satisfies them. Shared by {@link clone} and {@link copy}.
    */
   #copyRegistriesInto = (next: Graph): void => {
+    // Carry graph settings (clock, limits, parallelism) — a `new Graph()` starts at
+    // DEFAULT_CONFIG, so without this a clone/copy silently reverts a wired clock or
+    // a lowered limit, changing query behaviour on the copy.
+    next.settings = { ...this.settings, limits: { ...this.settings.limits } };
+
     copySetMap(this.vertexUniqueConstraints, next.vertexUniqueConstraints);
     copySetMap(this.vertexRequiredConstraints, next.vertexRequiredConstraints);
     copyTypeMap(this.vertexTypeConstraints, next.vertexTypeConstraints);
@@ -1373,12 +1378,46 @@ export class Graph {
     } else if (this.txDepth > 0) {
       this.txTouched.add(vertex.id);
     } else {
-      for (const key of this.vertexRequiredConstraints.get(label) ?? []) {
-        if (!this.isPresent(vertex.properties[key])) {
-          throw new LenkeError(
-            `cannot add label '${label}': it requires property '${key}', which is missing`,
-            { code: ErrorCode.ConstraintViolation },
-          );
+      // Adding a label brings ITS full constraint suite into force — not just
+      // required keys. Run the same checks the commit path (runDeferredChecks) runs
+      // for a touched vertex, against the augmented label set, so an eager
+      // addLabelToVertex and one wrapped in a transaction agree. Checked BEFORE the
+      // mutation, so a violation leaves the graph untouched (properties don't change,
+      // so the existing labels' validators still hold — only the new label's apply).
+      const augmented = [...new Set([...(this.elementLabels.get(vertex.id) ?? []), label])];
+
+      const missing = this.missingRequired(augmented, vertex.properties);
+
+      if (missing) {
+        throw new LenkeError(
+          `cannot add label '${label}': missing required property '${missing.key}' for label '${missing.label}'`,
+          { code: ErrorCode.ConstraintViolation },
+        );
+      }
+
+      const badType = this.typeViolation(augmented, vertex.properties);
+
+      if (badType) {
+        throw new LenkeError(
+          `property '${badType.key}' must be ${badType.expected} on '${badType.label}', got ${badType.got}`,
+          { code: ErrorCode.ConstraintViolation },
+        );
+      }
+
+      const dup = this.uniqueConflict(augmented, vertex.properties, vertex);
+
+      if (dup) {
+        throw new LenkeError(
+          `unique constraint on '${dup.label}.${dup.key}' violated by value ${JSON.stringify(dup.existing.properties[dup.key])}`,
+          { code: ErrorCode.ConstraintViolation },
+        );
+      }
+
+      for (const entry of this.validatorRegistry.get(label) ?? []) {
+        if (entry.fn(vertex) === false) {
+          throw new LenkeError(`validator '${entry.src}' on '${label}' violated`, {
+            code: ErrorCode.ConstraintViolation,
+          });
         }
       }
     }
@@ -1639,12 +1678,44 @@ export class Graph {
     } else if (this.txDepth > 0) {
       this.txTouchedEdges.add(edge.id);
     } else {
-      for (const key of this.edgeRequiredConstraints.get(label) ?? []) {
-        if (!this.isPresent(edge.properties[key])) {
-          throw new LenkeError(
-            `cannot add edge type '${label}': it requires property '${key}', which is missing`,
-            { code: ErrorCode.ConstraintViolation },
-          );
+      // Adding an edge type brings ITS full constraint suite into force, not just
+      // required keys — the same checks runDeferredChecks runs for a touched edge,
+      // against the augmented type set, so eager and in-transaction agree. Checked
+      // BEFORE the mutation (properties unchanged → existing types' validators hold).
+      const augmented = new Set([...edge.labels, label]);
+
+      const missing = this.edgeMissingRequired(augmented, edge.properties);
+
+      if (missing) {
+        throw new LenkeError(
+          `cannot add edge type '${label}': missing required property '${missing.key}' for edge type '${missing.label}'`,
+          { code: ErrorCode.ConstraintViolation },
+        );
+      }
+
+      const badType = this.edgeTypeViolation(augmented, edge.properties);
+
+      if (badType) {
+        throw new LenkeError(
+          `property '${badType.key}' must be ${badType.expected} on edge type '${badType.label}', got ${badType.got}`,
+          { code: ErrorCode.ConstraintViolation },
+        );
+      }
+
+      const dup = this.edgeUniqueConflict(augmented, edge.properties, edge);
+
+      if (dup) {
+        throw new LenkeError(
+          `unique constraint on edge type '${dup.label}.${dup.key}' violated by value ${JSON.stringify(dup.existing.properties[dup.key])}`,
+          { code: ErrorCode.ConstraintViolation },
+        );
+      }
+
+      for (const entry of this.validatorRegistry.get(label) ?? []) {
+        if (entry.fn(edge) === false) {
+          throw new LenkeError(`validator '${entry.src}' on '${label}' violated`, {
+            code: ErrorCode.ConstraintViolation,
+          });
         }
       }
     }
@@ -1877,7 +1948,12 @@ export class Graph {
    * domain so both engines agree on what a constraint can bucket.
    */
   private isUniqueKeyable = (value: unknown): value is string | number | boolean =>
-    typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
+    typeof value === 'string' ||
+    typeof value === 'boolean' ||
+    // Exclude NaN, matching PropertyIndex.isIndexable — else the declare-time dup
+    // scan (a JS Set: NaN === NaN) rejects two NaNs while runtime enforcement (index-
+    // backed, NaN not indexed) allows them, so the outcome depended on declare order.
+    (typeof value === 'number' && !Number.isNaN(value));
 
   /**
    * Declare a UNIQUE constraint on `(label, key)`. Creates the backing vertex

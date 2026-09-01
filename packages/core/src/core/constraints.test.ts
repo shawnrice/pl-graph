@@ -69,6 +69,18 @@ describe('required constraints', () => {
     expect(g.addLabelToVertex('User', p)).toBeTruthy(); // now satisfied
   });
 
+  test('adding a label enforces its FULL suite (type), and eager matches in-transaction', () => {
+    const g = new Graph();
+    g.createTypeConstraint('User', 'age', 'number'); // no User vertex yet → declares fine
+    const p = g.addVertex({ id: 'p', labels: ['Person'], properties: { age: 'not-a-number' } });
+
+    // The eager path used to enforce only required keys, so a TYPE violation slipped
+    // through outside a transaction while the in-transaction commit path rejected it.
+    // Now both reject — the eager addLabel runs the same full suite.
+    expect(isCV(() => g.addLabelToVertex('User', p))).toBe(true);
+    expect(isCV(() => g.transaction(() => g.addLabelToVertex('User', p)))).toBe(true);
+  });
+
   test('the constraint registry is queryable', () => {
     const g = new Graph();
     g.createRequiredConstraint('User', 'email');
