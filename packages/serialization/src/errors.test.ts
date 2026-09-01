@@ -77,6 +77,22 @@ describe('serialization error codes', () => {
     expect(normalizeValue(-Infinity)).toBe(-Infinity);
   });
 
+  test('a non-finite property renders as null at codec egress (matching the Rust codec)', () => {
+    const g = new Graph();
+    g.addVertex({ id: 'v', labels: ['P'], properties: { x: Number.NaN } });
+
+    // pg-text / csv emit the `null` token/text for non-finite (Rust scalar_token /
+    // num_str), NOT 'NaN' / 'Infinity' (which was type/value corruption).
+    for (const fmt of ['pg-text', 'csv'] as const) {
+      expect(serialize(g, fmt)).toContain('null');
+      expect(serialize(g, fmt)).not.toContain('NaN');
+    }
+
+    // graphson encodes `{@type:g:Double,@value:null}` (byte-identical to Rust) but
+    // both engines then reject that on decode — a shared limitation, not a divergence.
+    expect(() => deserialize(serialize(g, 'graphson'), 'graphson', new Graph())).toThrow();
+  });
+
   test('a lone UTF-16 surrogate is rejected (match native serde)', () => {
     // A `\uD800` escape survives JSON.parse in JS but the native UTF-8 store
     // can't hold a lone surrogate — its serde JSON decoder rejects it at ingest.

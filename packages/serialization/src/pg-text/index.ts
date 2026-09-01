@@ -125,7 +125,9 @@ const encodeScalar = (value: Exclude<PropertyValue, readonly PropertyValue[]>): 
   }
 
   if (typeof value === 'number') {
-    return String(value);
+    // Non-finite serializes as the `null` token (matches the Rust codec's
+    // scalar_token + JSON egress); it's a first-class value only in memory.
+    return Number.isFinite(value) ? String(value) : 'null';
   }
 
   // A temporal rides as an unquoted `@<kind>:<iso>` token — the ISO form has no

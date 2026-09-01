@@ -343,6 +343,12 @@ const scalarToRaw = (scalar: ScalarType, value: PropertyValue): string => {
     });
   }
 
+  // Non-finite serializes as the raw `null` text (matches the Rust codec's
+  // num_str); it's a first-class value only in memory. Otherwise String() it.
+  if (typeof value === 'number' && !Number.isFinite(value)) {
+    return 'null';
+  }
+
   // A CSV scalar cell is only ever a string/number/null here (lists are written
   // element-by-element, temporals/booleans/maps handled above).
   return String(value as string | number | null);

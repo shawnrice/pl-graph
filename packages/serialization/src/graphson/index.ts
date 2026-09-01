@@ -55,6 +55,10 @@ const encodeValue = (value: PropertyValue): unknown => {
   }
 
   if (typeof value === 'number') {
+    // Non-finite (NaN/±Infinity) serializes as `@value:null` (JSON.stringify) inside
+    // the g:Int64/g:Double wrapper — byte-identical to the Rust encoder. Note both
+    // engines then REJECT that on decode (a numeric typed value must be a number), so
+    // graphson cannot round-trip a non-finite: a shared limitation, NOT a divergence.
     return Number.isInteger(value)
       ? { '@type': 'g:Int64', '@value': value }
       : { '@type': 'g:Double', '@value': value };
