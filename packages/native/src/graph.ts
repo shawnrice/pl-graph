@@ -1109,7 +1109,11 @@ export const attachGraph = (backend: Backend, handle: GraphHandle): RustGraph =>
     return handle;
   };
 
-  const free = (): void => {
+  // Set when free() is called while an async algorithm is in flight — the actual
+  // release is deferred to the run's completion (see runAlgoAsync's finally).
+  let freeRequested = false;
+
+  const doFree = (): void => {
     if (state.freed) {
       return;
     }
@@ -1120,6 +1124,25 @@ export const attachGraph = (backend: Backend, handle: GraphHandle): RustGraph =>
     state.freed = true;
     disposal.get(backend)?.delete(handle);
     reclaim?.unregister(token);
+  };
+
+  const free = (): void => {
+    if (state.freed) {
+      return;
+    }
+
+    // NEVER free while an async algorithm is mid-run: the off-thread run reads the
+    // store through a raw pointer, so freeing now is a use-after-free (the napi
+    // `command_async` explicitly rests on this single-flight guard, which `live()`
+    // enforces for every other op). Defer to the run's completion. free()/`using`
+    // dispose must not throw, so record the request rather than erroring.
+    if (state.busy) {
+      freeRequested = true;
+
+      return;
+    }
+
+    doFree();
   };
 
   // Run an algorithm off the JS thread (Promise-returning). `live()` first rejects a
@@ -1141,6 +1164,15 @@ export const attachGraph = (backend: Backend, handle: GraphHandle): RustGraph =>
       return decodeRows(bytes);
     } finally {
       state.busy = false;
+
+      // A free() that arrived mid-run was deferred to here — now safe to release.
+      if (freeRequested) {
+        try {
+          doFree();
+        } catch {
+          // best-effort: the GC backstop reclaims if this throws
+        }
+      }
     }
   };
 
