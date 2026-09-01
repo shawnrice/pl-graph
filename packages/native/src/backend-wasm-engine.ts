@@ -154,10 +154,15 @@ export const createWasmEngineBackend = async (source: WasmSource): Promise<Backe
       }
 
       const len = dv().getUint32(outLenPtr, true);
-      const copy = readBytes(resPtr, len, op);
-      ex.lnk_free(resPtr, len);
 
-      return copy;
+      // Free the crate result buffer in a finally: if readBytes throws (a corrupt
+      // length escaping wasm memory), the buffer would otherwise leak (the FFI twin
+      // frees in a finally too).
+      try {
+        return readBytes(resPtr, len, op);
+      } finally {
+        ex.lnk_free(resPtr, len);
+      }
     } finally {
       ex.lnk_dealloc(outLenPtr, 4);
     }
@@ -219,10 +224,13 @@ export const createWasmEngineBackend = async (source: WasmSource): Promise<Backe
         }
 
         const len = dv().getUint32(outLenPtr, true);
-        const copy = readBytes(resPtr, len, 'query');
-        ex.lnk_free(resPtr, len);
 
-        return copy;
+        // Free the crate buffer in a finally — a throwing readBytes must not leak it.
+        try {
+          return readBytes(resPtr, len, 'query');
+        } finally {
+          ex.lnk_free(resPtr, len);
+        }
       } finally {
         ex.lnk_dealloc(qp, q.byteLength);
 
@@ -276,10 +284,13 @@ export const createWasmEngineBackend = async (source: WasmSource): Promise<Backe
         }
 
         const len = dv().getUint32(outLenPtr, true);
-        const copy = readBytes(resPtr, len, 'command');
-        ex.lnk_free(resPtr, len);
 
-        return copy;
+        // Free the crate buffer in a finally — a throwing readBytes must not leak it.
+        try {
+          return readBytes(resPtr, len, 'command');
+        } finally {
+          ex.lnk_free(resPtr, len);
+        }
       } finally {
         ex.lnk_dealloc(np, n.byteLength);
 
