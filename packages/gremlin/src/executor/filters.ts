@@ -50,7 +50,7 @@ export const whereCompareStep = function* (
 
   if (!('value' in valueBearing)) {
     throw new LenkeError(
-      `where('${startKey}', ...): only single-value predicates are supported (eq, neq, gt, gte, lt, lte, within, without). Got op '${pred.op}'.`,
+      `where('${startKey}', ...): only single-value predicates are supported (eq, neq, gt, gte, lt, lte). Got op '${pred.op}'.`,
       { code: ErrorCode.Unsupported },
     );
   }
@@ -91,7 +91,7 @@ export const whereCurrentStep = function* (
 
   if (!('value' in valueBearing)) {
     throw new LenkeError(
-      `where(predicate): only single-value predicates are supported (eq, neq, gt, gte, lt, lte, within, without). Got op '${pred.op}'.`,
+      `where(predicate): only single-value predicates are supported (eq, neq, gt, gte, lt, lte). Got op '${pred.op}'.`,
       { code: ErrorCode.Unsupported },
     );
   }

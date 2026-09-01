@@ -9,6 +9,7 @@
 // neither side dereferences the other at module-init — `applyStep` and
 // `applyPlanToStream` are only called inside generator bodies.
 
+import { isTemporal } from '@lenke/core';
 import type { Graph } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
@@ -230,11 +231,16 @@ export const applyStep = (
 
         const v = by !== undefined ? evalBy(by, t.value, graph, ctx) : t.value;
 
-        // Only plain lists/maps need structural keying; elements (stable refs),
-        // JS `Map`s, and other class instances keep cheap reference identity.
+        // Plain lists/maps AND value-typed instances (temporals) need structural
+        // keying — a temporal is a distinct object per vertex, so reference identity
+        // would never dedup equal dates (native keys by value; `group`/`groupCount`
+        // already do too via `tupleKey`, which stringifies a temporal's tagged form).
+        // Elements (stable refs), JS `Map`s, and other class instances keep cheap
+        // reference identity.
         const proto =
           v !== null && typeof v === 'object' ? (Object.getPrototypeOf(v) as unknown) : false;
-        const isComposite = Array.isArray(v) || proto === Object.prototype || proto === null;
+        const isComposite =
+          Array.isArray(v) || proto === Object.prototype || proto === null || isTemporal(v);
 
         if (isComposite) {
           const ref = v as object;
