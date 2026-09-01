@@ -105,8 +105,16 @@ export const createWriteLog = (options: WriteLogOptions = {}): WriteLog => {
     },
 
     since: (from) => {
-      if (from >= seq) {
-        return []; // caller is current (or ahead — treated as current)
+      if (from === seq) {
+        return []; // exactly current
+      }
+
+      if (from > seq) {
+        // The caller is AHEAD of this log — impossible unless the log REGRESSED
+        // (server restart, LB failover to a peer, in-memory reset: seq dropped back).
+        // Treating it as "current" ([]) would silently drop every future write (the
+        // client skips cursors <= its own). Force a cold-boot resync instead.
+        return null;
       }
 
       // The buffer holds a contiguous run [oldest … seq]. The caller needs

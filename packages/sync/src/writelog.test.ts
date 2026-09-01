@@ -30,6 +30,18 @@ describe('WriteLog (CDC op log)', () => {
     expect(log.since(0)).toBeNull();
   });
 
+  test('since(from > seq) is null (a regressed log forces resync, never silently []) ', () => {
+    // A caller ahead of the log means the log RESET (server restart / failover /
+    // fresh node): seq dropped back below the client cursor. Treating it as current
+    // ([]) would silently drop every future write; it must force a cold-boot resync.
+    const log = createWriteLog();
+    log.append('c', w('a'));
+    log.append('c', w('b')); // seq = 2
+
+    expect(log.since(2)).toEqual([]); // exactly current
+    expect(log.since(5)).toBeNull(); // ahead of seq → regressed → resync
+  });
+
   test('since(0) from the start when nothing has dropped', () => {
     const log = createWriteLog();
     log.append('c', w('a'));
