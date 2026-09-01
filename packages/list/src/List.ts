@@ -2,7 +2,6 @@ import {
   after,
   before,
   type BinaryFn,
-  distinct,
   equals,
   every,
   filter,
@@ -20,6 +19,7 @@ import {
   take,
   takeWhile,
   type UnaryFn,
+  uniq,
 } from '@lenke/fp';
 
 import { empty, from, isList, of } from './functions/index.js';
@@ -72,7 +72,7 @@ export class List<T> {
   }
 
   distinct(): List<T> {
-    return List.from(distinct(this));
+    return List.from(uniq(this));
   }
 
   /**
