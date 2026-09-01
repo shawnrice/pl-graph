@@ -1255,14 +1255,13 @@ export const combineRows = (op: SetOp, left: readonly Row[], right: readonly Row
     case 'union':
       return op.all ? [...left, ...right] : distinctRows([...left, ...right]);
     case 'except': {
-      const kept = left.filter((r) => !rightKeys.has(rowKeyOf(r)));
-
-      return op.all ? kept : distinctRows(kept);
+      // EXCEPT/INTERSECT always dedup — only UNION distinguishes ALL (matches the
+      // Rust engine: ir.rs "Except/Intersect always dedup; the ALL variants are
+      // not distinguished here").
+      return distinctRows(left.filter((r) => !rightKeys.has(rowKeyOf(r))));
     }
     case 'intersect': {
-      const kept = left.filter((r) => rightKeys.has(rowKeyOf(r)));
-
-      return op.all ? kept : distinctRows(kept);
+      return distinctRows(left.filter((r) => rightKeys.has(rowKeyOf(r))));
     }
   }
 };

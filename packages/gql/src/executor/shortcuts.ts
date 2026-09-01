@@ -384,7 +384,9 @@ const runReach = (spec: ReachSpec, graph: Graph, params: Params): Row[] => {
   for (const v of kept) {
     const env: EvalEnv = { binding: new Map([[bVar, v]]), params, graph };
     const cells = items.map((it) => it.fn(env));
-    const key = cells.map(valueKey).join('');
+    // Separator-joined (like `rowKeyOf`): without it, two string columns collide
+    // (`'as'+'b'` == `'a'+'sb'`) and a genuinely-distinct row is dropped.
+    const key = cells.map(valueKey).join('\x01');
 
     if (!seenRows.has(key)) {
       seenRows.add(key);

@@ -888,8 +888,11 @@ const compileCase = (expr: Extract<Expr, { kind: 'case' }>): CompiledExpr => {
       for (const w of whens) {
         const wv = w.when(env);
 
-        // `subject = when` with SQL/ISO null semantics: NULL never matches.
-        if (!isNullish(s) && !isNullish(wv) && s === wv) {
+        // `subject = when` with SQL/ISO null semantics: NULL never matches, and
+        // the match is the engine's VALUE equality (`structuralEq`, what `=` uses),
+        // not JS `===` — native lowers simple CASE to searched `WHEN subject = v`, so
+        // two temporals/lists/records holding the same value must match.
+        if (!isNullish(s) && !isNullish(wv) && structuralEq(s, wv)) {
           return w.then(env);
         }
       }
