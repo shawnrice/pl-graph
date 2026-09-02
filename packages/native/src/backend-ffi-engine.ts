@@ -149,7 +149,7 @@ export const createFfiEngineBackend = (libPath: string): Backend => {
             lang,
             bytesPtr(q),
             q.byteLength,
-            p ? ptr(p) : null,
+            p ? bytesPtr(p) : null,
             p ? p.byteLength : 0,
             format,
             outLen,
