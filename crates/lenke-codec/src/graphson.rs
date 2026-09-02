@@ -6,10 +6,10 @@
 //! "@value":… }`. A vertex label SET is `::`-joined into GraphSON's single `label`
 //! string (and split back on decode); a whole float → `g:Int64`, else `g:Double`.
 
+use crate::decstream::DecVal;
 use crate::json::Json;
 use crate::jsonfmt::{push_json_str, push_num};
 use crate::model::{graphson_tag, graphson_type, Edge, GraphData, Node, Value};
-use crate::decstream::DecVal;
 use crate::stream::ValueRef;
 use crate::{is_intish, json_id, CodeResult, CodecError, E_INVALID_SHAPE, E_INVALID_VALUE};
 
@@ -109,7 +109,8 @@ impl GraphsonSink {
         props: impl FnOnce(&mut VProps),
     ) {
         self.sep();
-        self.out.push_str("{\"@type\":\"g:Vertex\",\"@value\":{\"id\":");
+        self.out
+            .push_str("{\"@type\":\"g:Vertex\",\"@value\":{\"id\":");
         push_json_str(&mut self.out, id);
         self.out.push_str(",\"label\":");
         self.write_labels(labels);
@@ -137,7 +138,8 @@ impl GraphsonSink {
         props: impl FnOnce(&mut EProps),
     ) {
         self.sep();
-        self.out.push_str("{\"@type\":\"g:Edge\",\"@value\":{\"id\":");
+        self.out
+            .push_str("{\"@type\":\"g:Edge\",\"@value\":{\"id\":");
         push_json_str(&mut self.out, id);
         self.out.push_str(",\"label\":");
         self.write_labels(labels);

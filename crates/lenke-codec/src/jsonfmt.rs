@@ -198,7 +198,6 @@ pub fn push_value(out: &mut String, v: &Value) {
     }
 }
 
-
 #[cfg(test)]
 mod jsnum_tests {
     use super::*;
@@ -247,9 +246,32 @@ mod jsnum_tests {
     #[test]
     fn push_js_number_matches_the_original_across_the_range() {
         let mut xs: Vec<f64> = vec![
-            0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 100.0, 1e21, 1e-6, 1e-7, 9.999999e20,
-            1.5e21, 123456789012345.0, 0.1, 0.2, 0.3, 1.0 / 3.0, f64::MAX,
-            f64::MIN_POSITIVE, 5e-324, 2.5, 42.0, -0.0001, 12345.6789, 1e308, 1e-308,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            100.0,
+            1e21,
+            1e-6,
+            1e-7,
+            9.999999e20,
+            1.5e21,
+            123456789012345.0,
+            0.1,
+            0.2,
+            0.3,
+            1.0 / 3.0,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            5e-324,
+            2.5,
+            42.0,
+            -0.0001,
+            12345.6789,
+            1e308,
+            1e-308,
         ];
         // A spread of magnitudes and mantissas.
         let mut seed: u64 = 0x1234_5678;
@@ -262,7 +284,12 @@ mod jsnum_tests {
             }
         }
         for &x in &xs {
-            assert_eq!(js_number(x), reference(x), "diverged at {x:?} (bits {:#x})", x.to_bits());
+            assert_eq!(
+                js_number(x),
+                reference(x),
+                "diverged at {x:?} (bits {:#x})",
+                x.to_bits()
+            );
         }
     }
 }
