@@ -650,7 +650,7 @@ export const createSyncHost = (store: Store, options: SyncHostOptions): SyncHost
   };
 
   const sendStatus = (): void => {
-    send({ type: 'status', connected: true, pendingWrites: pendingWrites(), protocol: 1 });
+    send({ type: 'status', pendingWrites: pendingWrites(), protocol: 1 });
   };
 
   // Announce on a microtask, not synchronously in the constructor. The natural

@@ -63,7 +63,7 @@ suite('@lenke/sync host · protocol v1', () => {
     // so `const host = …(send: m => client.receive(m)); const client = …` — where
     // `client` is assigned after the host — can't call `send` before it exists.
     await Promise.resolve();
-    expect(sent[0]).toEqual({ type: 'status', connected: true, pendingWrites: 0, protocol: 1 });
+    expect(sent[0]).toEqual({ type: 'status', pendingWrites: 0, protocol: 1 });
   });
 
   test('safe when the host is constructed BEFORE its client (deferred status send)', async () => {

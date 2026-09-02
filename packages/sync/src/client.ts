@@ -188,11 +188,17 @@ export type SyncClient = {
    * error and rejects.
    */
   pushWrite: (write: SyncWrite) => Promise<void>;
-  /** The host's last `status` message, if any. */
-  getStatus: () => { connected: boolean; pendingWrites: number } | null;
   /**
-   * Subscribe to host `status` pushes (connectivity, pending-write count);
-   * returns an unsubscribe fn. Pairs with {@link getStatus} for a poll-free
+   * The host's last `status` message, if any. Carries `pendingWrites` (the
+   * write-back backlog). It intentionally does NOT report connectivity: a status
+   * message only arrives while the wire is up, so a bound client can never see it
+   * flip to offline — use {@link createReconnectingClient}'s `connected()` /
+   * `onConnectivity()` for outage detection.
+   */
+  getStatus: () => { pendingWrites: number } | null;
+  /**
+   * Subscribe to host `status` pushes (pending-write count); returns an
+   * unsubscribe fn. Pairs with {@link getStatus} for a poll-free
    * `useSyncExternalStore(onStatus, getStatus)` — the snapshot reference is
    * stable between pushes.
    */
@@ -494,7 +500,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     options.clientId ??
     (globalThis as { crypto?: { randomUUID?: () => string } }).crypto?.randomUUID?.() ??
     `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
-  let status: { connected: boolean; pendingWrites: number } | null = null;
+  let status: { pendingWrites: number } | null = null;
   const statusListeners = new Set<() => void>();
 
   // CDC write stream: the handler that ingests other clients' writes, the
@@ -925,7 +931,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
       case 'status': {
         // A fresh object only on an actual push, so getStatus() stays a stable
         // reference between messages (useSyncExternalStore-safe).
-        status = { connected: msg.connected, pendingWrites: msg.pendingWrites };
+        status = { pendingWrites: msg.pendingWrites };
 
         for (const l of statusListeners) {
           l();

@@ -21,7 +21,7 @@
  * host → client:  result      { req, rows | values | error }
  * client → host:  mutate      { req, text, lang?, params? }   // gql | gremlin
  * host → client:  ack         { req, ok, error? }                // UI effect arrives via rows pushes
- * host → client:  status      { connected, pendingWrites, protocol }
+ * host → client:  status      { pendingWrites, protocol }
  * ```
  *
  * `params` everywhere is a flat object of `$name` bindings. Values bind to
@@ -401,7 +401,6 @@ export type AckMessage = {
 /** Host status — sent on attach; a built-in subscription in later versions. */
 export type StatusMessage = {
   type: 'status';
-  connected: boolean;
   pendingWrites: number;
   /** Protocol version for forward-compat negotiation. */
   protocol: 1;

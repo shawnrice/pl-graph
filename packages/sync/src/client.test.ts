@@ -397,7 +397,7 @@ suite('@lenke/sync client · registry semantics', () => {
   test('status handshake is captured', async () => {
     const { client } = connect();
     await Promise.resolve(); // the host announces status on a microtask
-    expect(client.getStatus()).toEqual({ connected: true, pendingWrites: 0 });
+    expect(client.getStatus()).toEqual({ pendingWrites: 0 });
   });
 
   test('onStatus wakes subscribers on each push; getStatus is a stable ref between', () => {
@@ -407,18 +407,18 @@ suite('@lenke/sync client · registry semantics', () => {
       calls += 1;
     });
 
-    client.receive({ type: 'status', connected: true, pendingWrites: 0, protocol: 1 });
+    client.receive({ type: 'status', pendingWrites: 0, protocol: 1 });
     const first = client.getStatus();
     expect(calls).toBe(1);
-    expect(first).toEqual({ connected: true, pendingWrites: 0 });
+    expect(first).toEqual({ pendingWrites: 0 });
     expect(client.getStatus()).toBe(first); // no new object between pushes (useSyncExternalStore-safe)
 
-    client.receive({ type: 'status', connected: true, pendingWrites: 2, protocol: 1 });
+    client.receive({ type: 'status', pendingWrites: 2, protocol: 1 });
     expect(calls).toBe(2);
-    expect(client.getStatus()).toEqual({ connected: true, pendingWrites: 2 });
+    expect(client.getStatus()).toEqual({ pendingWrites: 2 });
 
     stop();
-    client.receive({ type: 'status', connected: false, pendingWrites: 5, protocol: 1 });
+    client.receive({ type: 'status', pendingWrites: 5, protocol: 1 });
     expect(calls).toBe(2); // unsubscribed — no further wakes
   });
 
