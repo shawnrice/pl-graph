@@ -705,6 +705,17 @@ impl Temporal {
         }
     }
 
+    /// Whether `tag` (the bare form, no leading `@`) is a recognised temporal kind tag.
+    /// The one place the codecs consult when deciding whether a tagged JSON object is a
+    /// temporal; mirrors `lenke_codec::model::is_temporal_tag`.
+    #[must_use]
+    pub fn is_tag(tag: &str) -> bool {
+        matches!(
+            tag,
+            "date" | "localtime" | "datetime" | "zoned_time" | "zoned_datetime" | "duration"
+        )
+    }
+
     /// The ISO-8601 string form (the byte-identity wire value).
     #[must_use]
     pub fn format(&self) -> String {

@@ -133,8 +133,9 @@ describe('serialization error codes', () => {
 
   test('a record whose key is a temporal tag round-trips as a record, not a temporal', () => {
     // `{'@date': '…'}` as a RECORD would, on the JSON wire, look exactly like a tagged
-    // temporal; the codec escapes the `@`-leading key (`@date` → `@@date`) so it decodes
-    // back to a record, while a genuine temporal still decodes as a temporal.
+    // temporal; the codec escapes ONLY such temporal-shaped keys (`@date` → `@@date`) so
+    // it decodes back to a record, while a genuine temporal still decodes as a temporal.
+    // A `@`-leading key that is NOT a temporal tag (`@user`) is left untouched.
     for (const fmt of ['ndjson', 'pg-json'] as const) {
       const g = new Graph();
       g.addVertex({
@@ -142,20 +143,25 @@ describe('serialization error codes', () => {
         labels: ['N'],
         properties: {
           rec: LenkeRecord.from([['@date', '2024-01-15']]),
-          multi: LenkeRecord.from([
-            ['@dur', 'x'],
-            ['b', 2],
+          atUser: LenkeRecord.from([
+            ['@user', 'alice'],
+            ['@id', 7],
           ]),
           real: parseDate('2020-05-05'),
         },
       });
-      const back = deserialize(serialize(g, fmt), fmt, new Graph());
+      const wire = serialize(g, fmt);
+      // Only the temporal-shaped key is escaped on the wire.
+      expect(wire).toContain('@@date');
+      expect(wire).not.toContain('@@user');
+
+      const back = deserialize(wire, fmt, new Graph());
       const rec = back.getVertexById('a')!.getProperty('rec');
       expect(isRecord(rec)).toBe(true);
       expect([...(rec as LenkeRecord).keys()]).toEqual(['@date']);
       expect(String(back.getVertexById('a')!.getProperty('real'))).toBe('2020-05-05');
-      const multi = back.getVertexById('a')!.getProperty('multi') as LenkeRecord;
-      expect([...multi.keys()].sort()).toEqual(['@dur', 'b']);
+      const atUser = back.getVertexById('a')!.getProperty('atUser') as LenkeRecord;
+      expect([...atUser.keys()].sort()).toEqual(['@id', '@user']);
     }
   });
 

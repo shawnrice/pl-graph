@@ -98,22 +98,34 @@ pub(crate) fn temporal_from_pairs_ref<'a>(
     Some((tag, v.as_str()?))
 }
 
-/// Escape a record (map) key for the JSON wire: a key beginning with the temporal
-/// sigil `@` gets one extra `@`, so a record like `{"@date": "…"}` cannot be read
-/// back as a tagged temporal (`temporal_from_pairs` only matches a single RECOGNISED
-/// tag, so `@@date` falls through to the map path). Inverse of [`unescape_record_key`].
-/// Mirrors the TS `escapeRecordKey`, keeping the wire byte-identical.
+/// A record key that LOOKS like a tagged temporal: one or more leading `@` followed by
+/// a recognised tag (`@date`, `@@date`, …). ONLY these collide with the temporal wire
+/// form, so only these are escaped — a `@`-leading key like `@user` is left alone.
+fn is_temporal_shaped(k: &str) -> bool {
+    let bare = k.trim_start_matches('@');
+    bare.len() < k.len() && crate::model::is_temporal_tag(bare)
+}
+
+/// Escape a temporal-shaped record key for the JSON wire: one extra `@`, so a record
+/// like `{"@date": "…"}` cannot be read back as a tagged temporal (`temporal_from_pairs`
+/// only matches a single RECOGNISED tag, so `@@date` falls through to the map path).
+/// Every other key is returned unchanged. Inverse of [`unescape_record_key`]; mirrors
+/// the TS `escapeRecordKey`, keeping the wire byte-identical.
 pub(crate) fn escape_record_key(k: &str) -> Cow<'_, str> {
-    if k.starts_with('@') {
+    if is_temporal_shaped(k) {
         Cow::Owned(format!("@{k}"))
     } else {
         Cow::Borrowed(k)
     }
 }
 
-/// Strip the single `@` that [`escape_record_key`] prepended when decoding a map key.
+/// Strip the single `@` that [`escape_record_key`] prepended, for a temporal-shaped key.
 pub(crate) fn unescape_record_key(k: &str) -> &str {
-    k.strip_prefix('@').unwrap_or(k)
+    if is_temporal_shaped(k) {
+        &k[1..]
+    } else {
+        k
+    }
 }
 
 const MAX_DEPTH: usize = 128;

@@ -233,23 +233,35 @@ pub fn encode_str_array<S: AsRef<str>>(out: &mut String, items: &[S]) {
 }
 
 /// Encode a value as JSON. A non-finite number becomes `null` (no JSON form).
-/// Escape a record/map key for the NDJSON wire: a key beginning with the temporal
-/// sigil `@` gets one extra `@`, so a record like `{"@date": "…"}` is not read back as
-/// a tagged temporal (the temporal check only matches a single RECOGNISED tag, so
-/// `@@date` falls through to the record path). Inverse of [`unescape_record_key`].
-/// Kept byte-identical to `lenke_codec::json::escape_record_key` and the TS
+/// A record key that LOOKS like a tagged temporal: one or more leading `@` then a
+/// recognised tag (`@date`, `@@date`, …). ONLY these collide with the temporal wire
+/// form, so only these are escaped — a `@`-leading key like `@user` is left alone.
+fn is_temporal_shaped(k: &str) -> bool {
+    let bare = k.trim_start_matches('@');
+    bare.len() < k.len() && crate::temporal::Temporal::is_tag(bare)
+}
+
+/// Escape a temporal-shaped record/map key for the NDJSON wire: one extra `@`, so a
+/// record like `{"@date": "…"}` is not read back as a tagged temporal (the temporal
+/// check only matches a single RECOGNISED tag, so `@@date` falls through to the record
+/// path). Every other key is returned unchanged. Inverse of [`unescape_record_key`];
+/// kept byte-identical to `lenke_codec::json::escape_record_key` and the TS
 /// `escapeRecordKey`.
 fn escape_record_key(k: &str) -> std::borrow::Cow<'_, str> {
-    if k.starts_with('@') {
+    if is_temporal_shaped(k) {
         std::borrow::Cow::Owned(format!("@{k}"))
     } else {
         std::borrow::Cow::Borrowed(k)
     }
 }
 
-/// Strip the single `@` that [`escape_record_key`] prepended, when decoding a key.
+/// Strip the single `@` that [`escape_record_key`] prepended, for a temporal-shaped key.
 fn unescape_record_key(k: &str) -> &str {
-    k.strip_prefix('@').unwrap_or(k)
+    if is_temporal_shaped(k) {
+        &k[1..]
+    } else {
+        k
+    }
 }
 
 pub fn encode_value(out: &mut String, v: &Value) {
@@ -809,15 +821,7 @@ fn json_value(j: &Json) -> Result<Value, String> {
         Json::Obj(fields) => {
             if let [(key, Json::Str(s))] = fields.as_slice() {
                 if let Some(tag) = key.strip_prefix('@') {
-                    if matches!(
-                        tag,
-                        "date"
-                            | "localtime"
-                            | "datetime"
-                            | "zoned_time"
-                            | "zoned_datetime"
-                            | "duration"
-                    ) {
+                    if crate::temporal::Temporal::is_tag(tag) {
                         return crate::temporal::Temporal::parse(tag, s)
                             .map(Value::Temporal)
                             .map_err(|e| format!("bad temporal value: {e}"));
@@ -1115,15 +1119,7 @@ impl JsonParser<'_> {
         let pairs = self.pairs()?;
         if let [(key, Value::Str(s))] = pairs.as_slice() {
             if let Some(tag) = key.strip_prefix('@') {
-                if matches!(
-                    tag,
-                    "date"
-                        | "localtime"
-                        | "datetime"
-                        | "zoned_time"
-                        | "zoned_datetime"
-                        | "duration"
-                ) {
+                if crate::temporal::Temporal::is_tag(tag) {
                     return crate::temporal::Temporal::parse(tag, s.as_str())
                         .map(Value::Temporal)
                         .map_err(|e| format!("bad temporal value: {e}"));

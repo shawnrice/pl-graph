@@ -1,3 +1,5 @@
+import { TEMPORAL_TAG_KEYS } from '../temporal.js';
+
 /**
  * An ISO GQL record / Gremlin map value: a `Map` with keys kept **sorted**
  * (canonical) and JSON serialization as an object. A `Map` subclass so it is
@@ -41,16 +43,24 @@ export class LenkeRecord extends Map<string, unknown> {
 export const isRecord = (v: unknown): v is LenkeRecord => v instanceof LenkeRecord;
 
 // A temporal is carried on the JSON wire as a single-key tagged object
-// (`{"@date": "…"}`); a record whose own key begins with the same `@` sigil would be
+// (`{"@date": "…"}`); a record whose own key IS a temporal tag would be
 // indistinguishable from one on decode (`{"@date": "…"}` → a LocalDate, not a record).
-// So a record key beginning with `@` is escaped with one extra `@` on the wire and
-// stripped back on decode — the temporal check runs on the raw key (single recognized
-// tag), so `@date` stays a temporal while a record's `@date` travels as `@@date`. The
-// native `Value::Map` codec does the same, keeping the wire byte-identical.
+// Only such "temporal-shaped" keys (one or more leading `@` then a recognized tag —
+// `@date`, `@@date`, …) are escaped with one extra `@` on the wire and stripped back on
+// decode; every other key (including `@user`, `@id`) is left untouched. The temporal
+// check runs on the raw key (a single recognized tag), so `@date` stays a temporal
+// while a record's `@date` travels as `@@date`. The native codecs do the same, keeping
+// the wire byte-identical.
 
-/** Escape a record key for the JSON wire (see above). */
-export const escapeRecordKey = (key: string): string => (key.startsWith('@') ? `@${key}` : key);
+/** A key that looks like a tagged temporal (`@`-run + a recognized tag). */
+const isTemporalShaped = (key: string): boolean => {
+  const bare = key.replace(/^@+/, '');
+  return bare.length < key.length && TEMPORAL_TAG_KEYS.has(`@${bare}`);
+};
+
+/** Escape a temporal-shaped record key for the JSON wire (see above); else unchanged. */
+export const escapeRecordKey = (key: string): string => (isTemporalShaped(key) ? `@${key}` : key);
 
 /** Invert {@link escapeRecordKey} when decoding a record from the JSON wire. */
 export const unescapeRecordKey = (key: string): string =>
-  key.startsWith('@') ? key.slice(1) : key;
+  isTemporalShaped(key) ? key.slice(1) : key;
