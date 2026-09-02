@@ -55,6 +55,36 @@ describe('branch tests', () => {
     expect(r.sort()).toEqual([29, 'josh', 'lop', 'peter', 'ripple', 'vadas']);
   });
 
+  // A value-typed pick token (a list) matches its option key by VALUE, not reference —
+  // TinkerPop keys `.option()` through a Map (Java `.equals`), verified against a real
+  // gremlin-console. A structurally-equal-but-distinct list still matches.
+  test('branch matches a value-typed (list) option key by value', () => {
+    const matched = arr(
+      run(
+        traversal(
+          V(),
+          branch(constant([1, 2]))
+            .option([1, 2], constant('by-value'))
+            .none(constant('no')),
+        ),
+        tinkerGraph,
+      ),
+    );
+    expect(new Set(matched)).toEqual(new Set(['by-value'])); // every vertex routed to the list option
+    const missed = arr(
+      run(
+        traversal(
+          V(),
+          branch(constant([1, 2]))
+            .option([9, 9], constant('by-value'))
+            .none(constant('no')),
+        ),
+        tinkerGraph,
+      ),
+    );
+    expect(new Set(missed)).toEqual(new Set(['no'])); // a non-equal list falls through to .none
+  });
+
   // No matching option and no default => traverser dropped.
   test('branch drops traverser with no match and no default', () => {
     const r = arr(

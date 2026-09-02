@@ -3,7 +3,14 @@ import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type { Plan, Step } from '../ast.js';
 import { applyPlanToStream } from './dispatch.js';
-import { hasAny, incLoops, isEmptyPlan, type RunContext, type Traverser } from './runtime.js';
+import {
+  hasAny,
+  incLoops,
+  isEmptyPlan,
+  type RunContext,
+  type Traverser,
+  tupleKey,
+} from './runtime.js';
 
 /**
  * Per-`repeat()` cap on the total traversers its body produces. A
@@ -241,6 +248,13 @@ export const branchStep = function* (
   graph: Graph,
   ctx: RunContext,
 ): Iterable<Traverser<unknown>> {
+  // Match option keys by VALUE, not identity — TinkerPop keys `.option()` through a
+  // Map (Java `.equals`), so a list/map/temporal pick token matches a structurally-equal
+  // option key even though it is a distinct object. `tupleKey` is the same value-keying
+  // dedup/group use (sorted-key maps, one numeric type), so equal values share a key.
+  // Precomputed once per branch, not per traverser.
+  const optionKeys = options.map((opt) => tupleKey([opt.match]));
+
   for (const t of stream) {
     let testResult: unknown = undefined;
     let sawResult = false;
@@ -254,11 +268,11 @@ export const branchStep = function* (
     let matched: Plan | undefined;
 
     if (sawResult) {
-      for (const opt of options) {
-        if (Object.is(opt.match, testResult) || opt.match === testResult) {
-          matched = opt.plan;
-          break;
-        }
+      const key = tupleKey([testResult]);
+      const i = optionKeys.indexOf(key);
+
+      if (i !== -1) {
+        matched = options[i].plan;
       }
     }
 
