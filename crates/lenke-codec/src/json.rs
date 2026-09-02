@@ -98,6 +98,24 @@ pub(crate) fn temporal_from_pairs_ref<'a>(
     Some((tag, v.as_str()?))
 }
 
+/// Escape a record (map) key for the JSON wire: a key beginning with the temporal
+/// sigil `@` gets one extra `@`, so a record like `{"@date": "…"}` cannot be read
+/// back as a tagged temporal (`temporal_from_pairs` only matches a single RECOGNISED
+/// tag, so `@@date` falls through to the map path). Inverse of [`unescape_record_key`].
+/// Mirrors the TS `escapeRecordKey`, keeping the wire byte-identical.
+pub(crate) fn escape_record_key(k: &str) -> Cow<'_, str> {
+    if k.starts_with('@') {
+        Cow::Owned(format!("@{k}"))
+    } else {
+        Cow::Borrowed(k)
+    }
+}
+
+/// Strip the single `@` that [`escape_record_key`] prepended when decoding a map key.
+pub(crate) fn unescape_record_key(k: &str) -> &str {
+    k.strip_prefix('@').unwrap_or(k)
+}
+
 const MAX_DEPTH: usize = 128;
 
 /// Parse a complete JSON document. `Err(())` on any malformed input (the callers

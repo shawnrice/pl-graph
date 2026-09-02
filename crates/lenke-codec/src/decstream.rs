@@ -62,7 +62,7 @@ pub(crate) fn json_to_decval<'a>(j: &'a Json<'a>) -> DecVal<'a> {
             None => DecVal::Map(
                 pairs
                     .iter()
-                    .map(|(k, v)| (k.as_ref(), json_to_decval(v)))
+                    .map(|(k, v)| (json::unescape_record_key(k.as_ref()), json_to_decval(v)))
                     .collect(),
             ),
         },

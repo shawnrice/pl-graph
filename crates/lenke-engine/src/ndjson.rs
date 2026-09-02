@@ -233,6 +233,25 @@ pub fn encode_str_array<S: AsRef<str>>(out: &mut String, items: &[S]) {
 }
 
 /// Encode a value as JSON. A non-finite number becomes `null` (no JSON form).
+/// Escape a record/map key for the NDJSON wire: a key beginning with the temporal
+/// sigil `@` gets one extra `@`, so a record like `{"@date": "…"}` is not read back as
+/// a tagged temporal (the temporal check only matches a single RECOGNISED tag, so
+/// `@@date` falls through to the record path). Inverse of [`unescape_record_key`].
+/// Kept byte-identical to `lenke_codec::json::escape_record_key` and the TS
+/// `escapeRecordKey`.
+fn escape_record_key(k: &str) -> std::borrow::Cow<'_, str> {
+    if k.starts_with('@') {
+        std::borrow::Cow::Owned(format!("@{k}"))
+    } else {
+        std::borrow::Cow::Borrowed(k)
+    }
+}
+
+/// Strip the single `@` that [`escape_record_key`] prepended, when decoding a key.
+fn unescape_record_key(k: &str) -> &str {
+    k.strip_prefix('@').unwrap_or(k)
+}
+
 pub fn encode_value(out: &mut String, v: &Value) {
     match v {
         Value::Null => out.push_str("null"),
@@ -274,7 +293,7 @@ pub fn encode_value(out: &mut String, v: &Value) {
                 if i > 0 {
                     out.push(',');
                 }
-                encode_string(out, k);
+                encode_string(out, &escape_record_key(k));
                 out.push(':');
                 encode_value(out, v);
             }
@@ -291,7 +310,7 @@ pub fn encode_value(out: &mut String, v: &Value) {
                     out.push(',');
                 }
                 match k {
-                    Value::Str(s) => encode_string(out, s),
+                    Value::Str(s) => encode_string(out, &escape_record_key(s)),
                     other => encode_string(out, &format!("{other:?}")),
                 }
                 out.push(':');
@@ -809,7 +828,9 @@ fn json_value(j: &Json) -> Result<Value, String> {
             // canonicalize (sorted, last-wins) via the value contract.
             let pairs = fields
                 .iter()
-                .map(|(k, v)| json_value(v).map(|v| (GStr::from(k.as_str()), v)))
+                .map(|(k, v)| {
+                    json_value(v).map(|v| (GStr::from(unescape_record_key(k.as_str())), v))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             crate::value::make_record(pairs)
         }
@@ -1111,7 +1132,7 @@ impl JsonParser<'_> {
         }
         let pairs: Vec<(GStr, Value)> = pairs
             .into_iter()
-            .map(|(k, v)| (GStr::from(k.as_str()), v))
+            .map(|(k, v)| (GStr::from(unescape_record_key(k.as_str())), v))
             .collect();
         Ok(crate::value::make_record(pairs))
     }
@@ -1497,6 +1518,46 @@ mod tests {
             }
             o => panic!("expected a Record after round trip, got {o:?}"),
         }
+    }
+
+    #[test]
+    fn record_key_at_sigil_round_trips_and_is_not_a_temporal() {
+        use crate::temporal::{Date, Temporal};
+        use crate::value::make_record;
+        // A record whose single key is a temporal tag (`@date`) would be indistinguishable
+        // from a tagged temporal on the wire; the codec escapes it to `@@date`, so it
+        // round-trips as a RECORD, while a real temporal still decodes as a temporal.
+        let mut st = Builder::default().build();
+        st.add_node(
+            &["P"],
+            &[
+                (
+                    "rec",
+                    make_record(vec![(crate::gstr::GStr::from("@date"), s("2024-01-15"))]),
+                ),
+                (
+                    "real",
+                    Value::Temporal(Temporal::Date(Date::parse("2020-05-05").unwrap())),
+                ),
+            ],
+        );
+        let text = to_ndjson(&st);
+        assert!(
+            text.contains("\"@@date\":\"2024-01-15\""),
+            "the record key is escaped on the wire: {text}"
+        );
+        let st2 = from_ndjson(&text).unwrap();
+        match st2.prop(0, "rec") {
+            Value::Record(f) => {
+                assert_eq!(f[0].0.as_ref(), "@date", "the `@date` KEY survives");
+                assert!(crate::value::equals(&f[0].1, &s("2024-01-15")));
+            }
+            o => panic!("expected a Record, got {o:?}"),
+        }
+        assert!(
+            matches!(st2.prop(0, "real"), Value::Temporal(_)),
+            "a real temporal still decodes as a temporal"
+        );
     }
 
     /// A deleted node (and its edges) is absent from the dump.

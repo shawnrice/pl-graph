@@ -189,7 +189,8 @@ pub fn push_value(out: &mut String, v: &Value) {
                 if i > 0 {
                     out.push(',');
                 }
-                push_json_str(out, k);
+                // Escape a `@`-leading key so the map is not read back as a temporal.
+                push_json_str(out, &crate::json::escape_record_key(k));
                 out.push(':');
                 push_value(out, e);
             }

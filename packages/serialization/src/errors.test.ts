@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import { Graph, parseDate } from '@lenke/core';
+import { Graph, isRecord, LenkeRecord, parseDate } from '@lenke/core';
 import { ErrorCode, hasErrorCode } from '@lenke/errors';
 
 import { deserialize, serialize } from './index.js';
@@ -129,6 +129,34 @@ describe('serialization error codes', () => {
         ErrorCode.InvalidJson,
       ),
     ).toBe(true);
+  });
+
+  test('a record whose key is a temporal tag round-trips as a record, not a temporal', () => {
+    // `{'@date': '…'}` as a RECORD would, on the JSON wire, look exactly like a tagged
+    // temporal; the codec escapes the `@`-leading key (`@date` → `@@date`) so it decodes
+    // back to a record, while a genuine temporal still decodes as a temporal.
+    for (const fmt of ['ndjson', 'pg-json'] as const) {
+      const g = new Graph();
+      g.addVertex({
+        id: 'a',
+        labels: ['N'],
+        properties: {
+          rec: LenkeRecord.from([['@date', '2024-01-15']]),
+          multi: LenkeRecord.from([
+            ['@dur', 'x'],
+            ['b', 2],
+          ]),
+          real: parseDate('2020-05-05'),
+        },
+      });
+      const back = deserialize(serialize(g, fmt), fmt, new Graph());
+      const rec = back.getVertexById('a')!.getProperty('rec');
+      expect(isRecord(rec)).toBe(true);
+      expect([...(rec as LenkeRecord).keys()]).toEqual(['@date']);
+      expect(String(back.getVertexById('a')!.getProperty('real'))).toBe('2020-05-05');
+      const multi = back.getVertexById('a')!.getProperty('multi') as LenkeRecord;
+      expect([...multi.keys()].sort()).toEqual(['@dur', 'b']);
+    }
   });
 
   test('a temporal instance and a TC39 Temporal.Plain* both normalize to a temporal', () => {

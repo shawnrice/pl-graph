@@ -94,7 +94,7 @@ pub(crate) fn json_to_value(j: &Json) -> CodeResult<Value> {
             None => Value::Map(
                 pairs
                     .iter()
-                    .map(|(k, v)| Ok((k.to_string(), json_to_value(v)?)))
+                    .map(|(k, v)| Ok((json::unescape_record_key(k).to_string(), json_to_value(v)?)))
                     .collect::<CodeResult<_>>()?,
             ),
         },

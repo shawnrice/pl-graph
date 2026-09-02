@@ -11,7 +11,7 @@ export {
   PropertyIndex,
   Vertex,
 } from './core/index.js';
-export { isRecord, LenkeRecord } from './core/index.js';
+export { escapeRecordKey, isRecord, LenkeRecord, unescapeRecordKey } from './core/index.js';
 export { mathSign } from './numeric.js';
 export { validateLabel, validatePropertyKey, validatePropertyValue } from './core/index.js';
 

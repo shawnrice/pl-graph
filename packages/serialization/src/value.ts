@@ -5,7 +5,13 @@
  * single source of truth for "what a property value may be" — and where richer
  * JS values lose information — lives here, not in each format.
  */
-import { coerceTemporal, fromTaggedJson, LenkeRecord, type Temporal } from '@lenke/core';
+import {
+  coerceTemporal,
+  fromTaggedJson,
+  LenkeRecord,
+  type Temporal,
+  unescapeRecordKey,
+} from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
 export type PropertyValue =
@@ -165,7 +171,12 @@ const normalizeAt = (value: unknown, depth: number): PropertyValue => {
   }
 
   if (Object.getPrototypeOf(value) === Object.prototype) {
-    return LenkeRecord.from(Object.entries(value).map(([k, v]) => [k, normalizeAt(v, depth + 1)]));
+    // Decoding a record from the wire: fromTaggedJson above already claimed any real
+    // tagged temporal, so a `@`-leading key here is an ESCAPED record key — strip the
+    // one extra `@` that `LenkeRecord.toJSON` added (see `escapeRecordKey`).
+    return LenkeRecord.from(
+      Object.entries(value).map(([k, v]) => [unescapeRecordKey(k), normalizeAt(v, depth + 1)]),
+    );
   }
 
   throw new LenkeError(
