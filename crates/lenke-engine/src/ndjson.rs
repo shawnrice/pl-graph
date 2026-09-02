@@ -522,6 +522,12 @@ pub fn merge_ndjson(store: &mut Store, text: &str) -> Result<MergeReport, String
             continue;
         }
         let lrefs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        for label in &lrefs {
+            crate::store::validate_label(label)?;
+        }
+        for (k, _) in props {
+            crate::store::validate_prop_key(k)?;
+        }
         let prefs: Vec<(&str, Value)> =
             props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         store.add_node_with_id(&Arc::from(ext.as_str()), &lrefs, &prefs);
@@ -543,6 +549,12 @@ pub fn merge_ndjson(store: &mut Store, text: &str) -> Result<MergeReport, String
                 report.edges_skipped.push(id.clone());
                 continue;
             }
+        }
+        for label in labels {
+            crate::store::validate_label(label)?;
+        }
+        for (k, _) in props {
+            crate::store::validate_prop_key(k)?;
         }
         let f = resolve_or_phantom(store, from, &mut report);
         let t = resolve_or_phantom(store, to, &mut report);
@@ -629,6 +641,12 @@ pub(crate) fn build_store(staged: StagedNdjson, threads: u32) -> Result<Store, S
     store.begin_bulk();
     for (ext, labels, props) in &nodes {
         let lrefs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        for label in &lrefs {
+            crate::store::validate_label(label)?;
+        }
+        for (k, _) in props {
+            crate::store::validate_prop_key(k)?;
+        }
         let prefs: Vec<(&str, Value)> =
             props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         store.add_node_bulk(ext, &lrefs, &prefs);
@@ -653,6 +671,12 @@ pub(crate) fn build_store(staged: StagedNdjson, threads: u32) -> Result<Store, S
     // the id by reference instead of a throwaway `Arc` per edge is measurement-neutral —
     // the transient small allocs are cheap — but it is cleaner, so it stays.)
     for ((_, _, edge_id, labels, props), &(f, t)) in edges.iter().zip(&resolved) {
+        for label in labels {
+            crate::store::validate_label(label)?;
+        }
+        for (k, _) in props {
+            crate::store::validate_prop_key(k)?;
+        }
         let etype = &labels[0];
         let eid = match edge_id {
             Some(id) => store.add_edge_with_id(id, f, t, etype),

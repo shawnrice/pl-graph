@@ -185,6 +185,26 @@ fn to_graph_data(store: &Store) -> GraphData {
     GraphData { nodes, edges }
 }
 
+/// Reject a malformed label / property key at the ingest boundary, so a document a
+/// codec decodes cannot introduce a name the TS engine (which validates at
+/// `deserialize`) would refuse — the two engines accept/reject the same input. Routes
+/// [`crate::store::validate_label`] / [`validate_prop_key`] errors to `E_INVALID_VALUE`.
+fn check_ingest_names<'a>(
+    labels: &[&str],
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Result<(), CodecError> {
+    let to_err =
+        |m: String| CodecError::new("E_INVALID_VALUE", m.trim_start_matches("E_INVALID_VALUE: "));
+    for label in labels {
+        crate::store::validate_label(label).map_err(to_err)?;
+    }
+    for key in keys {
+        crate::store::validate_prop_key(key).map_err(to_err)?;
+    }
+
+    Ok(())
+}
+
 /// Build a fresh store from neutral data. `strict` enforces the declared-nodes
 /// contract (an edge endpoint must be a declared node → `E_MISSING_VERTEX`); the
 /// lenient path (pg-text) fabricates a missing endpoint as a bare node.
@@ -198,6 +218,7 @@ fn from_graph_data(
 
     for n in data.nodes {
         let lrefs: Vec<&str> = n.labels.iter().map(String::as_str).collect();
+        check_ingest_names(&lrefs, n.props.iter().map(|(k, _)| k.as_str()))?;
         let props = n
             .props
             .iter()
@@ -207,6 +228,8 @@ fn from_graph_data(
     }
 
     for e in data.edges {
+        let elrefs: Vec<&str> = e.labels.iter().map(String::as_str).collect();
+        check_ingest_names(&elrefs, e.props.iter().map(|(k, _)| k.as_str()))?;
         let from = endpoint(&mut store, &e.from, strict)?;
         let to = endpoint(&mut store, &e.to, strict)?;
         // Edges are MULTI-type: the first label is the type, the rest are extras.
@@ -540,6 +563,7 @@ impl lenke_codec::GraphSink for StoreSink {
         labels: &[&str],
         props: &[(&str, lenke_codec::DecVal<'_>)],
     ) -> Result<(), CodecError> {
+        check_ingest_names(labels, props.iter().map(|(k, _)| *k))?;
         let props: Vec<(&str, Value)> = props
             .iter()
             .map(|(k, v)| Ok((*k, decval_to_value(v, self.on_err)?)))
@@ -556,6 +580,7 @@ impl lenke_codec::GraphSink for StoreSink {
         labels: &[&str],
         props: &[(&str, lenke_codec::DecVal<'_>)],
     ) -> Result<(), CodecError> {
+        check_ingest_names(labels, props.iter().map(|(k, _)| *k))?;
         let from = endpoint(&mut self.store, from, self.strict)?;
         let to = endpoint(&mut self.store, to, self.strict)?;
         // First label is the edge type; the rest are secondary (multi-label edges).

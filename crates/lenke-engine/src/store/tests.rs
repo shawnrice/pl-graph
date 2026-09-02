@@ -1257,3 +1257,46 @@ fn dict_max_distinct_knob_gates_high_cardinality_encoding() {
         "unique column stays Str despite the cap"
     );
 }
+
+#[test]
+fn validate_label_rejects_empty_and_double_colon() {
+    assert!(validate_label("Person").is_ok());
+    assert!(validate_label("").unwrap_err().contains("non-empty"));
+    let err = validate_label("a::b").unwrap_err();
+    assert!(
+        err.contains("::") && err.contains("E_INVALID_VALUE"),
+        "{err}"
+    );
+}
+
+#[test]
+fn validate_prop_key_rejects_empty() {
+    assert!(validate_prop_key("name").is_ok());
+    assert!(validate_prop_key("").unwrap_err().contains("non-empty"));
+}
+
+#[test]
+fn ndjson_ingest_rejects_malformed_names() {
+    // The engine must refuse the names the TS Graph refuses at deserialize, so the two
+    // engines accept/reject the same document (and a `::` label cannot silently corrupt
+    // a later graphson encode).
+    for nd in [
+        r#"{"type":"node","id":"x","labels":["a::b"],"properties":{}}"#,
+        r#"{"type":"node","id":"x","labels":[""],"properties":{}}"#,
+        r#"{"type":"node","id":"x","labels":["N"],"properties":{"":1}}"#,
+    ] {
+        let err = match crate::ndjson::from_ndjson(nd) {
+            Ok(_) => panic!("expected rejection for `{nd}`"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("E_INVALID_VALUE"),
+            "expected rejection, got: {err}"
+        );
+    }
+    // A well-formed document still loads.
+    assert!(crate::ndjson::from_ndjson(
+        r#"{"type":"node","id":"x","labels":["N"],"properties":{"k":1}}"#
+    )
+    .is_ok());
+}

@@ -359,7 +359,13 @@ pub unsafe extern "C" fn lnk_open(
             match crate::ndjson::from_ndjson_threads(text, threads) {
                 Ok(store) => Box::into_raw(Box::new(store)),
                 Err(e) => {
-                    crate::ffi_error::set("E_INVALID_JSON", &e.to_string());
+                    // A malformed label / property key is a value error (routed via its
+                    // prefix); everything else is a malformed-document JSON error.
+                    if let Some(rest) = e.strip_prefix("E_INVALID_VALUE: ") {
+                        crate::ffi_error::set("E_INVALID_VALUE", rest);
+                    } else {
+                        crate::ffi_error::set("E_INVALID_JSON", &e);
+                    }
                     std::ptr::null_mut()
                 }
             }

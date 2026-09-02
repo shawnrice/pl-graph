@@ -16,6 +16,36 @@ use std::sync::Arc;
 
 use crate::value::Value;
 
+/// A well-formed label (node label / edge type): non-empty and free of the `::`
+/// sequence. GraphSON joins a node's labels with `::`, so a `::` inside one label is
+/// ambiguous there (and bare GQL cannot name it); an empty label collapses to "no
+/// labels" in GraphSON/CSV. Enforced wherever a label enters the graph (codec ingest,
+/// GQL `INSERT`) so a name that will not round-trip cannot be stored. The TS engine's
+/// `validateLabel` mirrors this; the Gremlin write steps guard via `check_write_name`.
+/// The `E_INVALID_VALUE:` prefix routes to the wire code (see `ffi.rs`).
+pub fn validate_label(label: &str) -> Result<(), String> {
+    if label.is_empty() {
+        return Err("E_INVALID_VALUE: a label / edge type must be non-empty".to_string());
+    }
+    if label.contains("::") {
+        return Err(format!(
+            "E_INVALID_VALUE: a label / edge type cannot contain '::' (the GraphSON multi-label separator): {label:?}"
+        ));
+    }
+
+    Ok(())
+}
+
+/// A well-formed property key: non-empty (an empty key has no CSV column header nor
+/// pg-text `key:value` form). Enforced at the same boundaries as [`validate_label`].
+pub fn validate_prop_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("E_INVALID_VALUE: a property key must be non-empty".to_string());
+    }
+
+    Ok(())
+}
+
 /// Identity hasher for dense `u32` keys (edge ids). Edge ids are assigned
 /// sequentially, so hashing an id to itself spreads the SwissTable buckets nearly
 /// perfectly while skipping SipHash's per-probe mixing — the edge-property map is
