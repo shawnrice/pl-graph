@@ -3,7 +3,7 @@
 // Gremlin end to end: host applies it, it notifies standing queries, the client
 // escapes values safely through `mutateGremlin`, and the engine queues a
 // `lang:'gremlin'` write upstream. Run: bun test packages/sync/src/gremlin-write.test.ts
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { createStore, graphFromNdjson, type Store } from '@lenke/native';
@@ -33,8 +33,24 @@ const suite = hasLib ? describe : describe.skip;
 // One seed Person — the warm starting point.
 const NDJSON = '{"type":"node","id":"a","labels":["Person"],"properties":{"name":"local"}}';
 
-const newStore = (): Store =>
-  createStore(graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)));
+const created: Store[] = [];
+
+// Track every store so its native graph handle is released after each test; a
+// leaked handle otherwise trips the GC-backstop warning when the finalizer runs.
+afterEach(() => {
+  for (const store of created.splice(0)) {
+    store.free();
+  }
+});
+
+const newStore = (): Store => {
+  const store = createStore(
+    graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
+  );
+  created.push(store);
+
+  return store;
+};
 
 const until = async (check: () => boolean): Promise<void> => {
   for (let i = 0; i < 500; i += 1) {

@@ -3,7 +3,7 @@
 // backend returns, honor an app-supplied scheduler escape hatch, let an explicit
 // demand jump the backoff, prioritize under a concurrency cap, and reset cleanly
 // on retryAll. Run: bun test packages/sync/src/retry.test.ts
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { createStore, graphFromNdjson, type Store } from '@lenke/native';
@@ -35,8 +35,24 @@ const suite = hasLib ? describe : describe.skip;
 const NDJSON =
   '{"type":"node","id":"a","labels":["Person"],"properties":{"name":"local","age":50}}';
 
-const newStore = (): Store =>
-  createStore(graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)));
+// Track every store so its native graph handle is released after each test; a
+// leaked handle otherwise trips the GC-backstop warning when the finalizer runs.
+const created: Store[] = [];
+
+afterEach(() => {
+  for (const store of created.splice(0)) {
+    store.free();
+  }
+});
+
+const newStore = (): Store => {
+  const store = createStore(
+    graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
+  );
+  created.push(store);
+
+  return store;
+};
 
 const deferred = <T>() => {
   let resolve!: (v: T) => void;

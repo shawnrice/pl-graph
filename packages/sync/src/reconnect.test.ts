@@ -3,7 +3,7 @@
 // cut and will re-dial. Proves the three guarantees — standing queries
 // re-subscribe after a reconnect, a write issued while offline lands once the
 // wire returns, and connectivity flips are observable — without a real socket.
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { createStore, graphFromNdjson } from '@lenke/native';
@@ -30,6 +30,25 @@ if (!hasLib) {
 const NDJSON = ['a', 'b']
   .map((id) => `{"type":"node","id":"${id}","labels":["Person"],"properties":{"name":"${id}"}}`)
   .join('\n');
+
+// Track every store so its native graph handle is released after each test; a
+// leaked handle otherwise trips the GC-backstop warning when the finalizer runs.
+const created: ReturnType<typeof createStore>[] = [];
+
+afterEach(() => {
+  for (const store of created.splice(0)) {
+    store.free();
+  }
+});
+
+const newStore = (): ReturnType<typeof createStore> => {
+  const store = createStore(
+    graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
+  );
+  created.push(store);
+
+  return store;
+};
 
 /** Spin until `pred()` holds, pumping micro/macro tasks; fails loudly on timeout. */
 const until = async (pred: () => boolean, label: string): Promise<void> => {
@@ -158,9 +177,7 @@ suite('createReconnectingClient', () => {
   });
 
   test('re-subscribes a standing query after a reconnect', async () => {
-    const store = createStore(
-      graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
-    );
+    const store = newStore();
     const t = makeTransport(store);
     const client = createReconnectingClient({ connect: t.connect, retry: { baseMs: 1, maxMs: 5 } });
 
@@ -182,9 +199,7 @@ suite('createReconnectingClient', () => {
   });
 
   test('a mutate issued while offline lands after reconnect', async () => {
-    const store = createStore(
-      graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
-    );
+    const store = newStore();
     const t = makeTransport(store);
     const client = createReconnectingClient({ connect: t.connect, retry: { baseMs: 1, maxMs: 5 } });
 
@@ -212,9 +227,7 @@ suite('createReconnectingClient', () => {
   });
 
   test('the CDC write stream + clientId survive a reconnect (multiplayer + reconnect)', async () => {
-    const store = createStore(
-      graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
-    );
+    const store = newStore();
     // The CDC stream needs a shared op log across every per-connection host.
     const writeLog = createWriteLog();
     const t = makeTransport(store, { writeLog });
@@ -263,9 +276,7 @@ suite('createReconnectingClient', () => {
   });
 
   test('reports connectivity flips and stops re-dialing on close', async () => {
-    const store = createStore(
-      graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
-    );
+    const store = newStore();
     const t = makeTransport(store);
     const flips: boolean[] = [];
     const client = createReconnectingClient({ connect: t.connect, retry: { baseMs: 1, maxMs: 5 } });
@@ -291,9 +302,7 @@ suite('createReconnectingClient', () => {
   test('a synchronously-opening transport still re-subscribes on reconnect', async () => {
     // opened() fires DURING connect() (a MessagePort / test double). The manager
     // must still replay over the live connection, not a null one.
-    const store = createStore(
-      graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
-    );
+    const store = newStore();
     const t = makeTransport(store, { syncOpen: true });
     const client = createReconnectingClient({ connect: t.connect, retry: { baseMs: 1, maxMs: 5 } });
 

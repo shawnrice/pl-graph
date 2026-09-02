@@ -3,7 +3,7 @@
 // apply optimistically and replicate upstream with retry/backoff, server
 // pushes ingest without re-replicating, and the whole thing drives real
 // clients through engine.createHost. Run: bun test packages/sync/src/engine.test.ts
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { createStore, graphFromNdjson, type Store } from '@lenke/native';
@@ -30,8 +30,24 @@ const suite = hasLib ? describe : describe.skip;
 const NDJSON =
   '{"type":"node","id":"a","labels":["Person"],"properties":{"name":"local","age":50}}';
 
-const newStore = (): Store =>
-  createStore(graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)));
+const created: Store[] = [];
+
+// Track every store so its native graph handle is released after each test; a
+// leaked handle otherwise trips the GC-backstop warning when the finalizer runs.
+afterEach(() => {
+  for (const store of created.splice(0)) {
+    store.free();
+  }
+});
+
+const newStore = (): Store => {
+  const store = createStore(
+    graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
+  );
+  created.push(store);
+
+  return store;
+};
 
 /** A promise settled from the outside — deterministic async control. */
 const deferred = <T>() => {

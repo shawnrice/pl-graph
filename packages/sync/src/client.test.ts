@@ -3,7 +3,7 @@
 // referentially-stable snapshots with honest complete/error state, and
 // promise-shaped one-shots — the full client contract, transport-free.
 // Run: bun test packages/sync/src/client.test.ts
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { hasErrorCode, ErrorCode } from '@lenke/errors';
@@ -33,11 +33,22 @@ const NDJSON = [
   '{"type":"node","id":"b","labels":["Person"],"properties":{"name":"vadas","age":27}}',
 ].join('\n');
 
+// Track every store so its native graph handle is released after each test; a
+// leaked handle otherwise trips the GC-backstop warning when the finalizer runs.
+const created: ReturnType<typeof createStore>[] = [];
+
+afterEach(() => {
+  for (const store of created.splice(0)) {
+    store.free();
+  }
+});
+
 /** Client ↔ host wired directly — the minimal port. `wire` records traffic. */
 const connect = (clientOpts: { maxInactiveQueries?: number } = {}) => {
   const store = createStore(
     graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
   );
+  created.push(store);
   const wire: ClientMessage[] = [];
   // Declared before the host exists; the host's status message on attach
   // arrives before the client is constructed, so buffer and replay.

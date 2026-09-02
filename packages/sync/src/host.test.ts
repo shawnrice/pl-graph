@@ -3,7 +3,7 @@
 // epoch gating suppresses irrelevant pushes, re-subscribe replaces, mutate
 // acks and fans out to every host on the store, and errors ride the coded
 // wire shape. Run: bun test packages/sync/src/host.test.ts
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { createStore, graphFromNdjson, type Store } from '@lenke/native';
@@ -35,10 +35,22 @@ const NDJSON = [
   '{"type":"edge","id":"e0","from":"a","to":"b","labels":["KNOWS"],"properties":{}}',
 ].join('\n');
 
+// Track every store so its native graph handle is released after each test; a
+// leaked handle otherwise trips the GC-backstop warning when the finalizer runs.
+const created: Store[] = [];
+
+afterEach(() => {
+  for (const store of created.splice(0)) {
+    store.free();
+  }
+});
+
 const newStore = (): Store => {
   const backend = createFfiEngineBackend(LIB);
+  const store = createStore(graphFromNdjson(backend, new TextEncoder().encode(NDJSON)));
+  created.push(store);
 
-  return createStore(graphFromNdjson(backend, new TextEncoder().encode(NDJSON)));
+  return store;
 };
 
 /** A host wired to a capture buffer — the minimal "connection". */

@@ -4,7 +4,7 @@
 // OWN local store — cross-client optimism over the wire, which the rows-only
 // protocol couldn't do. Also covers origin-skip, catch-up replay, and resync.
 // Run: bun test packages/sync/src/cdc.test.ts
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { createStore, graphFromNdjson, type Store } from '@lenke/native';
@@ -39,8 +39,24 @@ if (!hasLib) {
 const suite = hasLib ? describe : describe.skip;
 
 const SEED = '{"type":"node","id":"seed","labels":["Seed"],"properties":{}}';
-const newStore = (): Store =>
-  createStore(graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(SEED)));
+// Track every store so its native graph handle is released after each test; a
+// leaked handle otherwise trips the GC-backstop warning when the finalizer runs.
+const created: Store[] = [];
+
+afterEach(() => {
+  for (const store of created.splice(0)) {
+    store.free();
+  }
+});
+
+const newStore = (): Store => {
+  const store = createStore(
+    graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(SEED)),
+  );
+  created.push(store);
+
+  return store;
+};
 
 /** Count of `Widget` nodes — a cheap way to read a store's state. */
 const widgets = (s: Store): number =>

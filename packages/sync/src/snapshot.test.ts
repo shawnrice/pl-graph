@@ -3,7 +3,7 @@
 // version/user mismatch, garbage bytes) reads as ABSENT and the caller cold
 // boots. Plus the one exception: the pending-write queue rides the snapshot
 // and resumes replication on boot. Run: bun test packages/sync/src/snapshot.test.ts
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { createStore, graphFromNdjson, type Store } from '@lenke/native';
@@ -42,8 +42,26 @@ const NDJSON = [
   '{"type":"node","id":"b","labels":["Person"],"properties":{"name":"vadas","age":27}}',
 ].join('\n');
 
+// Every store built here owns a native graph handle. These tests create them
+// freely (often inline, as a throwaway arg to encodeSnapshot), so rather than
+// dispose each by hand we track them and free the lot after each test — a leaked
+// handle otherwise trips the GC-backstop warning when the finalizer runs. free()
+// is idempotent, so a directly-tracked store is safe to free twice.
+const created: Store[] = [];
+const track = (store: Store): Store => {
+  created.push(store);
+
+  return store;
+};
+
+afterEach(() => {
+  for (const store of created.splice(0)) {
+    store.free();
+  }
+});
+
 const newStore = (seed: string = NDJSON): Store =>
-  createStore(graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(seed)));
+  track(createStore(graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(seed))));
 
 const EXPECT = { schemaVersion: 'v1', userId: 'shawn' };
 const KEY_BYTES = new Uint8Array(32).map((_, i) => i * 7 + 1);
@@ -401,7 +419,7 @@ suite('@lenke/sync snapshot · schema restore', () => {
     });
 
     // Rebuild the graph the complete way — data AND schema replayed.
-    const restored = createStore(graphFromSnapshot(createFfiEngineBackend(LIB), snap!));
+    const restored = track(createStore(graphFromSnapshot(createFfiEngineBackend(LIB), snap!)));
 
     // The unique constraint is live: the keyed `_MERGE` upserts (doesn't duplicate)…
     restored.mutate((g) => g.query("_MERGE (u:User {email: 'a@b.com', age: 31})"));
@@ -424,7 +442,7 @@ suite('@lenke/sync snapshot · schema restore', () => {
     const snap = await decodeSnapshot(bytes, EXPECT, PLAIN);
     expect(snap!.schema).toEqual([]);
     // Data still restores fine through the complete-boot helper.
-    const restored = createStore(graphFromSnapshot(createFfiEngineBackend(LIB), snap!));
+    const restored = track(createStore(graphFromSnapshot(createFfiEngineBackend(LIB), snap!)));
     expect(restored.graph.vertexCount).toBe(2);
   });
 });

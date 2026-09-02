@@ -1,7 +1,7 @@
 // Reproductions for reported bugs in the sync host + engine. Each test either
 // FAILS (bug confirmed) or PASSES (bug disproved). These are diagnostic — they
 // are NOT fixes. Run: bun test packages/sync/src/reported-bugs.test.ts
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { createStore, graphFromNdjson, type LiveQuery, type Row, type Store } from '@lenke/native';
@@ -29,8 +29,24 @@ const suite = hasLib ? describe : describe.skip;
 const NDJSON =
   '{"type":"node","id":"a","labels":["Person"],"properties":{"name":"local","age":50}}';
 
-const newStore = (): Store =>
-  createStore(graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)));
+const created: Store[] = [];
+
+// Track every store so its native graph handle is released after each test; a
+// leaked handle otherwise trips the GC-backstop warning when the finalizer runs.
+afterEach(() => {
+  for (const store of created.splice(0)) {
+    store.free();
+  }
+});
+
+const newStore = (): Store => {
+  const store = createStore(
+    graphFromNdjson(createFfiEngineBackend(LIB), new TextEncoder().encode(NDJSON)),
+  );
+  created.push(store);
+
+  return store;
+};
 
 const deferred = <T>() => {
   let resolve!: (v: T) => void;

@@ -64,7 +64,10 @@ suite('@lenke/sync over a real WebSocket', () => {
     },
   });
 
-  afterAll(() => server.stop(true));
+  afterAll(async () => {
+    await server.stop(true);
+    store.free(); // release the native graph handle (else the GC backstop warns)
+  });
 
   /** A tiny promise-based client: every inbound frame lands in an awaitable queue. */
   const connect = async () => {
