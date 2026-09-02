@@ -35,6 +35,15 @@ pub const DEFAULT_LABEL_ITERATIONS: u32 = 10;
 /// Peer-pressure default round bound, matching the TS engine (30, NOT the pagerank 20).
 pub const DEFAULT_PEER_PRESSURE_ITERATIONS: u32 = 30;
 
+/// Upper bound on a caller-supplied `iterations`. Every iterative algorithm converges
+/// far sooner than this (defaults are 10–30); the cap only defuses a pathological
+/// `{iterations: 1e18}` that would otherwise saturate to `u32::MAX` (~4.3e9) fixed
+/// rounds and hang. A float over the cap clamps here rather than spinning.
+pub const MAX_ALGO_ITERATIONS: u32 = 100_000;
+/// Upper bound on a caller-supplied `threads`, so a huge value cannot ask the OS for
+/// billions of worker threads. Well above any real core count.
+pub const MAX_ALGO_THREADS: u32 = 1_024;
+
 /// Resolve an optional edge-type name to `Some(Some(id))` (a specific type),
 /// `Some(None)` (any type), or `None` (a named-but-unknown type → matches
 /// nothing). Kept separate so each algorithm handles the unknown-type case the
@@ -1919,6 +1928,13 @@ pub fn run_procedure(
             }
         })
     };
+    // A caller-supplied `iterations`, capped at [`MAX_ALGO_ITERATIONS`] (a saturating
+    // float→u32 cast means `1e18` would otherwise become ~4.3e9 rounds). Only the UPPER
+    // bound is clamped — `iterations: 0` stays 0 (a no-op), matching the TS engine; a
+    // negative float saturates to 0 as before.
+    let iters_of = |default: u32| {
+        num_of("iterations").map_or(default, |n| (n as u32).min(MAX_ALGO_ITERATIONS))
+    };
     let dir = || match str_of("direction") {
         Some("in") => Dir::In,
         Some("both") => Dir::Both,
@@ -1932,7 +1948,7 @@ pub fn run_procedure(
     // Effective worker-thread count: a per-call `threads` overrides the graph-level
     // default (`Store::parallelism`); 1 = serial. Ignored on a build without threads.
     let threads = num_of("threads")
-        .map(|n| n.max(1.0) as u32)
+        .map(|n| (n.max(1.0) as u32).min(MAX_ALGO_THREADS))
         .unwrap_or_else(|| store.effective_parallelism());
     // Every remaining procedure is scalar `(node, f64)`; wrap into `(node, Value::Num)`.
     let numeric: Vec<(u32, f64)> = match name {
@@ -1942,7 +1958,7 @@ pub fn run_procedure(
             .map(|(v, c)| (v, f64::from(c)))
             .collect(),
         "label_propagation" => {
-            let iters = num_of("iterations").map_or(DEFAULT_LABEL_ITERATIONS, |n| n as u32);
+            let iters = iters_of(DEFAULT_LABEL_ITERATIONS);
             label_propagation(store, edge_filter(), iters, str_of("seedProperty"), threads)
                 .into_iter()
                 .map(|(v, l)| (v, f64::from(l)))
@@ -1950,7 +1966,7 @@ pub fn run_procedure(
         }
         "pagerank" => {
             let d = num_of("dampingFactor").unwrap_or(DEFAULT_DAMPING);
-            let iters = num_of("iterations").map_or(DEFAULT_PAGERANK_ITERATIONS, |n| n as u32);
+            let iters = iters_of(DEFAULT_PAGERANK_ITERATIONS);
             pagerank(
                 store,
                 edge_filter(),
@@ -1998,7 +2014,7 @@ pub fn run_procedure(
         }
         "personalized_pagerank" => {
             let d = num_of("dampingFactor").unwrap_or(DEFAULT_DAMPING);
-            let iters = num_of("iterations").map_or(DEFAULT_PAGERANK_ITERATIONS, |n| n as u32);
+            let iters = iters_of(DEFAULT_PAGERANK_ITERATIONS);
             // `sourceNodes` is a list of external-id strings (non-string items ignored).
             let seeds: Vec<String> = config
                 .iter()
@@ -2022,7 +2038,7 @@ pub fn run_procedure(
             personalized_pagerank(store, edge_filter(), &seeds, d, iters, threads)
         }
         "peer_pressure" => {
-            let iters = num_of("iterations").map_or(DEFAULT_PEER_PRESSURE_ITERATIONS, |n| n as u32);
+            let iters = iters_of(DEFAULT_PEER_PRESSURE_ITERATIONS);
             peer_pressure(store, edge_filter(), iters, threads)
                 .into_iter()
                 .map(|(v, c)| (v, f64::from(c)))
