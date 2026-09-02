@@ -170,7 +170,6 @@ export const createStore = (graph: RustGraph): Store => {
       return cell.cached; // nothing mutated since last read → stable reference
     }
 
-    cell.seenVersion = v;
     // `null` deps → gate on the global version (recompute every change). `[]` →
     // a constant fingerprint, so it never recomputes after the first prime.
     // Otherwise sum the declared epochs and recompute only when one moved.
@@ -184,12 +183,17 @@ export const createStore = (graph: RustGraph): Store => {
       fingerprint = cell.deps.reduce((acc, d) => acc + graph.epoch(d), 0);
     }
 
-    if (fingerprint === cell.seenFingerprint) {
-      return cell.cached; // the mutation didn't touch our dependencies
+    // Recompute only when our dependencies moved. Crucially, advance the bookkeeping
+    // (seenVersion / seenFingerprint) ONLY after run() returns: a run() that throws —
+    // a query made invalid by the mutation (a CAST error, an incompatible ORDER BY on
+    // newly-inserted data) — must re-throw on every subsequent read, not leave the cell
+    // marked "seen" so the next same-version read silently returns stale rows.
+    if (fingerprint !== cell.seenFingerprint) {
+      cell.cached = cell.run();
+      cell.seenFingerprint = fingerprint;
     }
 
-    cell.seenFingerprint = fingerprint;
-    cell.cached = cell.run();
+    cell.seenVersion = v;
 
     return cell.cached;
   };

@@ -160,4 +160,20 @@ suite('@lenke/native reactive store', () => {
       inferDeps('MATCH (a:Person)-[:KNOWS]->(b) WHERE a.age > 30 RETURN a.name').sort(),
     ).toEqual(['KNOWS', 'Person', 'age', 'name']);
   });
+
+  test('a live query made invalid by a mutation re-throws on every read, never serves stale', () => {
+    using store = newStore();
+    // Empty until an :N node exists, so the first read is a clean []. A later insert of
+    // non-numeric data makes the CAST throw at exec time.
+    const q = store.liveQuery('MATCH (n:N) RETURN CAST(n.x AS INTEGER) AS v', { deps: null });
+    expect(q.getSnapshot()).toEqual([]);
+
+    store.mutate((g) => g.query("INSERT (:N {x: 'notanumber'})"));
+
+    // The recompute throws — and CRUCIALLY it throws AGAIN on the next same-version read,
+    // rather than silently returning the stale [] (the bookkeeping must not advance past a
+    // failed run()).
+    expect(() => q.getSnapshot()).toThrow();
+    expect(() => q.getSnapshot()).toThrow();
+  });
 });
