@@ -383,6 +383,28 @@ describe('sentinel-collision safety', () => {
     expect(back.getVertexById('n1')!.properties.mixed).toEqual([1, 'a', 2]);
   });
 
+  test('a string LIST element equal to a type-override sigil round-trips as a string', () => {
+    // The wire encodes a mixed-type element as `\T<code>:<raw>` (e.g. `\Ti:5` = int 5
+    // inside a string list). A genuine string element whose *value* begins with `\T`
+    // would, once escaped, be indistinguishable from that override — so it must be
+    // emitted as an explicit `\Ts:` string-code override. Covers the int/null/string
+    // sigils plus a real override in the same list, so the disambiguation is exercised
+    // both ways. (Rust's csv codec has the matching branch — the wire is byte-identical.)
+    const g = new Graph();
+    g.addVertex({
+      id: 'n1',
+      labels: [],
+      properties: {
+        sigils: ['\\Ti:5', '\\Tn:', '\\Ts:x', 'ok'], // strings that LOOK like overrides
+        real: ['\\Ti:5', 5, null], // a genuine string, a real int override, a real null
+      },
+    });
+    const back = roundTripNodes(g);
+    const p = back.getVertexById('n1')!.properties;
+    expect(p.sigils).toEqual(['\\Ti:5', '\\Tn:', '\\Ts:x', 'ok']);
+    expect(p.real).toEqual(['\\Ti:5', 5, null]);
+  });
+
   test('a key that is a list on one node and a scalar on another round-trips', () => {
     const g = new Graph();
     g.addVertex({ id: 'n1', labels: [], properties: { v: [1, 2] } });

@@ -319,6 +319,13 @@ fn element_to_raw(elem_scalar: Scalar, el: &Value) -> String {
     let actual = scalar_of_element(el);
     let raw = scalar_to_raw(actual, el);
     if actual == elem_scalar {
+        // A genuine string whose value begins with the override prefix `\T` would, once
+        // escaped, be indistinguishable from a real type-override on decode. Emit it as
+        // an explicit `\Ts:` string-code override, which decodes back to the literal.
+        // (The TS csv codec has the matching branch, so the wire stays byte-identical.)
+        if actual == Scalar::Str && raw.starts_with(OVERRIDE_PREFIX) {
+            return escape_element(&format!("{OVERRIDE_PREFIX}{}:{}", Scalar::Str.code(), raw));
+        }
         let body = escape_element(&raw);
         if actual == Scalar::Str {
             guard_element(body)
@@ -823,6 +830,36 @@ mod tests {
         assert_eq!(
             prop(&g2, "t", "oneNull"),
             Some(&Value::List(vec![Value::Null]))
+        );
+    }
+
+    #[test]
+    fn override_sigil_string_list_element_round_trips() {
+        // A string list element whose value begins with the `\T` override prefix must
+        // survive: `\Ti:5` (looks like an int override), `\Tn:` (null sigil), `\Ts:x`
+        // (string sigil). Alongside a real int override + a real null in another list,
+        // so the disambiguation is exercised both ways.
+        let g = crate::pg_json::decode(
+            r#"{"nodes":[{"id":"t","labels":["T"],"properties":{"sigils":["\\Ti:5","\\Tn:","\\Ts:x","ok"],"real":["\\Ti:5",5,null]}}],"edges":[]}"#,
+        )
+        .unwrap();
+        let g2 = decode(&encode(&g));
+        assert_eq!(
+            prop(&g2, "t", "sigils"),
+            Some(&Value::List(vec![
+                Value::Str("\\Ti:5".into()),
+                Value::Str("\\Tn:".into()),
+                Value::Str("\\Ts:x".into()),
+                Value::Str("ok".into()),
+            ]))
+        );
+        assert_eq!(
+            prop(&g2, "t", "real"),
+            Some(&Value::List(vec![
+                Value::Str("\\Ti:5".into()),
+                Value::Num(5.0),
+                Value::Null,
+            ]))
         );
     }
 

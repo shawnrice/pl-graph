@@ -478,8 +478,16 @@ const elementToRaw = (elemScalar: ScalarType, el: PropertyValue): string => {
   const raw = scalarToRaw(actual, el);
 
   if (actual === elemScalar) {
-    // Guard a formula-leading STRING element (a number like `-5` is left bare);
-    // an override element already begins with `\T`, so it needs no guard.
+    // A genuine STRING whose value begins with the override prefix `\T` would, once
+    // escaped, be indistinguishable from a real type-override on decode (both become
+    // `\\T…`). Emit it as an explicit `\Ts:` string-code override, which decodes back
+    // to the literal — reusing the override machinery, no new escape scheme. (Rust's
+    // csv codec has the matching branch, so the wire stays byte-identical.)
+    if (actual === 'string' && raw.startsWith(OVERRIDE_PREFIX)) {
+      return escapeElement(`${OVERRIDE_PREFIX}${SCALAR_CODE[actual]}:${raw}`);
+    }
+
+    // Guard a formula-leading STRING element (a number like `-5` is left bare).
     const body = escapeElement(raw);
 
     return actual === 'string' ? guardElement(body) : body;
