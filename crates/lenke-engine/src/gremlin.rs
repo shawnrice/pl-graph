@@ -97,6 +97,13 @@ fn combine_edge_scope(arms: &[Option<bool>]) -> Option<bool> {
     }
 }
 
+/// Maximum sub-traversal nesting depth accepted by the parser (see [`Parser::depth`]).
+/// Far above any real traversal and safely below the stack-overflow threshold on the
+/// smallest stack the parser runs on (the wasm CLI, cargo's 2 MB test threads) — the
+/// `step` frame is large, so this is deliberately conservative. MUST match the TS
+/// `@lenke/gremlin` parser's cap so the two engines accept/reject the same queries.
+const MAX_TRAVERSAL_DEPTH: usize = 128;
+
 pub fn parse(query: &str) -> Result<Plan, String> {
     let toks = lex(query)?;
     // A traversal that reads a full `path()`/`tree()` records each value-producing step's
@@ -150,6 +157,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         last_arm_frontier: (false, false, false),
         last_arm_last_step: String::new(),
         frontier_from_reducer: false,
+        depth: 0,
     };
     p.traversal()
 }
@@ -861,6 +869,12 @@ struct Parser {
     /// True when the traversal reads a full `path()`/`tree()` — the lowering then emits a
     /// `Plan::PathRecord` after each value-producing step (see [`parse`]).
     building_full_path: bool,
+    /// Current sub-traversal nesting depth, bounded by [`MAX_TRAVERSAL_DEPTH`] via
+    /// [`Parser::nest`]. Each nested anonymous sub-traversal (`where(__.where(__.…))`)
+    /// re-enters [`Parser::step`], so an unbounded query would otherwise overflow the
+    /// native stack (SIGSEGV) or trap the wasm REPL. The [`crate::ir::Plan`] tree is also
+    /// walked recursively downstream, so the cap protects those passes too.
+    depth: usize,
 }
 
 impl Parser {
@@ -874,6 +888,25 @@ impl Parser {
             self.pos += 1;
         }
         t
+    }
+
+    /// Run `f` one sub-traversal-nesting level deeper, rejecting past
+    /// [`MAX_TRAVERSAL_DEPTH`] before the stack overflows. Wraps [`Parser::step`], so a
+    /// flat step chain (each `step` returns before the next) never accumulates — only a
+    /// nested sub-traversal (`where(__.where(…))`, which re-enters `step`) does.
+    fn nest<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, String>) -> Result<T, String> {
+        self.depth += 1;
+        if self.depth > MAX_TRAVERSAL_DEPTH {
+            self.depth -= 1;
+
+            return Err(format!(
+                "E_RESOURCE_EXHAUSTED: traversal nesting exceeds the maximum depth of {MAX_TRAVERSAL_DEPTH}"
+            ));
+        }
+        let r = f(self);
+        self.depth -= 1;
+
+        r
     }
 
     fn expect(&mut self, t: &Tok) -> Result<(), String> {
@@ -1465,6 +1498,12 @@ impl Parser {
     }
 
     fn step(&mut self, plan: Plan) -> Result<Plan, String> {
+        // Every nested sub-traversal re-enters here; the depth guard bounds nesting
+        // before the parser (and the downstream Plan walkers) overflow the stack.
+        self.nest(move |p| p.step_inner(plan))
+    }
+
+    fn step_inner(&mut self, plan: Plan) -> Result<Plan, String> {
         let name = self.ident()?;
         self.expect(&Tok::LParen)?;
         let lname = name.to_ascii_lowercase();

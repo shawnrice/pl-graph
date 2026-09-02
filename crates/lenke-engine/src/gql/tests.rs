@@ -5417,3 +5417,29 @@ fn intermediate_guard_covers_the_streaming_path() {
         "streaming path guarded: {err}"
     );
 }
+
+#[test]
+fn deeply_nested_expressions_reject_instead_of_overflowing_the_stack() {
+    // A pathological nesting depth is rejected with a resource error rather than
+    // overflowing the stack (SIGSEGV). Covers the three self-recursive descents that
+    // do not funnel through a single point: nested list literals / parens (`expr`),
+    // `NOT` chains (`not_expr`), and unary `-` chains (`unary`).
+    let over = super::MAX_EXPR_DEPTH + 50;
+    let cases = [
+        format!("RETURN {}1{}", "[".repeat(over), "]".repeat(over)),
+        format!("RETURN {}1{}", "(".repeat(over), ")".repeat(over)),
+        format!("RETURN {}true", "NOT ".repeat(over)),
+        // Spaced so the lexer sees unary Minus tokens, not the `--` line comment.
+        format!("RETURN {}1", "- ".repeat(over)),
+    ];
+    for q in &cases {
+        let err = super::parse(q).unwrap_err();
+        assert!(
+            err.contains("E_RESOURCE_EXHAUSTED") && err.contains("nesting"),
+            "expected a nesting-depth rejection, got: {err}",
+        );
+    }
+    // A modest nest still parses (the cap is far above any real query).
+    let ok = format!("RETURN {}1{}", "[".repeat(100), "]".repeat(100));
+    assert!(super::parse(&ok).is_ok(), "depth 100 should parse fine");
+}

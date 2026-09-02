@@ -2677,3 +2677,28 @@ fn inject_prepends_and_values_reads_boxed_elements() {
         alone.rows[1][0],
     );
 }
+
+#[test]
+fn deeply_nested_subtraversals_reject_instead_of_overflowing_the_stack() {
+    // A pathological sub-traversal nesting depth is rejected with a resource error
+    // rather than overflowing the stack (SIGSEGV / wasm trap). Each `where(__.…)`
+    // re-enters `step`, so the depth guard bounds it.
+    let over = super::MAX_TRAVERSAL_DEPTH + 50;
+    let q = format!(
+        "g.V().{}identity(){}",
+        "where(__.".repeat(over),
+        ")".repeat(over),
+    );
+    let err = super::parse(&q).unwrap_err();
+    assert!(
+        err.contains("E_RESOURCE_EXHAUSTED") && err.contains("nesting"),
+        "expected a nesting-depth rejection, got: {err}",
+    );
+    // A modest nest still parses.
+    let ok = format!(
+        "g.V().{}identity(){}",
+        "where(__.".repeat(50),
+        ")".repeat(50)
+    );
+    assert!(super::parse(&ok).is_ok(), "depth 50 should parse fine");
+}

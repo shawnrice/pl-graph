@@ -517,7 +517,9 @@ export const parse = (
   // otherwise overflow the JS stack with an uncaught `RangeError`. Wrapping the
   // recursive entry points in `descend` converts that into a clean
   // `GqlSyntaxError` past a fixed bound, well below any real stack limit.
-  const MAX_DEPTH = 500;
+  // Kept in lockstep with the native engine's `MAX_EXPR_DEPTH` (gql.rs) so the two
+  // engines accept/reject the same queries — the value is far above any real query.
+  const MAX_DEPTH = 128;
   let depth = 0;
   // Whether a bare `IN` is the membership operator (default) or a structural
   // keyword. Suppressed only while parsing a `LET … IN … END` binding's RHS so

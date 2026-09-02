@@ -309,6 +309,14 @@ struct Rel {
 /// and const-overflowed the wasm build.
 const AGG_SLOT_BASE: usize = 1 << 28;
 
+/// Maximum expression-nesting depth accepted by the parser (see [`Parser::depth`]).
+/// Far above any legitimate query (real expressions nest a handful deep) and safely
+/// below the stack-overflow threshold on the SMALLEST stack the parser runs on — the
+/// wasm CLI (~1 MB) and cargo's 2 MB test threads, not just the 8 MB native main
+/// stack. MUST match the TS `@lenke/gql` parser's cap so the two engines accept/reject
+/// the same queries.
+const MAX_EXPR_DEPTH: usize = 128;
+
 /// A parsed RETURN item: a keyed expression (a grouping key / plain projection), a
 /// bare aggregate, or an expression that CONTAINS aggregates (`count(*) + 1`) — the
 /// last carries the hoisted aggregates and an expression that references them by
@@ -418,6 +426,7 @@ fn parse_internal(query: &str, params: &[(String, Value)], prepared: bool) -> Re
         params: params.iter().cloned().collect(),
         prepared,
         no_next: false,
+        depth: 0,
     };
     // ISO transaction-control command (`START TRANSACTION`/`COMMIT`/`ROLLBACK`)? A
     // linear query never begins with a bare START/COMMIT/ROLLBACK, so there is no
@@ -809,6 +818,13 @@ struct Parser {
     /// operator is a documented limitation (both engines reject it), so `query_tail`
     /// refuses to consume `NEXT` here rather than silently re-associating the union.
     no_next: bool,
+    /// Current expression-nesting depth, bounded by [`MAX_EXPR_DEPTH`] via [`Parser::nest`].
+    /// A recursive-descent parser recurses once per nested `(…)`/`[…]`/`NOT`/unary-`-`/`!`,
+    /// so an unbounded query string (`RETURN [[[[…]]]]`) would otherwise overflow the
+    /// native stack (SIGSEGV) or trap the wasm REPL — before any operator-chain limit,
+    /// which is only checked post-parse. The [`crate::ir::Expr`] tree the parser builds is
+    /// also walked recursively by `optimize`/`exec`, so the cap protects them too.
+    depth: usize,
 }
 
 impl Parser {
@@ -822,6 +838,25 @@ impl Parser {
             self.pos += 1;
         }
         t
+    }
+
+    /// Run `f` one expression-nesting level deeper, rejecting past [`MAX_EXPR_DEPTH`]
+    /// before the stack overflows. Wraps each self-recursive descent (`expr`, `NOT`,
+    /// unary `-`, `!`); the depth is decremented on every non-fatal return so sibling
+    /// breadth (a wide list) never accumulates — only genuine nesting does.
+    fn nest<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, String>) -> Result<T, String> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+
+            return Err(format!(
+                "E_RESOURCE_EXHAUSTED: expression nesting exceeds the maximum depth of {MAX_EXPR_DEPTH}"
+            ));
+        }
+        let r = f(self);
+        self.depth -= 1;
+
+        r
     }
 
     fn eat(&mut self, t: &Tok) -> bool {
@@ -4785,7 +4820,9 @@ impl Parser {
 
     // Expression precedence: OR < AND < NOT < comparison < primary.
     fn expr(&mut self) -> Result<Expr, String> {
-        self.or_expr()
+        // One nesting level per `expr` (re)entry — every `(…)`, `[…]`, function arg,
+        // `LET` body, `CASE`, and `IN`-list funnels back through here.
+        self.nest(|p| p.or_expr())
     }
 
     /// Parse an expression that sits in a BOOLEAN context (`WHERE` / `FILTER` /
@@ -4827,7 +4864,8 @@ impl Parser {
 
     fn not_expr(&mut self) -> Result<Expr, String> {
         if self.eat_kw("NOT") {
-            Ok(Expr::Not(Box::new(self.not_expr()?)))
+            // `NOT NOT …` recurses here (not through `expr`), so guard the re-entry.
+            Ok(Expr::Not(Box::new(self.nest(|p| p.not_expr())?)))
         } else {
             self.cmp_expr()
         }
@@ -5088,7 +5126,8 @@ impl Parser {
     // non-numeric propagation is the ordinary Arith rule.
     fn unary(&mut self) -> Result<Expr, String> {
         if self.eat(&Tok::Minus) {
-            let e = self.unary()?;
+            // Unary `- - - …` recurses here (not through `expr`), so guard the re-entry.
+            let e = self.nest(|p| p.unary())?;
             Ok(Expr::Arith {
                 op: crate::ir::ArithOp::Sub,
                 left: Box::new(Expr::Lit(Value::Num(0.0))),
@@ -5105,7 +5144,8 @@ impl Parser {
         // comparison operators, unlike the keyword `NOT` which sits above them). So
         // `!(1=2) = true` parses as `(!(1=2)) = true`.
         if self.eat(&Tok::Bang) {
-            return Ok(Expr::Not(Box::new(self.primary()?)));
+            // `!!!…` recurses here (not through `expr`), so guard the re-entry.
+            return Ok(Expr::Not(Box::new(self.nest(|p| p.primary())?)));
         }
         // `LET name = expr [, name = expr]* IN body END` — local bindings. Each
         // binding is pushed onto `self.lets` (later bindings may reference earlier

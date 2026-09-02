@@ -614,6 +614,8 @@ pub unsafe extern "C" fn lnk_query(
                         crate::ffi_error::set("E_MISSING_PARAMETER", rest);
                     } else if let Some(rest) = e.strip_prefix("E_INVALID_VALUE: ") {
                         crate::ffi_error::set("E_INVALID_VALUE", rest);
+                    } else if let Some(rest) = e.strip_prefix("E_RESOURCE_EXHAUSTED: ") {
+                        crate::ffi_error::set("E_RESOURCE_EXHAUSTED", rest);
                     } else {
                         crate::ffi_error::set("E_SYNTAX", &e);
                     }
@@ -650,6 +652,8 @@ pub unsafe extern "C" fn lnk_query(
                         crate::ffi_error::set("E_UNKNOWN_FUNCTION", rest);
                     } else if let Some(rest) = e.strip_prefix("E_INVALID_VALUE: ") {
                         crate::ffi_error::set("E_INVALID_VALUE", rest);
+                    } else if let Some(rest) = e.strip_prefix("E_RESOURCE_EXHAUSTED: ") {
+                        crate::ffi_error::set("E_RESOURCE_EXHAUSTED", rest);
                     } else {
                         crate::ffi_error::set("E_SYNTAX", &e);
                     }
