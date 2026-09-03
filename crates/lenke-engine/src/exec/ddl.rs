@@ -16,6 +16,9 @@ use crate::store::Store;
 /// schema entry point the C ABI calls.
 pub fn apply_schema_op(store: &mut Store, json: &str) -> Result<(), crate::schema_op::SchemaError> {
     use crate::schema_op::SchemaError;
+    // Inside a transaction, capture the declarative schema before the first schema op so a
+    // rollback reverts it with the rest of the transaction (a no-op outside a transaction).
+    store.snapshot_schema_for_tx();
     let parsed = crate::ndjson::parse_json(json).map_err(SchemaError::BadRequest)?;
     let crate::ndjson::Json::Obj(fields) = &parsed else {
         return Err(SchemaError::BadRequest(

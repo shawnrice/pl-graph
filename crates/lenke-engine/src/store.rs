@@ -731,6 +731,35 @@ enum Undo {
     },
 }
 
+/// The DECLARATIVE schema captured the first time a schema op runs inside a transaction,
+/// so `rollback` can revert it — a `createIndex` / constraint / validator / invariant run
+/// in a transaction reverts with the rest of the transaction (see [`Store::rollback`]).
+///
+/// Only NAMES / CONFIG are captured, never index bucket DATA: the declarative registries
+/// and an index's IDENTITY (its path / interval keys / the edge-type flag) are mutated
+/// ONLY by schema ops, never by data writes, so a lazy capture at the first schema op is
+/// exact. A pre-existing index's bucket data is maintained across the rollback by the data
+/// undos; an index CREATED in the tx is dropped, and one DROPPED in the tx is rebuilt from
+/// the (already-restored) data.
+#[derive(Clone)]
+struct SchemaSnapshot {
+    unique: Vec<(String, Vec<String>)>,
+    required: Vec<(String, String)>,
+    e_unique: Vec<(String, Vec<String>)>,
+    e_required: Vec<(String, String)>,
+    v_type: Vec<TypeRule>,
+    e_type: Vec<TypeRule>,
+    cardinality: Vec<CardRule>,
+    validators: Vec<ValidatorRule>,
+    invariants: Vec<InvariantRule>,
+    /// Hash-index identities (the dotted paths) — bucket data is excluded.
+    index_paths: Vec<Vec<String>>,
+    /// The interval index's `(lo, hi)` keys, or `None` if there was none.
+    interval_keys: Option<(String, String)>,
+    /// Whether the opt-in edge-type index was active.
+    edge_type_index: bool,
+}
+
 /// One adjacency entry: the neighbour node, the edge's interned type id, and the
 /// edge's identity (`eid`). A directed edge appears once in its source's `out`
 /// and once in its target's `in`, both with the SAME `eid` — so trail semantics
@@ -1231,6 +1260,11 @@ pub struct Store {
     /// every subscriber even though nothing effectively changed). `Some` only inside a
     /// transaction. Matches the pure-TS engine, which likewise leaves them untouched.
     tx_snapshot: Option<(u64, FnvMap<String, u64>)>,
+    /// The declarative schema captured at the FIRST schema op inside a transaction (see
+    /// [`SchemaSnapshot`]), restored on `rollback` so a `createIndex` / constraint /
+    /// validator / invariant declared in a transaction reverts with it. `None` until a
+    /// schema op runs in an open transaction (data-only transactions never allocate it).
+    tx_schema: Option<Box<SchemaSnapshot>>,
     /// declared unique constraints as `(label, keys)` — at most one live node per
     /// label may carry a given key tuple. Enforced by the write statements, not
     /// the store primitives (which stay infallible for rollback).
@@ -1391,6 +1425,7 @@ impl Clone for Store {
             last_commit: self.last_commit.clone(),
             tx_read_only: self.tx_read_only,
             tx_snapshot: self.tx_snapshot.clone(),
+            tx_schema: self.tx_schema.clone(),
             unique: self.unique.clone(),
             required: self.required.clone(),
             e_unique: self.e_unique.clone(),
@@ -4110,7 +4145,79 @@ impl Store {
     pub fn commit(&mut self) {
         self.undo = None;
         self.tx_snapshot = None; // the forward version/epoch bumps stand
+        self.tx_schema = None; // the schema declarations stand
         self.last_commit = self.changes.take().unwrap_or_default();
+    }
+
+    /// Capture the declarative schema the FIRST time a schema op runs inside a
+    /// transaction, so [`rollback`](Store::rollback) can revert it. A no-op outside a
+    /// transaction, or once already captured for the current one. Only names/config are
+    /// copied (see [`SchemaSnapshot`]); a data-only transaction never calls this.
+    pub fn snapshot_schema_for_tx(&mut self) {
+        if self.undo.is_none() || self.tx_schema.is_some() {
+            return;
+        }
+        self.tx_schema = Some(Box::new(SchemaSnapshot {
+            unique: self.unique.clone(),
+            required: self.required.clone(),
+            e_unique: self.e_unique.clone(),
+            e_required: self.e_required.clone(),
+            v_type: self.v_type.clone(),
+            e_type: self.e_type.clone(),
+            cardinality: self.cardinality.clone(),
+            validators: self.validators.clone(),
+            invariants: self.invariants.clone(),
+            index_paths: self.indexes.iter().map(|i| i.path.clone()).collect(),
+            interval_keys: self.interval_index_keys(),
+            edge_type_index: self.edge_type_index,
+        }));
+    }
+
+    /// Restore the declarative schema captured by [`snapshot_schema_for_tx`]: overwrite the
+    /// declarative registries, drop hash indexes created in the transaction (and rebuild any
+    /// dropped in it from the now-restored data), and revert the interval / edge-type index.
+    fn restore_schema(&mut self, snap: SchemaSnapshot) {
+        self.unique = snap.unique;
+        self.required = snap.required;
+        self.e_unique = snap.e_unique;
+        self.e_required = snap.e_required;
+        self.v_type = snap.v_type;
+        self.e_type = snap.e_type;
+        self.cardinality = snap.cardinality;
+        self.validators = snap.validators;
+        self.invariants = snap.invariants;
+
+        // Hash indexes: keep the ones that existed before the tx (their buckets are kept
+        // consistent by the data undos), drop the ones created in it, and rebuild any the
+        // tx dropped from the restored data.
+        self.indexes
+            .retain(|i| snap.index_paths.iter().any(|p| p == &i.path));
+        for path in &snap.index_paths {
+            if !self.indexes.iter().any(|i| &i.path == path) {
+                self.create_index(&path.join("."));
+            }
+        }
+
+        // Interval index: recreate/clear to match the snapshot; the caller rebuilds its
+        // data (the `interval.is_some()` rebuild below) after this returns.
+        if self.interval_index_keys() != snap.interval_keys {
+            match snap.interval_keys {
+                Some((lo, hi)) => self.create_interval_index(&lo, &hi),
+                None => self.interval = None,
+            }
+        }
+
+        // Edge-type index: rebuild it from the restored adjacency if the tx dropped it,
+        // or tear it down if the tx created it.
+        if self.edge_type_index != snap.edge_type_index {
+            if snap.edge_type_index {
+                self.create_edge_type_index();
+            } else {
+                self.edge_type_index = false;
+                self.out_type_idx = Vec::new();
+                self.in_type_idx = Vec::new();
+            }
+        }
     }
 
     /// Roll back every change since `begin`, in reverse, and close the
@@ -4123,6 +4230,12 @@ impl Store {
             for rec in log.into_iter().rev() {
                 self.apply_undo(rec);
             }
+        }
+        // Revert any schema op (index / constraint / validator / invariant) declared in the
+        // transaction, BEFORE the interval rebuild — so a tx-created interval index is
+        // cleared (skipping the rebuild) and a tx-dropped one is recreated (then rebuilt).
+        if let Some(snap) = self.tx_schema.take() {
+            self.restore_schema(*snap);
         }
         // The interval index depends on edge PROPS as well as adjacency, both of
         // which are restored by the undos above in an order that per-record index
@@ -4514,6 +4627,7 @@ impl Builder {
             last_commit: Vec::new(),
             tx_read_only: false,
             tx_snapshot: None,
+            tx_schema: None,
             unique: Vec::new(),
             required: Vec::new(),
             e_unique: Vec::new(),

@@ -1332,3 +1332,56 @@ fn rollback_restores_version_and_epoch_but_commit_advances_them() {
     assert!(st.version() > v0, "version advances after commit");
     assert!(st.epoch("k") > e0, "epoch advances after commit");
 }
+
+#[test]
+fn rollback_reverts_schema_created_in_a_transaction() {
+    // A schema op (index / constraint) declared inside a transaction must revert with the
+    // rest of the transaction — `apply_schema_op` captures the declarative schema on the
+    // first op (simulated here by calling `snapshot_schema_for_tx` directly).
+    let mut st = Builder::default().build();
+    st.add_node(&["N"], &[("k", n(1.0))]);
+
+    // Created-then-rolled-back → gone.
+    st.begin();
+    st.snapshot_schema_for_tx();
+    st.create_index("k");
+    st.create_unique_constraint("N", &["k"]).unwrap();
+    assert!(
+        st.hash_index_keys().contains(&"k".to_string()),
+        "index exists mid-tx"
+    );
+    assert_eq!(st.unique_constraints().len(), 1, "constraint exists mid-tx");
+    st.rollback();
+    assert!(
+        st.hash_index_keys().is_empty(),
+        "created index reverted on rollback"
+    );
+    assert!(
+        st.unique_constraints().is_empty(),
+        "created constraint reverted on rollback"
+    );
+
+    // Created-then-committed → stays.
+    st.begin();
+    st.snapshot_schema_for_tx();
+    st.create_index("k");
+    st.commit();
+    assert!(
+        st.hash_index_keys().contains(&"k".to_string()),
+        "committed index stays"
+    );
+
+    // A PRE-EXISTING index is untouched by a rolled-back tx that also declares new schema.
+    st.begin();
+    st.snapshot_schema_for_tx();
+    st.create_unique_constraint("N", &["k"]).unwrap();
+    st.rollback();
+    assert!(
+        st.hash_index_keys().contains(&"k".to_string()),
+        "pre-existing index survives"
+    );
+    assert!(
+        st.unique_constraints().is_empty(),
+        "tx-created constraint reverted"
+    );
+}
