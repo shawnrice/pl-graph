@@ -1113,6 +1113,49 @@ export const attachGraph = (backend: Backend, handle: GraphHandle): RustGraph =>
   // release is deferred to the run's completion (see runAlgoAsync's finally).
   let freeRequested = false;
 
+  // Host-side transaction depth. The native store is a single flat frame (its undo log
+  // asserts no nesting — a nested `begin` would panic ACROSS the FFI boundary and abort
+  // the process), so nesting is joined here: only the OUTERMOST begin/commit reaches the
+  // backend, matching the documented "flat, savepoint-less; the outermost frame owns
+  // commit/rollback" contract (and the pure-TS engine, which joins the same way).
+  let txDepth = 0;
+
+  const beginTx = (): void => {
+    if (txDepth === 0) {
+      backend.beginTransaction(live());
+    }
+
+    txDepth += 1;
+  };
+
+  const commitTx = (): void => {
+    if (txDepth === 0) {
+      throw new LenkeError('commit called with no open transaction', {
+        code: ErrorCode.InvalidGraphOp,
+      });
+    }
+
+    txDepth -= 1;
+
+    // An inner commit just joins the outer frame; only the outermost finalizes (which
+    // may throw a ConstraintViolation after the store rolls itself back).
+    if (txDepth === 0) {
+      backend.commitTransaction(live());
+    }
+  };
+
+  const rollbackTx = (): void => {
+    if (txDepth === 0) {
+      return; // no open frame — a no-op (also the tail of a nested rollback unwind)
+    }
+
+    // Flat frame: any rollback tears the WHOLE transaction down. Reset depth first so an
+    // enclosing frame's rollback (as an exception unwinds through nested `transaction()`
+    // wrappers) is the no-op above rather than a second backend call.
+    txDepth = 0;
+    backend.rollbackTransaction(live());
+  };
+
   const doFree = (): void => {
     if (state.freed) {
       return;
@@ -1209,31 +1252,31 @@ export const attachGraph = (backend: Backend, handle: GraphHandle): RustGraph =>
     lastWriteScope: (key) => backend.lastWriteScope(live(), key),
     edgeIndexes: () => backend.edgeIndexes(live()),
     dumpSchema: () => backend.dumpSchema(live()),
-    beginTransaction: () => backend.beginTransaction(live()),
-    commitTransaction: () => backend.commitTransaction(live()),
-    rollbackTransaction: () => backend.rollbackTransaction(live()),
+    beginTransaction: () => beginTx(),
+    commitTransaction: () => commitTx(),
+    rollbackTransaction: () => rollbackTx(),
     tx: () => {
-      backend.beginTransaction(live());
+      beginTx();
 
       return {
-        commit: () => backend.commitTransaction(live()),
-        rollback: () => backend.rollbackTransaction(live()),
+        commit: () => commitTx(),
+        rollback: () => rollbackTx(),
       };
     },
     transaction: <T>(fn: (graph: RustGraph) => T): T => {
-      backend.beginTransaction(live());
+      beginTx();
 
       let result: T;
 
       try {
         result = fn(graph);
       } catch (error) {
-        backend.rollbackTransaction(live());
+        rollbackTx();
 
         throw error;
       }
 
-      backend.commitTransaction(live()); // may throw ConstraintViolation after rolling back
+      commitTx(); // may throw ConstraintViolation after rolling back
 
       return result;
     },

@@ -98,6 +98,44 @@ suite('transactions differential: explicit transactions (TS vs native)', () => {
     ]);
   });
 
+  test('a nested transaction joins the outer frame (and never crashes native)', () => {
+    // Regression: the native host had no depth tracking, so a nested begin hit an
+    // `assert!` in the store that panicked ACROSS the FFI boundary and ABORTED the
+    // process. It now joins the outer frame like the TS engine — only the outermost
+    // begin/commit reaches the store.
+    differential(() => {}, [
+      {
+        label: 'nested commit keeps inner writes',
+        run: (e) =>
+          e.transaction(() => {
+            e.query(`INSERT (:Acct {id: 'a', bal: 1})`);
+            e.transaction(() => {
+              e.query(`INSERT (:Acct {id: 'b', bal: 2})`);
+            });
+          }),
+      },
+    ]);
+    differential(() => {}, [
+      {
+        label: 'outer rollback discards inner writes',
+        run: (e) => {
+          try {
+            e.transaction(() => {
+              e.query(`INSERT (:Acct {id: 'a', bal: 1})`);
+              e.transaction(() => {
+                e.query(`INSERT (:Acct {id: 'b', bal: 2})`);
+              });
+
+              throw new Error('boom');
+            });
+          } catch {
+            /* the whole frame rolls back */
+          }
+        },
+      },
+    ]);
+  });
+
   test('a transaction whose body throws rolls every statement back', () => {
     differential(() => {}, [
       {
