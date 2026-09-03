@@ -1300,3 +1300,35 @@ fn ndjson_ingest_rejects_malformed_names() {
     )
     .is_ok());
 }
+
+#[test]
+fn rollback_restores_version_and_epoch_but_commit_advances_them() {
+    // A rolled-back transaction is observed to have changed nothing, so the reactive
+    // counters (`version`, per-token `epoch`) must return to their pre-tx values — the
+    // undo replay re-touches every reverted cell and would otherwise leave them advanced,
+    // spuriously invalidating every subscriber. A COMMITTED tx still advances them.
+    let mut st = Builder::default().build();
+    let a = st.add_node(&["P"], &[("k", n(1.0))]);
+
+    let v0 = st.version();
+    let e0 = st.epoch("k");
+
+    // Rolled back → counters unchanged.
+    st.begin();
+    st.set_prop(a, "k", n(2.0));
+    assert!(st.version() > v0, "forward write advances version mid-tx");
+    st.rollback();
+    assert_eq!(st.version(), v0, "version restored after rollback");
+    assert_eq!(st.epoch("k"), e0, "epoch restored after rollback");
+    assert!(
+        crate::value::equals(&st.prop(a, "k"), &n(1.0)),
+        "value restored"
+    );
+
+    // Committed → counters advance.
+    st.begin();
+    st.set_prop(a, "k", n(3.0));
+    st.commit();
+    assert!(st.version() > v0, "version advances after commit");
+    assert!(st.epoch("k") > e0, "epoch advances after commit");
+}

@@ -1225,6 +1225,12 @@ pub struct Store {
     /// `START TRANSACTION READ ONLY`). A write statement consults it and is rejected;
     /// set on START, cleared on COMMIT/ROLLBACK. Meaningless outside a transaction.
     tx_read_only: bool,
+    /// `version` + `epochs` captured at `begin`, restored on `rollback`. The undo replay
+    /// re-`touch()`es every reverted cell, which would otherwise leave the reactive
+    /// change counters ADVANCED after a rolled-back transaction (spuriously invalidating
+    /// every subscriber even though nothing effectively changed). `Some` only inside a
+    /// transaction. Matches the pure-TS engine, which likewise leaves them untouched.
+    tx_snapshot: Option<(u64, FnvMap<String, u64>)>,
     /// declared unique constraints as `(label, keys)` — at most one live node per
     /// label may carry a given key tuple. Enforced by the write statements, not
     /// the store primitives (which stay infallible for rollback).
@@ -1384,6 +1390,7 @@ impl Clone for Store {
             changes: self.changes.clone(),
             last_commit: self.last_commit.clone(),
             tx_read_only: self.tx_read_only,
+            tx_snapshot: self.tx_snapshot.clone(),
             unique: self.unique.clone(),
             required: self.required.clone(),
             e_unique: self.e_unique.clone(),
@@ -4093,12 +4100,16 @@ impl Store {
         assert!(self.undo.is_none(), "nested transactions are not supported");
         self.undo = Some(Vec::new());
         self.changes = Some(Vec::new());
+        // Capture the reactive counters so a rollback can restore them: the undo replay
+        // re-touches every reverted cell, which would otherwise leave them advanced.
+        self.tx_snapshot = Some((self.version, self.epochs.clone()));
     }
 
     /// Commit: the changes stand, the undo log is discarded, and the transaction's
     /// change list becomes the observable `last_commit` (CDC).
     pub fn commit(&mut self) {
         self.undo = None;
+        self.tx_snapshot = None; // the forward version/epoch bumps stand
         self.last_commit = self.changes.take().unwrap_or_default();
     }
 
@@ -4120,6 +4131,13 @@ impl Store {
         // each undo record reindexes as it restores it.)
         if self.interval.is_some() {
             self.rebuild_interval();
+        }
+        // Restore the reactive counters to their pre-transaction values (LAST, so neither
+        // the undo replay nor the interval rebuild leaves them advanced) — a rolled-back
+        // transaction is observed to have changed nothing, so it must invalidate nothing.
+        if let Some((version, epochs)) = self.tx_snapshot.take() {
+            self.version = version;
+            self.epochs = epochs;
         }
     }
 
@@ -4495,6 +4513,7 @@ impl Builder {
             changes: None,
             last_commit: Vec::new(),
             tx_read_only: false,
+            tx_snapshot: None,
             unique: Vec::new(),
             required: Vec::new(),
             e_unique: Vec::new(),
