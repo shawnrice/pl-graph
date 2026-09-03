@@ -296,3 +296,57 @@ describe('rollback replays every op when an element is re-created mid-transactio
     });
   });
 });
+
+describe('schema ops roll back with the transaction', () => {
+  const seed = (): Graph => {
+    const g = new Graph();
+    g.addVertex({ id: 'a', labels: ['N'], properties: { k: 1 } });
+    g.addVertex({ id: 'b', labels: ['N'], properties: { k: 2 } });
+    return g;
+  };
+  const rolledBack = (g: Graph, fn: () => void): void => {
+    try {
+      g.transaction(() => {
+        fn();
+        throw new Error('abort');
+      });
+    } catch {
+      /* expected */
+    }
+  };
+
+  test('an index / constraint created in a transaction is reverted on rollback', () => {
+    const g = seed();
+    rolledBack(g, () => {
+      g.createIndex({ on: 'vertex', kind: 'hash', keys: ['k'] });
+      g.createUniqueConstraint('N', 'k');
+    });
+    expect(g.vertexIndexes()).toEqual([]);
+    expect(g.uniqueConstraints()).toEqual([]);
+  });
+
+  test('a schema op committed in a transaction persists', () => {
+    const g = seed();
+    g.transaction(() => g.createIndex({ on: 'vertex', kind: 'hash', keys: ['k'] }));
+    expect(g.vertexIndexes()).toEqual(['k']);
+  });
+
+  test('an index dropped in a transaction is restored on rollback', () => {
+    const g = seed();
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['k'] });
+    rolledBack(g, () => g.dropVertexIndex('k'));
+    expect(g.vertexIndexes()).toEqual(['k']);
+  });
+
+  test('a pre-existing index survives a rolled-back tx that also declares new schema', () => {
+    const g = seed();
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['k'] });
+    rolledBack(g, () => {
+      g.addVertex({ id: 'c', labels: ['N'], properties: { k: 3 } });
+      g.createUniqueConstraint('N', 'other');
+    });
+    expect(g.vertexIndexes()).toEqual(['k']); // pre-existing index intact
+    expect(g.uniqueConstraints()).toEqual([]); // tx-created constraint reverted
+    expect(g.vertexCount).toBe(2); // data write reverted
+  });
+});

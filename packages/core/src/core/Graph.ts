@@ -662,6 +662,13 @@ export class Graph {
   // ops, which must neither re-record undo nor re-run constraint checks.
   private txDepth = 0;
   private txUndo: Array<() => void> = [];
+  // The declarative schema captured the first time a schema op (createIndex / a
+  // constraint / validator / invariant) runs inside a transaction, restored if the
+  // transaction rolls back so the schema op reverts with the rest of it. Holds a throwaway
+  // graph carrying the pre-op registries (via `#copyRegistriesInto`) plus the indexed-key
+  // sets. `null` until a schema op runs in an open transaction — a data-only transaction
+  // never allocates it. Mirrors the native engine's `tx_schema` snapshot.
+  #txSchema: { registries: Graph; vIdx: Set<string>; eIdx: Set<string> } | null = null;
   // Savepoint marks — one per open frame: the `txUndo` / `txEvents` lengths when
   // that frame opened. An INNER frame's rollback replays only the ops recorded
   // since its own mark and hands control back to the enclosing frame, instead of
@@ -1093,6 +1100,89 @@ export class Graph {
     for (const [k, entry] of this.invariantRegistry) {
       next.invariantRegistry.set(k, entry);
     }
+  };
+
+  // Empty every schema registry `#copyRegistriesInto` fills — the pre-step of restoring a
+  // snapshot (which only ADDS entries, so the target must start empty). KEEP IN SYNC with
+  // `#copyRegistriesInto` above: a new registry there needs a `.clear()` here.
+  #clearRegistries = (): void => {
+    this.vertexUniqueConstraints.clear();
+    this.vertexRequiredConstraints.clear();
+    this.vertexTypeConstraints.clear();
+    this.vertexTypeNotNull.clear();
+    this.vertexRecordConstraints.clear();
+    this.edgeUniqueConstraints.clear();
+    this.edgeRequiredConstraints.clear();
+    this.edgeTypeConstraints.clear();
+    this.edgeTypeNotNull.clear();
+    this.edgeRecordConstraints.clear();
+    this.vertexCardinalityConstraints.clear();
+    this.validatorRegistry.clear();
+    this.invariantRegistry.clear();
+  };
+
+  // Capture the declarative schema the FIRST time a schema op runs inside a transaction so
+  // `#restoreSchemaSnapshot` can revert it. A no-op outside a transaction, once already
+  // captured, or while replaying undos. Only names/config are held (registries + indexed
+  // keys), never index bucket data — those are declarative and unaffected by data writes,
+  // so a lazy capture at the first schema op is exact; a pre-existing index's buckets are
+  // kept consistent across the rollback by the data undos.
+  #snapshotSchemaForTx = (): void => {
+    if (this.txDepth === 0 || this.applyingUndo || this.#txSchema !== null) {
+      return;
+    }
+
+    const registries = new Graph();
+
+    registries.disableEvents();
+    this.#copyRegistriesInto(registries);
+    this.#txSchema = {
+      registries,
+      vIdx: new Set(this.vertexPropertyIndex.indexedKeys()),
+      eIdx: new Set(this.edgePropertyIndex.indexedKeys()),
+    };
+  };
+
+  // Restore the schema captured by `#snapshotSchemaForTx`, dropping anything the (now
+  // rolled-back) transaction declared: replace the constraint registries with the snapshot,
+  // and reconcile the property indexes — drop those created in the transaction, rebuild any
+  // it dropped from the (already-restored) data. Called at the outermost rollback, AFTER the
+  // data undos, so a rebuild sees the restored graph.
+  #restoreSchemaSnapshot = (): void => {
+    const snap = this.#txSchema;
+
+    if (snap === null) {
+      return;
+    }
+
+    this.#txSchema = null;
+    this.#clearRegistries();
+    snap.registries.#copyRegistriesInto(this);
+
+    const reconcile = <E extends { properties: Record<string, unknown> }>(
+      index: PropertyIndex<E>,
+      want: Set<string>,
+      elems: Iterable<E>,
+    ): void => {
+      for (const key of index.indexedKeys()) {
+        if (!want.has(key)) {
+          index.dropIndex(key);
+        }
+      }
+
+      for (const key of want) {
+        if (!index.indexedKeys().includes(key)) {
+          index.createIndex(key);
+
+          for (const el of elems) {
+            index.addForKey(el, key, el.properties[key]);
+          }
+        }
+      }
+    };
+
+    reconcile(this.vertexPropertyIndex, snap.vIdx, this.verticesById.values());
+    reconcile(this.edgePropertyIndex, snap.eIdx, this.edgesById.values());
   };
 
   /**
@@ -1835,6 +1925,8 @@ export class Graph {
    * @example g.createIndex({ on: 'vertex', kind: 'hash', keys: ['email'] })
    */
   public createIndex = (spec: IndexSpec): void => {
+    this.#snapshotSchemaForTx();
+
     if (spec.kind === 'interval') {
       throw new LenkeError(
         'lenke: interval indexes are only available in the native engine (@lenke/native), not the pure-TS engine',
@@ -1860,6 +1952,8 @@ export class Graph {
   };
 
   public dropVertexIndex = (key: string): void => {
+    this.#snapshotSchemaForTx();
+
     // A unique constraint is index-backed; dropping its index would silently
     // downgrade enforcement (or lose it), so refuse — drop the constraint first.
     // (Byte-identical to the Rust core, which rejects the same.)
@@ -1876,6 +1970,8 @@ export class Graph {
   };
 
   public dropEdgeIndex = (key: string): void => {
+    this.#snapshotSchemaForTx();
+
     // See dropVertexIndex: an edge unique constraint is index-backed, so refuse.
     for (const keys of this.edgeUniqueConstraints.values()) {
       if (keys.has(key)) {
@@ -1963,6 +2059,8 @@ export class Graph {
    * index build).
    */
   public createUniqueConstraint = (label: string, key: string): void => {
+    this.#snapshotSchemaForTx();
+
     if (!this.vertexIndexes().includes(key)) {
       this.createIndex({ on: 'vertex', kind: 'hash', keys: [key] });
     }
@@ -2001,6 +2099,8 @@ export class Graph {
    * {@link dropVertexIndex} if unwanted). Idempotent.
    */
   public dropUniqueConstraint = (label: string, key: string): void => {
+    this.#snapshotSchemaForTx();
+
     const keys = this.vertexUniqueConstraints.get(label);
 
     if (keys) {
@@ -2047,6 +2147,8 @@ export class Graph {
    * meaningless.
    */
   public createRequiredConstraint = (label: string, key: string): void => {
+    this.#snapshotSchemaForTx();
+
     for (const vertex of this.getVerticesByLabel(label)) {
       if (!this.isPresent(vertex.properties[key])) {
         throw new LenkeError(
@@ -2068,6 +2170,8 @@ export class Graph {
 
   /** Drop a required constraint. Idempotent. */
   public dropRequiredConstraint = (label: string, key: string): void => {
+    this.#snapshotSchemaForTx();
+
     const keys = this.vertexRequiredConstraints.get(label);
 
     if (keys) {
@@ -2239,6 +2343,8 @@ export class Graph {
    * vertex with `label` holds a present, non-null `key` of a different type.
    */
   public createTypeConstraint = (label: string, key: string, type: string): void => {
+    this.#snapshotSchemaForTx();
+
     const parsed = parseTypeSpecWithNotNull(type);
 
     if (parsed === null) {
@@ -2310,6 +2416,8 @@ export class Graph {
   /** Drop a type constraint (scalar or record). Idempotent. Removes this
    *  constraint's `NOT NULL` (leaving any independent required constraint). */
   public dropTypeConstraint = (label: string, key: string): void => {
+    this.#snapshotSchemaForTx();
+
     for (const map of [
       this.vertexTypeConstraints,
       this.vertexRecordConstraints,
@@ -2572,6 +2680,8 @@ export class Graph {
    * the current data already violates it.
    */
   public createEdgeUniqueConstraint = (edgeType: string, key: string): void => {
+    this.#snapshotSchemaForTx();
+
     if (!this.edgeIndexes().includes(key)) {
       this.createIndex({ on: 'edge', kind: 'hash', keys: [key] });
     }
@@ -2607,6 +2717,8 @@ export class Graph {
 
   /** Drop an edge unique constraint. The backing index is left in place. Idempotent. */
   public dropEdgeUniqueConstraint = (edgeType: string, key: string): void => {
+    this.#snapshotSchemaForTx();
+
     const keys = this.edgeUniqueConstraints.get(edgeType);
 
     if (keys) {
@@ -2724,6 +2836,8 @@ export class Graph {
    * lacks a present, non-null `key`.
    */
   public createEdgeRequiredConstraint = (edgeType: string, key: string): void => {
+    this.#snapshotSchemaForTx();
+
     for (const edge of this.getEdgesByLabel(edgeType)) {
       if (!this.isPresent(edge.properties[key])) {
         throw new LenkeError(
@@ -2745,6 +2859,8 @@ export class Graph {
 
   /** Drop an edge required constraint. Idempotent. */
   public dropEdgeRequiredConstraint = (edgeType: string, key: string): void => {
+    this.#snapshotSchemaForTx();
+
     const keys = this.edgeRequiredConstraints.get(edgeType);
 
     if (keys) {
@@ -2853,6 +2969,8 @@ export class Graph {
    * holds a present, non-null `key` of a different type.
    */
   public createEdgeTypeConstraint = (edgeType: string, key: string, type: string): void => {
+    this.#snapshotSchemaForTx();
+
     const parsed = parseTypeSpecWithNotNull(type);
 
     if (parsed === null) {
@@ -2922,6 +3040,8 @@ export class Graph {
 
   /** Drop an edge type constraint (scalar or record). Idempotent. */
   public dropEdgeTypeConstraint = (edgeType: string, key: string): void => {
+    this.#snapshotSchemaForTx();
+
     for (const map of [
       this.edgeTypeConstraints,
       this.edgeRecordConstraints,
@@ -3077,6 +3197,8 @@ export class Graph {
     min: number,
     max: number | null,
   ): void => {
+    this.#snapshotSchemaForTx();
+
     for (const vertex of this.getVerticesByLabel(label)) {
       const degree =
         direction === 'out' ? this.outDegree(vertex, edgeType) : this.inDegree(vertex, edgeType);
@@ -3104,6 +3226,7 @@ export class Graph {
     edgeType: string,
     direction: 'out' | 'in',
   ): void => {
+    this.#snapshotSchemaForTx();
     this.vertexCardinalityConstraints.delete(this.cardKey(label, edgeType, direction));
   };
 
@@ -3248,6 +3371,8 @@ export class Graph {
     src: string,
     fn: ValidatorFn,
   ): void => {
+    this.#snapshotSchemaForTx();
+
     for (const element of [...this.getVerticesByLabel(label), ...this.getEdgesByLabel(label)]) {
       if (fn(element) === false) {
         throw new LenkeError(
@@ -3269,6 +3394,8 @@ export class Graph {
 
   /** Drop every validator declared on `label`. Idempotent. */
   public dropValidator = (label: string): void => {
+    this.#snapshotSchemaForTx();
+
     this.validatorRegistry.delete(label);
   };
 
@@ -3333,6 +3460,8 @@ export class Graph {
    * never parses the query itself.
    */
   public registerInvariant = (name: string, src: string, fn: InvariantFn): void => {
+    this.#snapshotSchemaForTx();
+
     if (this.invariantViolated(fn(this))) {
       throw new LenkeError(`existing data already violates the invariant '${name}' (${src})`, {
         code: ErrorCode.ConstraintViolation,
@@ -3344,6 +3473,8 @@ export class Graph {
 
   /** Drop the graph-level invariant named `name`. Idempotent. */
   public dropInvariant = (name: string): void => {
+    this.#snapshotSchemaForTx();
+
     this.invariantRegistry.delete(name);
   };
 
@@ -3507,6 +3638,7 @@ export class Graph {
     const events = this.txEvents;
     this.txUndo = [];
     this.txEvents = [];
+    this.#txSchema = null; // committed — the schema declarations stand
     this.txTouched.clear();
     this.txTouchedEdges.clear();
 
@@ -3562,6 +3694,9 @@ export class Graph {
   private applyUndoAndReset = (): void => {
     // Replay every inverse op newest-first; each reverses one forward write.
     this.undoTo(0);
+    // Revert any schema op declared in the transaction — AFTER the data undos, so a
+    // rebuilt index sees the restored graph. A no-op if no schema op ran.
+    this.#restoreSchemaSnapshot();
     this.txDepth = 0;
     this.txMarks = [];
     this.txUndo = [];
