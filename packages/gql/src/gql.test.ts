@@ -1150,13 +1150,15 @@ describe('GQL: IS LABELED predicate & ELEMENT_ID (ISO)', () => {
 });
 
 describe('GQL: ISO reserved words', () => {
-  test('a reserved word is rejected as a bare identifier', () => {
+  test('a reserved word is rejected in a BINDING position (but not as a property name)', () => {
     const g = createTestSocialGraph();
-    // variable, property key, alias, and label positions all reject reserved words.
+    // Binding positions — variable, alias, label — still reject a bare reserved word.
     expect(() => query(g, `MATCH (select) RETURN select`)).toThrow(/reserved word/);
-    expect(() => query(g, `MATCH (n:Person) RETURN n.value AS v`)).toThrow(/reserved word/);
     expect(() => query(g, `MATCH (n:Person) RETURN n AS count`)).toThrow();
     expect(() => query(g, `MATCH (n:Match) RETURN n`)).toThrow();
+    // A property NAME is NOT a binding position: a reserved word names a property fine
+    // (matches the native engine), returning null for an absent one rather than throwing.
+    expect(query(g, `MATCH (n:Person) RETURN n.value AS v LIMIT 1`)).toEqual([{ v: null }]);
   });
 
   test('a reserved word is allowed as a delimited identifier or a function name', () => {

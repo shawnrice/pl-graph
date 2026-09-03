@@ -614,6 +614,24 @@ export const parse = (
     return expect('ident', what).value;
   };
 
+  // A property / field name after `.` (`n.count`, `rec.year`, `n.date`). Unlike a bound
+  // variable (see `bindName`), a reserved word IS a valid property name here — the native
+  // engine accepts keywords as member names (like JS `obj.count`), so the two engines must
+  // agree. A keyword token holds its lowercased text in `value` but the original source
+  // case in `raw`; a property name is case-sensitive, so use `raw`. An ident (delimited or
+  // a reserved-but-not-structural one) already carries its source text in `value`.
+  const memberName = (): string => {
+    const tok = peek();
+
+    if (tok.type === 'keyword') {
+      advance();
+
+      return tok.raw ?? tok.value;
+    }
+
+    return expect('ident', 'a property name').value;
+  };
+
   // --- patterns --------------------------------------------------------------
 
   // Pattern property map `{ k: expr, ... }` and inline `WHERE pred` — the ISO
@@ -624,7 +642,9 @@ export const parse = (
 
     if (!check('rbrace')) {
       do {
-        const key = bindName('a property name');
+        // A reserved word is a valid property KEY too (`{count: 5}`, `{date: …}`) — same
+        // rule as dot-access, matching the native engine.
+        const key = memberName();
         expect('colon', "':'");
         props.push({ key, value: parseExpr() });
       } while (check('comma') && (advance(), true));
@@ -1709,7 +1729,7 @@ export const parse = (
           e = { kind: 'index', base: e, index: idx };
         } else if (!bareLiteral && check('dot')) {
           advance();
-          e = { kind: 'field', base: e, key: bindName('a property name') };
+          e = { kind: 'field', base: e, key: memberName() };
         } else {
           break;
         }
@@ -2168,7 +2188,7 @@ export const parse = (
       expect('lparen', "'(' after PROPERTY_EXISTS");
       const variable = bindName('an element variable');
       expect('comma', "',' in PROPERTY_EXISTS(n, key)");
-      const key = bindName('a property name');
+      const key = memberName();
       expect('rparen', "')' to close PROPERTY_EXISTS");
 
       return { kind: 'property_exists', variable, key };
@@ -2368,7 +2388,7 @@ export const parse = (
 
       if (check('dot')) {
         advance();
-        const key = bindName('a property name');
+        const key = memberName();
 
         return { kind: 'prop', variable: t.value, key };
       }
@@ -2623,7 +2643,7 @@ export const parse = (
     }
 
     expect('dot', "'.' or ':'");
-    const key = bindName('a property name');
+    const key = memberName();
     expect('eq', "'='");
 
     return { variable, key, value: parseExpr() };
@@ -2711,7 +2731,7 @@ export const parse = (
 
     expect('dot', "'.' or ':'");
 
-    return { variable, key: bindName('a property name') };
+    return { variable, key: memberName() };
   };
 
   const parseRemoveClause = (): RemoveClause => {

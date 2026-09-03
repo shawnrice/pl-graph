@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 
+import { Graph } from '@lenke/core';
 import { ErrorCode } from '@lenke/errors';
 
+import { query } from './index.js';
 import { GqlSyntaxError, quoteIdent } from './lexer.js';
 import { parse } from './parser.js';
 
@@ -67,12 +69,12 @@ describe('reserved words in binding positions', () => {
     expect(err.message).toContain('delimited identifier');
   });
 
-  test('a reserved word as a property key gets the improved message', () => {
-    const err = reject('MATCH (x { Order: 1 }) RETURN x');
-
-    expect(err.code).toBe(ErrorCode.Syntax);
-    expect(err.message).toContain('`Order`');
-    expect(err.message).toContain('delimited identifier');
+  test('a reserved word IS a valid property key in a pattern (matches native)', () => {
+    // Previously rejected with a backtick hint; a property name is not a binding
+    // position, so a reserved word names a property fine here — the native engine
+    // accepts it, and the two must agree. (Delimiting still works too.)
+    expect(() => parse('MATCH (x { Order: 1 }) RETURN x')).not.toThrow();
+    expect(() => parse('MATCH (x { `Order`: 1 }) RETURN x')).not.toThrow();
   });
 
   test('the aggregate-aliased-to-its-own-name case still fails, now helpfully', () => {
@@ -127,5 +129,32 @@ describe('quoteIdent', () => {
       const q = `MATCH (n:${quoteIdent(key)}) RETURN n`;
       expect(() => parse(q)).not.toThrow();
     }
+  });
+});
+
+describe('reserved words are valid PROPERTY names (match the native engine)', () => {
+  // Native accepts a keyword as a member name (like JS `obj.count`); the TS parser used
+  // to reject it as E_SYNTAX, an accept/reject divergence on very common names. A
+  // reserved word is now valid as a property key in every property-name position.
+  const names = ['count', 'date', 'value', 'size', 'year', 'month', 'order', 'group', 'start'];
+
+  test('parse: a reserved word names a property in dot-access, a map, SET, and PROPERTY_EXISTS', () => {
+    for (const w of names) {
+      expect(() => parse(`MATCH (n) RETURN n.${w} AS x`)).not.toThrow();
+      expect(() => parse(`MATCH (n) RETURN n.rec.${w} AS x`)).not.toThrow(); // chained field
+      expect(() => parse(`INSERT (:T {${w}: 1})`)).not.toThrow(); // map key
+      expect(() => parse(`MATCH (n) SET n.${w} = 1`)).not.toThrow(); // SET target
+      expect(() => parse(`MATCH (n) RETURN PROPERTY_EXISTS(n, ${w}) AS x`)).not.toThrow();
+    }
+  });
+
+  test('behavioral: a reserved-word property reads back its value, case-preserved', () => {
+    const g = new Graph();
+    g.addVertex({ id: 'a', labels: ['N'], properties: { count: 7, date: 'd', Year: 2020 } });
+    expect(query(g, 'MATCH (n:N) RETURN n.count AS c, n.date AS d')).toEqual([{ c: 7, d: 'd' }]);
+    // `Year` lexes as the keyword `year` but keeps its source case (`raw`), so it reads
+    // the `Year` property; lowercase `year` would read the (absent) `year` property.
+    expect(query(g, 'MATCH (n:N) RETURN n.Year AS y')).toEqual([{ y: 2020 }]);
+    expect(query(g, 'MATCH (n:N) RETURN n.year AS y')).toEqual([{ y: null }]);
   });
 });
