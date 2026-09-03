@@ -79,3 +79,23 @@ describe('unbounded var-length + DISTINCT: BFS reachability (no trail-budget fau
     expect(() => query(g, `MATCH (a)-[e:ROAD WHERE e.w > 5]->{1,4}(b) RETURN b`)).not.toThrow();
   });
 });
+
+describe('quantifier upper bound', () => {
+  // `{0,0}` = exactly zero hops → only the start node. Regression: the emit condition
+  // checked only the lower bound, so the unconditionally-generated first hop leaked
+  // through and `{0,0}` behaved like `{0,1}` (diverging from the native engine).
+  test('{0,0} matches exactly zero hops (the start node only)', () => {
+    const g = new Graph();
+    const a = g.addVertex({ id: 'a', labels: ['N'], properties: { name: 'a' } });
+    const b = g.addVertex({ id: 'b', labels: ['N'], properties: { name: 'b' } });
+    g.addEdge({ from: a, to: b, labels: ['R'], properties: {} });
+
+    expect(query(g, "MATCH (a:N {name:'a'})-[:R]->{0,0}(b) RETURN b.name AS n ORDER BY n")).toEqual(
+      [{ n: 'a' }],
+    );
+    // sanity: {0,1} still includes the 1-hop neighbour.
+    expect(query(g, "MATCH (a:N {name:'a'})-[:R]->{0,1}(b) RETURN b.name AS n ORDER BY n")).toEqual(
+      [{ n: 'a' }, { n: 'b' }],
+    );
+  });
+});

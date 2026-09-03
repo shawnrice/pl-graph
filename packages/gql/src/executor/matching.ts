@@ -1131,7 +1131,12 @@ export const resolve = (
     } else {
       const rep2 = top.rep + 1;
 
-      if (rep2 >= top.min) {
+      // Accept this completion only INSIDE the unit's bounds. The lower bound alone is
+      // not enough: the first hop's move is generated unconditionally, so a `{0,0}` (or
+      // any max=0) unit would otherwise emit a 1-rep completion (`1 >= 0`) even though
+      // its max forbids it. The `again` guard below already stops FURTHER reps, but the
+      // first over-max completion must be rejected here too.
+      if (rep2 >= top.min && (top.max === null || rep2 <= top.max)) {
         if (p.length === 1) {
           emit = true;
         } else {
