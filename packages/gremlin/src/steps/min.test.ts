@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import { run } from '../executor.js';
 import { createTestTinkerGraph } from '../fixtures/createTestTinkerGraph.js';
-import { V, both, inject, min, repeat, values } from '../steps.js';
+import { V, both, inject, max, min, repeat, values } from '../steps.js';
 import { traversal } from '../traversal.js';
 
 const arr = (r: Iterable<unknown>): unknown[] => [...r];
@@ -16,12 +16,10 @@ describe('Gremlin tests', () => {
       expect(arr(r)).toEqual([27]);
     });
 
-    test('min over strings faults — min()/max() are numeric-only', () => {
-      // TinkerPop orders any Comparable, but a mixed/string max is decided by an
-      // arbitrary type rank, so we keep min()/max() to numbers (like sum()/mean()).
-      expect(() => arr(run(traversal(V(), values('name'), min()), tinkerGraph))).toThrow(
-        /numeric values/,
-      );
+    test('min over strings uses the total order (like the native engine + TinkerPop)', () => {
+      // min()/max() order ANY comparable over the engine's total order — no longer
+      // numeric-only (that faulted on `values('name').min()`, diverging from native).
+      expect(arr(run(traversal(V(), values('name'), min()), tinkerGraph))).toEqual(['josh']);
     });
 
     // doc: g.V().repeat(both()).times(3).values('age').min() — 27
@@ -38,6 +36,15 @@ describe('Gremlin tests', () => {
     test('min takes null if that is all it got', () => {
       const r = run(traversal(inject(null, null, null, null), min()), tinkerGraph);
       expect(arr(r)).toEqual([null]);
+    });
+
+    test('min/max reduce over the total order — strings too, not just numbers', () => {
+      // Regression: an earlier numeric-only guard threw on `values('name').min()`,
+      // diverging from the native engine and TinkerPop (both order any comparable).
+      expect(arr(run(traversal(V(), values('name'), min()), tinkerGraph))).toEqual(['josh']);
+      expect(arr(run(traversal(V(), values('name'), max()), tinkerGraph))).toEqual(['vadas']);
+      expect(arr(run(traversal(V(), values('age'), min()), tinkerGraph))).toEqual([27]);
+      expect(arr(run(traversal(V(), values('age'), max()), tinkerGraph))).toEqual([35]);
     });
   });
 });

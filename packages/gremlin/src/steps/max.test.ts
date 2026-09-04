@@ -16,12 +16,10 @@ describe('Gremlin tests', () => {
       expect(arr(r)).toEqual([35]);
     });
 
-    test('max over strings faults — min()/max() are numeric-only', () => {
-      // TinkerPop orders any Comparable, but a mixed/string max is decided by an
-      // arbitrary type rank, so we keep min()/max() to numbers (like sum()/mean()).
-      expect(() => arr(run(traversal(V(), values('name'), max()), tinkerGraph))).toThrow(
-        /numeric values/,
-      );
+    test('max over strings uses the total order (like the native engine + TinkerPop)', () => {
+      // min()/max() order ANY comparable over the engine's total order — no longer
+      // numeric-only (that faulted on `values('name').max()`, diverging from native).
+      expect(arr(run(traversal(V(), values('name'), max()), tinkerGraph))).toEqual(['vadas']);
     });
 
     // doc: g.V().repeat(both()).times(3).values('age').max() — 35

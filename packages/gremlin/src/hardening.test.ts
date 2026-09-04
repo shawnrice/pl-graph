@@ -15,6 +15,7 @@ import {
   gt,
   inject,
   is,
+  max,
   min,
   order,
   regex,
@@ -140,9 +141,11 @@ describe('hardening G7-G9: comparison/order/aggregation reject incomparable type
     expect(arr(run(traversal(inject(3, 'a', 1), order()), new Graph()))).toEqual([1, 3, 'a']);
   });
 
-  test('min()/max() are NUMERIC-only — a non-numeric value faults (like sum/mean)', () => {
-    const e = thrown(() => arr(run(traversal(inject(3, 'a'), min()), new Graph())));
-    expect(hasErrorCode(e, ErrorCode.InvalidValue)).toBe(true);
+  test('min()/max() TOTAL-order any comparable (consistent with order(), like TinkerPop)', () => {
+    // Not numeric-only: min/max use the same total order as order() above — numbers
+    // before strings — so a mixed stream reduces deterministically instead of faulting.
+    expect(arr(run(traversal(inject(3, 'a'), min()), new Graph()))).toEqual([3]);
+    expect(arr(run(traversal(inject(3, 'a'), max()), new Graph()))).toEqual(['a']);
   });
 
   test('sum() of a non-numeric value throws', () => {

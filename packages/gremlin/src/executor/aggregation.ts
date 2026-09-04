@@ -52,16 +52,12 @@ export const aggregateNumber = function* (
   yield startTraverser(kind === 'sum' ? sum : sum / count);
 };
 
-// min()/max() are NUMERIC reductions (like sum()/mean()): a non-null NON-numeric value
-// is a data exception. TinkerPop orders any Comparable, but a mixed max is decided only by
-// an arbitrary type rank (a meaningless result), so we fault instead. NaN is a number and
-// passes (the total order keeps it — NaN greatest).
-const requireNumber = (v: unknown): void => {
-  if (typeof v !== 'number') {
-    throw new LenkeError('min()/max() require numeric values', { code: ErrorCode.InvalidValue });
-  }
-};
-
+// min()/max() reduce over the engine's TOTAL ORDER (the same one `order()` and the native
+// engine use — see the numeric/NaN comparison policy), so they work on ANY value, not just
+// numbers: strings compare lexicographically (`min` of names → the first alphabetically),
+// NaN sorts greatest, and a mixed stream is decided by the deterministic type rank. This
+// matches the native engine AND TinkerPop (which orders any Comparable); an earlier
+// numeric-only guard faulted on `values('name').min()`, diverging from both.
 export const aggregateComparable = function* (
   stream: Iterable<Traverser<unknown>>,
   kind: 'min' | 'max',
@@ -73,8 +69,6 @@ export const aggregateComparable = function* (
     if (t.value == null) {
       continue;
     }
-
-    requireNumber(t.value);
 
     if (!sawNonNull) {
       best = t.value;
@@ -154,8 +148,6 @@ const reduceComparable = (items: readonly unknown[], kind: 'min' | 'max'): unkno
     if (x == null) {
       continue;
     }
-
-    requireNumber(x);
 
     if (!saw) {
       best = x;
