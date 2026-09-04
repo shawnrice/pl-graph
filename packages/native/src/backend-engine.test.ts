@@ -100,6 +100,50 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
       be.graphFree(g);
     });
 
+    test('a prepared WRITE applies, not a silent no-op', async () => {
+      // Regression: prepared_run went straight to the read executor, so a prepared
+      // INSERT/SET returned [] and mutated nothing. It now routes through run_query.
+      const be = await make();
+      const g = be.graphFromNdjson(NDJSON);
+      const ins = be.prepare('INSERT (:Q {v: $x})');
+      be.preparedQueryRows(ins, g, '{"x": 7}');
+      expect(rows(be.queryRows(g, 'MATCH (q:Q) RETURN count(*) AS c')).rows).toEqual([[1]]);
+      expect(rows(be.queryRows(g, 'MATCH (q:Q) RETURN q.v AS v')).rows).toEqual([[7]]);
+      const upd = be.prepare('MATCH (q:Q) SET q.v = $y');
+      be.preparedQueryRows(upd, g, '{"y": 99}');
+      expect(rows(be.queryRows(g, 'MATCH (q:Q) RETURN q.v AS v')).rows).toEqual([[99]]);
+      be.preparedFree(ins);
+      be.preparedFree(upd);
+      be.graphFree(g);
+    });
+
+    test('auto-commit mergeNdjson enforces constraints (rejects + rolls back)', async () => {
+      // Regression: a bare mergeNdjson skipped the deferred constraint recheck an
+      // auto-commit INSERT runs, so a bulk append could load data violating a live
+      // constraint (two rows under one unique key). It is now a checked transaction.
+      const be = await make();
+      const g = be.graphFromNdjson(NDJSON); // alice, bob (distinct names)
+      be.createUniqueConstraint(g, 'P', 'name');
+      const before = rows(be.queryRows(g, 'MATCH (n:P) RETURN count(*) AS c')).rows[0][0] as number;
+      // Two nodes sharing a name violate UNIQUE(P.name) → the whole merge rolls back.
+      expect(() =>
+        be.mergeNdjson(
+          g,
+          enc.encode(
+            '{"id":"7","labels":["P"],"props":{"name":"zed"}}\n' +
+              '{"id":"8","labels":["P"],"props":{"name":"zed"}}\n',
+          ),
+        ),
+      ).toThrow();
+      expect(rows(be.queryRows(g, 'MATCH (n:P) RETURN count(*) AS c')).rows).toEqual([[before]]);
+      // A valid merge still applies.
+      be.mergeNdjson(g, enc.encode('{"id":"9","labels":["P"],"props":{"name":"quinn"}}\n'));
+      expect(rows(be.queryRows(g, 'MATCH (n:P) RETURN count(*) AS c')).rows).toEqual([
+        [before + 1],
+      ]);
+      be.graphFree(g);
+    });
+
     test('snapshot round-trips (ndjson + binary)', async () => {
       const be = await make();
       const g = be.graphFromNdjson(NDJSON);

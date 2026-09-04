@@ -917,7 +917,29 @@ pub unsafe extern "C" fn lnk_command(
                 crate::ffi_error::set("E_FFI", "merge requires an NDJSON payload as input");
                 return std::ptr::null_mut();
             };
-            match crate::ndjson::merge_ndjson(store, text) {
+            // A bare auto-commit merge must be a CHECKED transaction, exactly like an
+            // auto-commit INSERT: wrap it so the deferred declared-constraint checks run
+            // against the merged graph and a violation rolls the WHOLE merge back. Without
+            // this, a bulk append could smuggle in data that breaks a live constraint
+            // (e.g. two rows under one unique key) — a silent corruption, and it is also
+            // the snapshot-reload path. Inside a user transaction the checks run at THEIR
+            // commit, so we leave the frame open and don't nest a `begin`.
+            let outcome = if store.in_transaction() {
+                crate::ndjson::merge_ndjson(store, text)
+            } else {
+                store.begin();
+                match crate::ndjson::merge_ndjson(store, text) {
+                    // commit_with_deferred_checks rolls the whole merge back itself on a
+                    // constraint violation, then returns the error.
+                    Ok(report) => crate::exec::commit_with_deferred_checks(store).map(|()| report),
+                    // merge_ndjson faulted mid-way (bad payload) — the frame is still open.
+                    Err(e) => {
+                        store.rollback();
+                        Err(e)
+                    }
+                }
+            };
+            match outcome {
                 Ok(report) => {
                     let mut json = String::new();
                     json.push_str(&format!(
@@ -934,7 +956,14 @@ pub unsafe extern "C" fn lnk_command(
                     unsafe { out_string(json, out_len) }
                 }
                 Err(e) => {
-                    crate::ffi_error::set("E_INVALID_JSON", &e);
+                    // A coded error (a constraint violation from the deferred check, or an
+                    // element-name value error from ingest) routes to its wire code; a bare
+                    // staging error is a malformed-NDJSON payload.
+                    if e.split_once(": ").is_some_and(|(p, _)| p.starts_with("E_")) {
+                        set_exec_error(&e);
+                    } else {
+                        crate::ffi_error::set("E_INVALID_JSON", &e);
+                    }
                     std::ptr::null_mut()
                 }
             }
@@ -999,24 +1028,41 @@ pub unsafe extern "C" fn lnk_command(
             }
             let plan = crate::opt::optimize_indexed(plan, store);
             // JSON rows (default) or an Arrow carrier (raw ARW1 / IPC), so a prepared
-            // statement has the same output surface as `lnk_query`.
+            // statement has the same output surface as `lnk_query`. Route through the
+            // shared `run_query` dispatcher (NOT the read-only `try_run*` directly): it
+            // owns the write/read split + transaction/READ ONLY enforcement, so a prepared
+            // WRITE actually applies instead of silently no-op'ing as an empty read.
             match format.as_str() {
-                "arrow" | "arrow_ipc" => match guarded(|| crate::exec::try_run(&plan, store)) {
-                    Ok(rows) => {
-                        let bytes = if format == "arrow_ipc" {
+                "arrow" | "arrow_ipc" => {
+                    let ipc = format == "arrow_ipc";
+                    match guarded(|| -> Result<Vec<u8>, String> {
+                        let rows = match crate::exec::run_query(plan, store)? {
+                            crate::exec::Executed::Rows(rows) => rows,
+                            crate::exec::Executed::Read(plan) => {
+                                crate::exec::try_run(&plan, store)?
+                            }
+                        };
+
+                        Ok(if ipc {
                             crate::arrow::to_arrow_ipc(&rows, true)
                         } else {
                             crate::arrow::to_arrow(&rows)
-                        };
+                        })
+                    }) {
                         // SAFETY: out_len is writable per this fn's contract.
-                        unsafe { out_bytes(bytes, out_len) }
+                        Ok(bytes) => unsafe { out_bytes(bytes, out_len) },
+                        Err(e) => {
+                            set_exec_error(&e);
+                            std::ptr::null_mut()
+                        }
                     }
-                    Err(e) => {
-                        set_exec_error(&e);
-                        std::ptr::null_mut()
+                }
+                _ => match guarded(|| match crate::exec::run_query(plan, store)? {
+                    crate::exec::Executed::Rows(rows) => Ok(crate::json::gql_rows_json(&rows)),
+                    crate::exec::Executed::Read(plan) => {
+                        crate::exec::try_run_gql_json(&plan, store)
                     }
-                },
-                _ => match guarded(|| crate::exec::try_run_gql_json(&plan, store)) {
+                }) {
                     // SAFETY: out_len is writable per this fn's contract.
                     Ok(json) => unsafe { out_string(json, out_len) },
                     Err(e) => {
