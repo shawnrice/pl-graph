@@ -3056,9 +3056,10 @@ pub(super) fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         Expr::Call { args, .. } | Expr::GraphPred { args, .. } | Expr::List { items: args } => {
             args.iter().all(|a| refs_only_slot(a, s))
         }
-        Expr::Record { fields } | Expr::MapLit { entries: fields } => {
-            fields.iter().all(|(_, e)| refs_only_slot(e, s))
-        }
+        Expr::Record { fields }
+        | Expr::MapLit {
+            entries: fields, ..
+        } => fields.iter().all(|(_, e)| refs_only_slot(e, s)),
         Expr::Field { base, .. } => refs_only_slot(base, s),
         Expr::Index { base, index, .. } => refs_only_slot(base, s) && refs_only_slot(index, s),
         Expr::Case {
@@ -3141,11 +3142,15 @@ pub(super) fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
                 .map(|(k, e)| (k.clone(), remap_slot(e, from, to)))
                 .collect(),
         },
-        Expr::MapLit { entries } => Expr::MapLit {
+        Expr::MapLit {
+            entries,
+            omit_absent,
+        } => Expr::MapLit {
             entries: entries
                 .iter()
                 .map(|(k, e)| (k.clone(), remap_slot(e, from, to)))
                 .collect(),
+            omit_absent: *omit_absent,
         },
         Expr::Index { base, index, elem } => Expr::Index {
             base: go(base),

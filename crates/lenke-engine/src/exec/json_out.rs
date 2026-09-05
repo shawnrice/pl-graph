@@ -269,7 +269,14 @@ fn try_fused_maplit_json(plan: &Plan, store: &Store) -> Option<String> {
     let Plan::Project { input, items } = plan else {
         return None;
     };
-    let [(_, Expr::MapLit { entries })] = items.as_slice() else {
+    let [(
+        _,
+        Expr::MapLit {
+            entries,
+            omit_absent,
+        },
+    )] = items.as_slice()
+    else {
         return None;
     };
     if needs_lineage(plan) {
@@ -277,16 +284,31 @@ fn try_fused_maplit_json(plan: &Plan, store: &Store) -> Option<String> {
     }
     let batch = pull(input, store, false).ok()?;
     let cols = eval_all(entries.iter().map(|(_, e)| e), store, &batch).ok()?;
+    // Gremlin project(): drop a bare-property entry that is absent for the row (byte-
+    // identical to the `MapLit` evaluator arm, which uses the same `prop_present_mask`).
+    let present: Vec<Option<Vec<bool>>> = if *omit_absent {
+        entries
+            .iter()
+            .map(|(_, e)| prop_present_mask(e, store, &batch))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut out = String::from("[");
     for i in 0..batch.rows() {
         if i > 0 {
             out.push(',');
         }
         out.push('{');
+        let mut first = true;
         for (j, ((k, _), col)) in entries.iter().zip(&cols).enumerate() {
-            if j > 0 {
+            if *omit_absent && present[j].as_ref().is_some_and(|m| !m[i]) {
+                continue; // absent property → omit this key
+            }
+            if !first {
                 out.push(',');
             }
+            first = false;
             crate::json::write_string(&mut out, k);
             out.push(':');
             match col {

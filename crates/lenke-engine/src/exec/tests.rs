@@ -5477,20 +5477,23 @@ fn gql_order_by_desc_keeps_nulls_last() {
     );
 }
 
-/// Gremlin's `order()` places NULLs FIRST (the other language default) — the
-/// same shared OrderPage, driven by `SortKey.nulls_first`.
+/// Gremlin's `order()` places a stored PRESENT null FIRST (the other language default) —
+/// the same shared OrderPage, driven by `SortKey.nulls_first`. An ABSENT property, by
+/// contrast, FILTERS the traverser (TinkerPop: a by() yielding no value drops the row) —
+/// so a present-null and an absent value are NOT conflated.
 #[test]
-fn gremlin_order_keeps_nulls_first() {
+fn gremlin_order_present_null_first_absent_filtered() {
     let mut b = Builder::default();
     b.node(&["P"], &[("age", n(30.0)), ("name", s("a"))]);
     b.node(&["P"], &[("age", n(10.0)), ("name", s("b"))]);
-    b.node(&["P"], &[("name", s("c"))]); // no age → NULL
+    b.node(&["P"], &[("age", Value::Null), ("name", s("c"))]); // PRESENT null → kept, first
+    b.node(&["P"], &[("name", s("d"))]); // no age at all → ABSENT → filtered out
     let store = b.build();
     let out = run(
         &crate::gremlin::parse("g.V().hasLabel('P').order().by('age').values('name')").unwrap(),
         &store,
     );
-    // NULL-age node ('c') sorts FIRST, then 10 ('b'), 30 ('a').
+    // present-null ('c') sorts FIRST, then 10 ('b'), 30 ('a'); absent-age ('d') is dropped.
     assert_eq!(names_of(&out, 0), vec!["c", "b", "a"]);
 }
 

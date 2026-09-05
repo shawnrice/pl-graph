@@ -460,9 +460,10 @@ pub(super) fn needs_lineage(plan: &Plan) -> bool {
             Expr::Call { args, .. } | Expr::GraphPred { args, .. } | Expr::List { items: args } => {
                 args.iter().any(reads_path)
             }
-            Expr::Record { fields } | Expr::MapLit { entries: fields } => {
-                fields.iter().any(|(_, e)| reads_path(e))
-            }
+            Expr::Record { fields }
+            | Expr::MapLit {
+                entries: fields, ..
+            } => fields.iter().any(|(_, e)| reads_path(e)),
             Expr::Field { base, .. } => reads_path(base),
             Expr::Index { base, index, .. } => reads_path(base) || reads_path(index),
             Expr::Case {

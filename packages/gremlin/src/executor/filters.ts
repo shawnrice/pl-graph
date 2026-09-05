@@ -4,7 +4,7 @@ import { ErrorCode, LenkeError } from '@lenke/errors';
 import type { By, Plan, Predicate, Step } from '../ast.js';
 import { matches } from '../predicates.js';
 import { applyPlanToStream } from './dispatch.js';
-import { evalBy, hasAny, recallTag, type RunContext, type Traverser } from './runtime.js';
+import { byOr, evalBy, hasAny, recallTag, type RunContext, type Traverser } from './runtime.js';
 
 // `fail` throws as soon as the first traverser arrives. Useful as an
 // assertion: `traversal(V(), hasLabel('Person'), out('knows'), fail('expected no neighbors'))`.
@@ -67,8 +67,10 @@ export const whereCompareStep = function* (
       continue;
     }
 
-    const startValue = evalBy(startBy, start.value, graph, ctx);
-    const endValue = evalBy(endBy, end.value, graph, ctx);
+    // Coerce a no-value by() to `undefined` (this where-comparison keeps its prior
+    // behavior; only the keying steps opt into NO_VALUE filtering).
+    const startValue = byOr(evalBy(startBy, start.value, graph, ctx));
+    const endValue = byOr(evalBy(endBy, end.value, graph, ctx));
     // Substitute the resolved end-tag value in for the predicate's raw
     // label name. e.g. `gt('b')` becomes `gt(endValue)` at evaluation.
     const resolved = { ...pred, value: endValue } as Predicate;

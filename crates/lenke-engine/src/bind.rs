@@ -302,7 +302,10 @@ fn bind_expr(e: &mut Expr, params: &HashMap<&str, &Value>) -> Result<(), String>
                 bind_expr(a, params)?;
             }
         }
-        Expr::Record { fields } | Expr::MapLit { entries: fields } => {
+        Expr::Record { fields }
+        | Expr::MapLit {
+            entries: fields, ..
+        } => {
             for (_, v) in fields {
                 bind_expr(v, params)?;
             }

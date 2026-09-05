@@ -11,7 +11,7 @@ import type { Graph } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type { By, Step } from '../ast.js';
-import { evalBy, extend, recallTag, type RunContext, type Traverser } from './runtime.js';
+import { byOr, evalBy, extend, recallTag, type RunContext, type Traverser } from './runtime.js';
 
 const IDENT = /[A-Za-z_][A-Za-z0-9_]*/g;
 
@@ -130,7 +130,9 @@ export const mathStep = function* (
         base = r.value;
       }
 
-      return Number(evalBy(byFor(name), base, graph, ctx));
+      // A no-value by() coerces to `undefined` → NaN (unchanged from before NO_VALUE;
+      // `Number(NO_VALUE)` would otherwise throw on the symbol).
+      return Number(byOr(evalBy(byFor(name), base, graph, ctx)));
     };
 
     yield extend(t, evalMath(step.expr, resolve));

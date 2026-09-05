@@ -7441,8 +7441,9 @@ fn p6_group_name_keyed_by_age() {
 }
 
 #[test]
-fn p6_group_by_lang_missing_key_bucket() {
-    // V().group().by(lang).by(name): software → 'java'; persons lack lang → Null key.
+fn p6_group_by_lang_missing_key_absent_filtered() {
+    // V().group().by(lang).by(name): software → 'java'. Persons lack `lang`, so a by()
+    // yielding no value FILTERS them out (TinkerPop) — there is NO Null-key bucket.
     let out = q_eids(g().V().group().by("lang").by("name"));
     let m = as_map(&out[0]);
     assert_eq!(
@@ -7454,12 +7455,8 @@ fn p6_group_by_lang_missing_key_bucket() {
     );
     assert_eq!(
         map_get_gval(m, &GVal::Null),
-        Some(&GVal::list(vec![
-            GVal::Str("marko".into()),
-            GVal::Str("vadas".into()),
-            GVal::Str("josh".into()),
-            GVal::Str("peter".into()),
-        ]))
+        None,
+        "no null bucket for absent lang"
     );
 }
 

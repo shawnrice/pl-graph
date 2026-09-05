@@ -338,6 +338,68 @@ fn fused_map_json_matches_value_tree_bytes() {
     }
 }
 
+/// A keying `by('k')` (group/groupCount/order/dedup/select) over an ABSENT property
+/// FILTERS the traverser (TinkerPop semantics — no null bucket), while a stored PRESENT
+/// null is a value and is KEPT; `project('k').by(absent)` OMITS the key (keeps the row).
+#[test]
+fn by_absent_property_filters_present_null_kept() {
+    let nd = [
+        r#"{"id":"1","labels":["P"],"props":{"name":"a","age":29}}"#,
+        r#"{"id":"2","labels":["P"],"props":{"name":"b","age":31}}"#,
+        // no `age` at all — absent → filtered by a keying by()
+        r#"{"id":"3","labels":["S"],"props":{"name":"c"}}"#,
+        // a stored PRESENT null — a value, kept under a null key
+        r#"{"id":"4","labels":["P"],"props":{"name":"d","age":null}}"#,
+    ]
+    .join("\n");
+    let st = crate::ndjson::from_ndjson(&nd).unwrap();
+    let json = |q: &str| {
+        let plan = crate::opt::optimize_indexed(super::parse(q).unwrap(), &st);
+        crate::exec::run_gremlin_json(&plan, &st)
+    };
+
+    // order().by('age'): the no-`age` vertex `c` drops; `d` (present null) stays.
+    let ordered = json("g.V().order().by('age').values('name')");
+    assert!(
+        !ordered.contains("\"c\""),
+        "absent-age vertex must be filtered: {ordered}"
+    );
+    assert!(
+        ordered.contains("\"d\""),
+        "present-null vertex must be kept: {ordered}"
+    );
+    assert!(ordered.contains("\"a\"") && ordered.contains("\"b\""));
+
+    // groupCount().by('age'): buckets for 29, 31, and a null (for `d`) — but NOT for `c`.
+    let gc = json("g.V().groupCount().by('age')");
+    assert!(
+        gc.contains("\"29\":1") && gc.contains("\"31\":1"),
+        "age buckets: {gc}"
+    );
+    assert!(
+        gc.contains("\"null\":1"),
+        "present-null keeps its own bucket: {gc}"
+    );
+
+    // dedup().by('age'): the absent-age vertex is filtered, not deduped under one key.
+    let dd = json("g.V().dedup().by('age').values('name')");
+    assert!(
+        !dd.contains("\"c\""),
+        "absent-age vertex must be filtered from dedup: {dd}"
+    );
+
+    // project('x').by('age'): absent → `{}` (key omitted, row kept); present-null → {x:null}.
+    let pj = json("g.V().project('x').by('age')");
+    assert!(
+        pj.contains("{}"),
+        "absent-age row must be an empty map: {pj}"
+    );
+    assert!(
+        pj.contains("\"x\":null"),
+        "present-null must appear as x:null: {pj}"
+    );
+}
+
 /// `valueMap(true)` (TinkerPop's includeTokens overload) prepends id + label to the
 /// property map — like `elementMap()` but WITHOUT an edge's IN/OUT submaps. A key
 /// filter still keeps the tokens; plain `valueMap()` stays properties-only.

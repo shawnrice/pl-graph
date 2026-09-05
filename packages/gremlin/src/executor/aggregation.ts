@@ -7,6 +7,7 @@ import {
   evalBy,
   extend,
   isSliceable,
+  NO_VALUE,
   type RunContext,
   startTraverser,
   type Traverser,
@@ -169,13 +170,13 @@ const reduceComparable = (items: readonly unknown[], kind: 'min' | 'max'): unkno
 // key, rest = tie-breakers, in order). Per-by direction prefers the By's
 // `direction`; falls back to the step-level `desc` (legacy `order({desc})` form).
 const sortByBys = <T>(
-  items: T[],
+  items: readonly T[],
   project: (item: T) => unknown,
   bys: readonly By[],
   desc: boolean,
   graph: Graph,
   ctx: RunContext,
-): void => {
+): T[] => {
   const dirs = bys.map((by) => by.direction ?? (desc ? 'desc' : 'asc'));
   const keyed = items.map((item) => ({
     item,
@@ -194,7 +195,12 @@ const sortByBys = <T>(
     );
   }
 
-  keyed.sort((a, b) => {
+  // TinkerPop: a `by()` that yields no value FILTERS the item out of the ordering
+  // (e.g. `order().by('age')` drops elements lacking `age`), so a NO_VALUE key never
+  // reaches the comparator. A stored `null` is a value and orders normally.
+  const live = keyed.filter((k) => !k.keys.some((key) => key === NO_VALUE));
+
+  live.sort((a, b) => {
     for (let i = 0; i < bys.length; i++) {
       const c = compareTotal(a.keys[i], b.keys[i]) * (dirs[i] === 'desc' ? -1 : 1);
 
@@ -206,9 +212,7 @@ const sortByBys = <T>(
     return 0;
   });
 
-  for (let i = 0; i < items.length; i++) {
-    items[i] = keyed[i].item;
-  }
+  return live.map((k) => k.item);
 };
 
 // `order` (global scope) materializes the stream, sorts the traversers by their
@@ -220,10 +224,7 @@ export const orderStep = function* (
   graph: Graph,
   ctx: RunContext,
 ): Iterable<Traverser<unknown>> {
-  const items = [...stream];
-  sortByBys(items, (t) => t.value, bys, desc, graph, ctx);
-
-  yield* items;
+  yield* sortByBys([...stream], (t) => t.value, bys, desc, graph, ctx);
 };
 
 // `order(Scope.local)` sorts WITHIN each traverser's value instead of across the
@@ -254,10 +255,13 @@ export const orderLocalStep = function* (
 
     if (v instanceof Map) {
       const dirs = bys.map((by) => by.direction ?? (desc ? 'desc' : 'asc'));
-      const keyed = [...v.entries()].map((entry) => ({
-        entry,
-        keys: bys.map((by) => entryKey(by, entry)),
-      }));
+      const keyed = [...v.entries()]
+        .map((entry) => ({
+          entry,
+          keys: bys.map((by) => entryKey(by, entry)),
+        }))
+        // A by() yielding no value on an entry filters that entry out (as in global order()).
+        .filter((k) => !k.keys.some((key) => key === NO_VALUE));
 
       keyed.sort((a, b) => {
         for (let i = 0; i < bys.length; i++) {
@@ -273,10 +277,10 @@ export const orderLocalStep = function* (
 
       yield extend(t, new Map(keyed.map((k) => k.entry)));
     } else if (isSliceable(v)) {
-      const items = [...v];
-      sortByBys(items, (x) => x, bys, desc, graph, ctx);
-
-      yield extend(t, items);
+      yield extend(
+        t,
+        sortByBys([...v], (x) => x, bys, desc, graph, ctx),
+      );
     } else {
       yield t;
     }

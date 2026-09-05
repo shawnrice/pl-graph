@@ -8,7 +8,7 @@ import type { Graph } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type { By, SackOp } from '../ast.js';
-import { evalBy } from './runtime.js';
+import { byOr, evalBy } from './runtime.js';
 import { extend, type RunContext, type Traverser } from './runtime.js';
 
 export const withSackStep = function* (
@@ -75,7 +75,8 @@ export const sackStep = function* (
       yield extend(t, current);
     } else {
       // `sack(op).by(proj)` write — update the sack, pass the traverser through.
-      const projected = by ? evalBy(by, t.value, graph, ctx) : t.value;
+      // A no-value by() coerces to `undefined` (unchanged from before NO_VALUE).
+      const projected = by ? byOr(evalBy(by, t.value, graph, ctx)) : t.value;
 
       yield { ...t, sack: applySackOp(op, current, projected) };
     }

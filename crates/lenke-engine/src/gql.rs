@@ -100,7 +100,7 @@ fn check_bool_ctx(e: &Expr, bool_ctx: bool) -> Result<(), String> {
                 check_bool_ctx(v, false)?;
             }
         }
-        Expr::MapLit { entries } => {
+        Expr::MapLit { entries, .. } => {
             for (_, v) in entries {
                 check_bool_ctx(v, false)?;
             }

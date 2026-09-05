@@ -4317,6 +4317,36 @@ fn eval_all<'a>(
     exprs.into_iter().map(|e| eval(e, store, batch)).collect()
 }
 
+/// Per-row presence mask for a Gremlin `project()` map entry under `omit_absent`.
+/// `Some(mask)` when the entry's value is a bare property projection (`Expr::Prop`) over
+/// an element frontier — `mask[i]` is false where that row's element lacks the property
+/// (an OPTIONAL `u32::MAX` sentinel counts as absent). `None` means "always keep" (a
+/// non-property entry, or a non-element frontier where a Prop read is not an absence
+/// test) — matching the TS engine, which omits a project key only when `by()` yields no
+/// value. Shared by the `MapLit` evaluator arm and the fused project JSON fast path so
+/// the two stay byte-identical.
+fn prop_present_mask(e: &Expr, store: &Store, batch: &Batch) -> Option<Vec<bool>> {
+    let Expr::Prop { slot, key } = e else {
+        return None;
+    };
+    if *slot >= batch.slots.len() {
+        return Some(vec![false; batch.rows()]);
+    }
+    match batch.slot(*slot) {
+        Col::Nodes(ids) => Some(
+            ids.iter()
+                .map(|&id| id != u32::MAX && store.has_prop(id, key))
+                .collect(),
+        ),
+        Col::Edges(eids) => Some(
+            eids.iter()
+                .map(|&eid| eid != u32::MAX && store.has_edge_prop(eid, key))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 mod scalar;
 pub(crate) use self::scalar::temporal_ctor;
 use self::scalar::*;

@@ -500,6 +500,31 @@ enum GroupBy {
     Reduce(AggFn, Option<Expr>),
 }
 
+/// TinkerPop: a keying `by()` (group/groupCount/order/dedup/select) that yields NO
+/// VALUE — an absent property — FILTERS the traverser rather than keying it under a
+/// null bucket. For each by-key that lowered to a bare property projection
+/// (`Expr::Prop`), build a `PROPERTY_EXISTS` gate (the one predicate separating absent
+/// from a stored null); AND several together. A non-`Prop` key (the element itself, an
+/// id/label token, a computed expr) always yields a value → no gate. `None` = no gate
+/// needed. The caller `plan.filter(...)`s the result before the keying operator.
+fn key_present_gate(key_exprs: &[&Expr]) -> Option<Expr> {
+    let mut gate: Option<Expr> = None;
+    for e in key_exprs {
+        if let Expr::Prop { slot, key } = e {
+            let g = Expr::PropertyExists {
+                slot: *slot,
+                key: key.clone(),
+            };
+            gate = Some(match gate {
+                Some(acc) => Expr::And(Box::new(acc), Box::new(g)),
+                None => g,
+            });
+        }
+    }
+
+    gate
+}
+
 /// Shift every slot reference `>= threshold` up by one — used when a correlated
 /// subquery body gets a provenance column inserted at `threshold`, pushing the body's
 /// own appended slots up. Recurses through the common scalar Expr shapes.
@@ -939,6 +964,16 @@ impl Parser {
     /// leaves it AT the closing `)`): a property, a direction on the current value, an
     /// id/label/T token, or a degree sub-traversal `[__.]<hop>('L').count()`, each with
     /// an optional trailing `, asc|desc`. Returns `(sort_expr, descending)`.
+    /// Whether a keying `by('k')` (group/groupCount/order/dedup/select) should install the
+    /// absent-property filter (a no-value `by()` drops the traverser, per TinkerPop). TRUE
+    /// on an ELEMENT or UNKNOWN frontier (e.g. after `unfold()`), where `by('k')` reads an
+    /// element property and PROPERTY_EXISTS is the right absence test. FALSE on a MAP frontier
+    /// (a `project()`/`group()` row — `by('k')` is a field read) or a definite SCALAR frontier
+    /// (a Prop read there is not an element-property presence test), leaving those unchanged.
+    fn by_absent_gates(&self) -> bool {
+        !self.current_is_map && !self.current_is_scalar
+    }
+
     fn order_by_body(&mut self, current: usize) -> Result<(Expr, bool), String> {
         // Empty by() → the current value, ascending.
         if self.peek() == Some(&Tok::RParen) {
@@ -3578,6 +3613,7 @@ impl Parser {
                 // Optional `.by('k'|id|label)` modulators: dedup by the TUPLE of those
                 // by-values of the element (keep the first per distinct tuple).
                 let mut by_slots: Vec<usize> = Vec::new();
+                let mut by_exprs: Vec<Expr> = Vec::new();
                 let mut p = plan;
                 while self.peek() == Some(&Tok::Dot)
                     && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
@@ -3587,12 +3623,24 @@ impl Parser {
                     self.expect(&Tok::LParen)?;
                     let (_, e) = self.by_key_expr(self.current)?;
                     self.expect(&Tok::RParen)?;
+                    by_exprs.push(e.clone());
                     let w = self.slots;
                     p = p.map_slot(w, e, true);
                     self.slots += 1;
                     by_slots.push(w);
                 }
                 if !by_slots.is_empty() {
+                    // TinkerPop: a `by('k')` that yields no value (absent property) FILTERS
+                    // the traverser — dedup().by('age') drops elements without `age` rather
+                    // than deduping them under one null key. Gate BEFORE the distinct, and
+                    // only on an element/unknown frontier (a Map/scalar `by('k')` is a field read).
+                    if self.by_absent_gates() {
+                        let refs: Vec<&Expr> = by_exprs.iter().collect();
+                        if let Some(g) = key_present_gate(&refs) {
+                            p = p.filter(g);
+                        }
+                    }
+
                     return Ok(p.distinct_by(by_slots));
                 }
                 let plan = p;
@@ -3848,9 +3896,24 @@ impl Parser {
                                 .into(),
                         );
                     }
+                    // TinkerPop: a `by('k')` sort key that yields no value (absent property)
+                    // FILTERS the traverser out of the ordering (order().by('age') drops
+                    // elements without `age`) — gate on PROPERTY_EXISTS for each property key.
+                    // Element frontier only: a `by('k')` over a Map/scalar row (e.g.
+                    // `project(...).order().by('k')`) is a field read, not an element property.
+                    let key_refs: Vec<&Expr> = keys.iter().map(|k| &k.expr).collect();
+                    let gate = if self.by_absent_gates() {
+                        key_present_gate(&key_refs)
+                    } else {
+                        None
+                    };
+                    let gated = match gate {
+                        Some(g) => plan.filter(g),
+                        None => plan,
+                    };
                     // Gremlin: `order()` over raw elements faults (the runtime backstop for a
                     // mixed/branch frontier the build-time check above cannot classify).
-                    plan.order_page_strict(keys, None, None)
+                    gated.order_page_strict(keys, None, None)
                 }
             }
             "as" => {
@@ -4107,7 +4170,13 @@ impl Parser {
                     } else {
                         self.current_is_map = true; // multi-label select yields a Map
                         let entries = labels.iter().map(|l| (l.clone(), field_of(l))).collect();
-                        plan.project(vec![("select".into(), Expr::MapLit { entries })])
+                        plan.project(vec![(
+                            "select".into(),
+                            Expr::MapLit {
+                                entries,
+                                omit_absent: false,
+                            },
+                        )])
                     };
                     self.current = 0;
                     self.slots = 1;
@@ -4121,7 +4190,20 @@ impl Parser {
                     let items = slots.into_iter().map(Expr::Slot).collect();
                     plan.project(vec![(labels[0].clone(), Expr::List { items })])
                 } else if labels.len() == 1 {
-                    plan.project(vec![(labels[0].clone(), val_of(0, &labels[0])?)])
+                    // TinkerPop: a `by('k')` that yields no value (absent property) FILTERS
+                    // the traverser — `select('a').by('age')` drops a selected element with
+                    // no `age`. Gate on PROPERTY_EXISTS before projecting.
+                    let v = val_of(0, &labels[0])?;
+                    let gate = if self.by_absent_gates() {
+                        key_present_gate(&[&v])
+                    } else {
+                        None
+                    };
+                    let gated = match gate {
+                        Some(g) => plan.filter(g),
+                        None => plan,
+                    };
+                    gated.project(vec![(labels[0].clone(), v)])
                 } else {
                     self.current_is_map = true; // multi-label select yields a Map
                     let entries = labels
@@ -4129,7 +4211,24 @@ impl Parser {
                         .enumerate()
                         .map(|(i, l)| Ok((l.clone(), val_of(i, l)?)))
                         .collect::<Result<Vec<_>, String>>()?;
-                    plan.project(vec![("select".into(), Expr::MapLit { entries })])
+                    // A no-value by() on ANY selected label filters the whole traverser.
+                    let refs: Vec<&Expr> = entries.iter().map(|(_, e)| e).collect();
+                    let gate = if self.by_absent_gates() {
+                        key_present_gate(&refs)
+                    } else {
+                        None
+                    };
+                    let gated = match gate {
+                        Some(g) => plan.filter(g),
+                        None => plan,
+                    };
+                    gated.project(vec![(
+                        "select".into(),
+                        Expr::MapLit {
+                            entries,
+                            omit_absent: false,
+                        },
+                    )])
                 };
                 self.current = 0;
                 self.slots = 1;
@@ -4166,7 +4265,13 @@ impl Parser {
                         (k.clone(), v)
                     })
                     .collect();
-                let p = plan.project(vec![("project".into(), Expr::MapLit { entries })]);
+                let p = plan.project(vec![(
+                    "project".into(),
+                    Expr::MapLit {
+                        entries,
+                        omit_absent: true,
+                    },
+                )]);
                 self.current = 0;
                 self.slots = 1;
                 self.current_is_map = true;
@@ -4188,7 +4293,18 @@ impl Parser {
                 } else {
                     ("key".to_string(), Expr::Slot(self.current))
                 };
-                let p = plan
+                // An absent-property key-by filters the traverser out (no null bucket) —
+                // element frontier only (a Map/scalar `by('k')` is a field read).
+                let gate = if self.by_absent_gates() {
+                    key_present_gate(&[&key_expr.1])
+                } else {
+                    None
+                };
+                let gated = match gate {
+                    Some(g) => plan.filter(g),
+                    None => plan,
+                };
+                let p = gated
                     .aggregate(
                         vec![key_expr],
                         vec![Agg {
@@ -4433,7 +4549,20 @@ impl Parser {
                         numeric_only: false,
                     },
                 };
-                let p = plan
+                // A `by('k')` key that yields no value (absent property) filters the
+                // traverser out of the grouping (no null bucket), matching TinkerPop. Only
+                // on an ELEMENT frontier — a `by('k')` over a Map/scalar row is a field
+                // read (PROPERTY_EXISTS does not apply there), so leave it ungated.
+                let gate = if self.by_absent_gates() {
+                    key_present_gate(&[&key_expr.1])
+                } else {
+                    None
+                };
+                let gated = match gate {
+                    Some(g) => plan.filter(g),
+                    None => plan,
+                };
+                let p = gated
                     .aggregate(vec![key_expr], vec![value_agg])
                     .group_to_map();
                 self.current = 0;

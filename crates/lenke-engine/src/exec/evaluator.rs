@@ -1222,19 +1222,37 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                     .collect(),
             )
         }
-        Expr::MapLit { entries } => {
+        Expr::MapLit {
+            entries,
+            omit_absent,
+        } => {
             // Per row, an insertion-ordered Value::Map with string keys. A VERTEX/EDGE
             // value renders as its element map (via render_cell), not a raw dense id, so
             // a project()/select() map of elements canonicalizes like a top-level one.
             let cols = eval_all(entries.iter().map(|(_, e)| e), store, batch)?;
             let n = batch.rows();
+            // Gremlin project(): a bare-property entry that is ABSENT for a row is DROPPED
+            // from that row's map (`project('a').by('age')` → `{}`, not `{a:null}`). A
+            // present null is kept; non-property entries are always kept. `None` = keep-all.
+            let present: Vec<Option<Vec<bool>>> = if *omit_absent {
+                entries
+                    .iter()
+                    .map(|(_, e)| prop_present_mask(e, store, batch))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             Col::Gen(
                 (0..n)
                     .map(|i| {
                         let pairs = entries
                             .iter()
                             .zip(&cols)
-                            .map(|((k, _), c)| {
+                            .enumerate()
+                            .filter(|(j, _)| {
+                                !*omit_absent || present[*j].as_ref().is_none_or(|m| m[i])
+                            })
+                            .map(|(_, ((k, _), c))| {
                                 (Value::Str(GStr::from(k.as_str())), render_cell(c, i, store))
                             })
                             .collect();

@@ -333,8 +333,11 @@ const emitStep = (step: Step): string => {
       return `is(${emitPredicate(step.pred)})`;
     case 'values':
       return `values(${step.keys.map(emitLiteral).join(', ')})`;
-    case 'dedupe':
-      return `dedup(${(step.labels ?? []).map(emitLiteral).join(', ')})`;
+    case 'dedupe': {
+      const bys = (step.bys ?? []).map(emitBy).join('');
+
+      return `dedup(${(step.labels ?? []).map(emitLiteral).join(', ')})${bys}`;
+    }
     case 'constant':
       return `constant(${emitLiteral(step.value)})`;
     case 'property': {

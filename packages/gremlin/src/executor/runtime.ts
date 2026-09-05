@@ -391,27 +391,47 @@ export const projectToken = (token: 'id' | 'label' | 'key' | 'value', value: unk
   return undefined;
 };
 
+/**
+ * Sentinel returned by {@link evalBy} when a `by()` projection yields NO VALUE — an
+ * ABSENT property (the element / map / row has no such key) or a sub-traversal that
+ * emitted nothing. TinkerPop treats this as a FILTER for the keying steps
+ * (order/group/groupCount/dedup/select) and as an OMITTED key for `project()`. It is
+ * DISTINCT from a stored `null` (a present value, which is kept). Consumers that do
+ * not filter coerce it back with {@link byOr} so their behavior is unchanged.
+ */
+export const NO_VALUE: unique symbol = Symbol('lenke.gremlin.noValue');
+
+/** Coerce a possibly-`NO_VALUE` `evalBy` result to `fallback` (default `undefined`) —
+ * for the consumers that keep the traverser rather than filtering on an absent `by()`. */
+export const byOr = (v: unknown, fallback?: unknown): unknown => (v === NO_VALUE ? fallback : v);
+
 // Evaluate a `By` modulator against a single value. The traversal form runs
 // the sub-plan with `value` as the starting traverser and projects to its
-// first emitted result (or `undefined` if empty).
+// first emitted result. A projection that yields nothing — an absent property or an
+// empty sub-traversal — returns {@link NO_VALUE} (a stored `null` is a value, kept).
 export const evalBy = (by: By, value: unknown, graph: Graph, ctx: RunContext): unknown => {
   switch (by.kind) {
     case 'identity':
       return value;
     case 'key':
+      // `hasOwn`, not `k in props`: an absent key is NO_VALUE (so keying steps filter
+      // it, matching TinkerPop), and an inherited name (`toString`) never leaks a
+      // prototype function — parity with the HashMap-backed native engine.
       if (isVertex(value) || isEdge(value)) {
-        return value.properties[by.key];
+        return Object.hasOwn(value.properties, by.key) ? value.properties[by.key] : NO_VALUE;
       }
 
       // `by('k')` over a Map (`group`/`groupCount`) or a `project()` row object
       // projects the value at that key — e.g. `project('name','age').order().by('age')`.
       // Without this the whole container reached the comparator ("cannot order …").
       if (value instanceof Map) {
-        return value.get(by.key);
+        return value.has(by.key) ? value.get(by.key) : NO_VALUE;
       }
 
       if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
-        return (value as Record<string, unknown>)[by.key];
+        const obj = value as Record<string, unknown>;
+
+        return Object.hasOwn(obj, by.key) ? obj[by.key] : NO_VALUE;
       }
 
       return value;
@@ -422,7 +442,7 @@ export const evalBy = (by: By, value: unknown, graph: Graph, ctx: RunContext): u
         return t.value;
       }
 
-      return undefined;
+      return NO_VALUE;
     }
     case 'token':
       return projectToken(by.token, value);

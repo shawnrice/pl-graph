@@ -34,13 +34,16 @@ describe('STEP, group', () => {
     expect(map.get(35)).toEqual(['peter']);
   });
 
-  // doc: g.V().group().by('lang') — software vertices grouped by lang; non-software produce undefined keys.
-  test('group by property (lang) collapses missing-key vertices into one bucket', () => {
+  // doc: g.V().group().by('lang') — software vertices group by lang; persons lack `lang`
+  // and are FILTERED OUT (TinkerPop: a key-by that yields no value drops the traverser),
+  // so there is no undefined/null bucket.
+  test('group by property (lang) filters out missing-key vertices (no null bucket)', () => {
     const result = arr(run(traversal(V(), group({ keyBy: 'lang', valueBy: 'name' })), g));
     const map = result[0] as Map<unknown, unknown[]>;
     expect(map.get('java')).toEqual(['lop', 'ripple']);
-    // Persons lack `lang`, so they all bucket under `undefined`.
-    expect(map.get(undefined)).toEqual(['marko', 'vadas', 'josh', 'peter']);
+    expect(map.has(undefined)).toBe(false);
+    expect(map.has(null)).toBe(false);
+    expect(map.size).toBe(1);
   });
 
   // doc: g.V().group().by(label) — [software:[v[3],v[5]],person:[v[1],v[2],v[4],v[6]]]

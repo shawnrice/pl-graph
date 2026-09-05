@@ -84,6 +84,7 @@ import {
   mapTraverser,
   newContext,
   normalizeBys,
+  NO_VALUE,
   type RunContext,
   type Traverser,
   tupleKey,
@@ -230,6 +231,13 @@ export const applyStep = (
         }
 
         const v = by !== undefined ? evalBy(by, t.value, graph, ctx) : t.value;
+
+        // TinkerPop: a dedup-by that yields no value (absent property) FILTERS the
+        // traverser — `dedup().by('age')` drops elements without `age` rather than
+        // collapsing them into one null bucket.
+        if (v === NO_VALUE) {
+          return false;
+        }
 
         // Plain lists/maps AND value-typed instances (temporals) need structural
         // keying — a temporal is a distinct object per vertex, so reference identity

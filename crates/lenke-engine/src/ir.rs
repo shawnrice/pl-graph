@@ -205,8 +205,15 @@ pub enum Expr {
     /// A map literal producing a `Value::Map` (insertion-ordered, string keys).
     /// Built by the Gremlin front-end for multi-label `select('a','b')`; GQL uses
     /// `Record` instead. Values are expressions, evaluated per row.
+    ///
+    /// `omit_absent` (set only by Gremlin `project(...)`): an entry whose value is a
+    /// bare property projection (`Expr::Prop`) that is ABSENT for a row is DROPPED from
+    /// that row's map, rather than stored as `null` — TinkerPop's `project('a').by('age')`
+    /// yields `{}` (not `{a:null}`) for an element without `age`. A present `null` is
+    /// kept, and non-`Prop` entries (element/token/computed) are always kept.
     MapLit {
         entries: Vec<(String, Expr)>,
+        omit_absent: bool,
     },
     /// Field access on an arbitrary base expression: `<base>.key`. `base` may be a
     /// record/map value (→ the field) or an element frontier (→ its property) —
