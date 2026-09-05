@@ -108,7 +108,12 @@ export const repeatStep = function* (
   // silently vanished (a transitive-`subgraph` blast radius came back empty).
   ctx: RunContext,
 ): Iterable<Traverser<unknown>> {
-  // Cap iterations to `times` if given; else 100 to avoid runaway.
+  // Cap iterations to `times` if given; else 100 to avoid runaway. `times(n)` is a plain
+  // count here (a while-do bound), so `times(0)` runs ZERO iterations. This DELIBERATELY
+  // differs from TinkerPop, where a `.times()` placed AFTER `repeat(...)` is do-while and
+  // `repeat(out()).times(0)` runs ONE iteration (a well-known TinkerPop surprise). lenke
+  // keeps the intuitive count semantics; only `times(0)` observes the difference (`times`
+  // ≥ 1 agree). Both lenke engines match each other.
   const maxIterations = step.times ?? 100;
   // `until(plan)` empty means "no until" — let `times` be the only stopper.
   // `emit(plan)` empty means "emit every traverser at every level".
