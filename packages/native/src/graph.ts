@@ -715,11 +715,15 @@ export type RustGraph = {
   /**
    * The distinct values of property `key` across the vertices the most recent
    * committed write touched — that write's content-derived **value-scope**, for CDC
-   * interest routing (`lastWriteScope('room')` → `['42']` right after a write into
-   * room 42). Empty when the last write touched no vertex carrying `key`. Reads a
-   * handful of columns off the already-collected touched set.
+   * interest routing (`lastWriteScope('room')` → `{ scopes: ['42'], open: false }`
+   * right after a write into room 42). `open` is the fail-open flag: `true` when the
+   * write also touched an element with no derivable scope (an edge change, or a node
+   * missing `key`), meaning the write is relevant to ALL scopes. A subscriber to
+   * scope `S` treats the write as relevant iff `open || scopes.includes(S)` — scope
+   * only ever narrows, it never hides an unclassifiable write. Reads a handful of
+   * columns off the already-collected touched set.
    */
-  lastWriteScope: (key: string) => string[];
+  lastWriteScope: (key: string) => { scopes: string[]; open: boolean };
   /**
    * Run `fn` as one atomic transaction. Every write inside applies to the
    * graph immediately (so reads see their own writes), but if `fn` throws — or a

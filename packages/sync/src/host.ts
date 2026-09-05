@@ -243,9 +243,21 @@ export const createSyncHost = (store: Store, options: SyncHostOptions): SyncHost
   const { send, writeLog, dedup, scopeKey } = options;
   // The just-committed write's value-scope (distinct scope-key values across its
   // touched elements), read straight off the store — `undefined` when no scopeKey
-  // is configured, so an unscoped host stays exactly as before.
-  const writeScope = (): readonly string[] | undefined =>
-    scopeKey === undefined ? undefined : store.graph.lastWriteScope(scopeKey);
+  // is configured, so an unscoped host stays exactly as before. The store also
+  // reports an `open` fail-open flag (the write touched an unscoped element — an
+  // edge change or a node missing the key); we collapse that to `undefined` here,
+  // which the routing filter (`inScope`) already treats as "deliver to everyone".
+  // So the CDC entry carries a concrete scope list only for a write that is fully
+  // classifiable, exactly matching the store's `open || scopes.includes(S)` rule.
+  const writeScope = (): readonly string[] | undefined => {
+    if (scopeKey === undefined) {
+      return undefined;
+    }
+
+    const { scopes, open } = store.graph.lastWriteScope(scopeKey);
+
+    return open ? undefined : scopes;
+  };
   // Origin-skip identity. A write's op-log entry is tagged with the committing
   // client's STABLE id (not a per-connection id), so the author's own write is
   // filtered out of its CDC backlog even across a reconnect (a fresh host for the

@@ -57,7 +57,7 @@ const countingBackend = (): { backend: Backend; freed: GraphHandle[] } => {
     serialize: () => new Uint8Array(),
     deserialize: () => 1,
     setConfig: () => true,
-    lastWriteScope: () => [],
+    lastWriteScope: () => ({ scopes: [], open: false }),
   };
 
   return { backend, freed };

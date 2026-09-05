@@ -187,8 +187,11 @@ export type Backend = {
    * declarations, for snapshot persistence + CDC replication. */
   dumpSchema: (handle: GraphHandle) => SchemaOp[];
   /** The distinct values of property `key` across the last committed write's touched
-   * vertices — that write's content-derived CDC value-scope. */
-  lastWriteScope: (handle: GraphHandle, key: string) => string[];
+   * vertices — that write's content-derived CDC value-scope. `open` is the fail-open
+   * flag: `true` when the write touched an element with no derivable scope (an edge
+   * change, or a node missing `key`), meaning "relevant to ALL scopes". A subscriber
+   * to scope `S` treats the write as relevant iff `open || scopes.includes(S)`. */
+  lastWriteScope: (handle: GraphHandle, key: string) => { scopes: string[]; open: boolean };
 
   /**
    * Run a GQL query; returns the `{columns, rows}` JSON document as bytes.

@@ -89,6 +89,25 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
       be.graphFree(dup);
     });
 
+    test('lastWriteScope reports scopes AND the open fail-open flag', async () => {
+      const be = await make();
+      const g = be.graphFromNdjson(NDJSON);
+
+      // A scoped node write: one distinct scope, fully classifiable → not open.
+      be.queryRows(g, "INSERT (:Msg {room: '42'})");
+      expect(be.lastWriteScope(g, 'room')).toEqual({ scopes: ['42'], open: false });
+
+      // A node missing the scope key is unclassifiable → open (fail-open), no scope.
+      be.queryRows(g, "INSERT (:Note {body: 'x'})");
+      expect(be.lastWriteScope(g, 'room')).toEqual({ scopes: [], open: true });
+
+      // An edge change has no node scope → open as well.
+      be.queryRows(g, "MATCH (a:P {name: 'alice'}), (b:P {name: 'bob'}) INSERT (a)-[:R]->(b)");
+      expect(be.lastWriteScope(g, 'room').open).toBe(true);
+
+      be.graphFree(g);
+    });
+
     test('prepared statement: reuse, then use-after-free is a clean error', async () => {
       const be = await make();
       const g = be.graphFromNdjson(NDJSON);

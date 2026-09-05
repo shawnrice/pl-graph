@@ -70,7 +70,7 @@ const fakeStore = () => {
     encodeNdjson: () => new Uint8Array(),
     serialize: () => new Uint8Array(),
     deserialize: (): GraphHandle => 1,
-    lastWriteScope: () => [],
+    lastWriteScope: () => ({ scopes: [], open: false }),
   };
   const store = createStore(attachGraph(backend, 1));
 

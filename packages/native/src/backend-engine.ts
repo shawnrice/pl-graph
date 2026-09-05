@@ -319,10 +319,13 @@ export const buildEngineBackend = (abi: EngineAbi): Backend => {
     vertexIndexes: (handle) => indexKeys(abi.schemaDump(handle), 'vertex'),
     edgeIndexes: (handle) => indexKeys(abi.schemaDump(handle), 'edge'),
     dumpSchema: (handle) => dumpLines(abi.schemaDump(handle)).flatMap(toSchemaOp),
-    lastWriteScope: (handle, key) =>
-      parseJson<{ scopes: unknown[]; open: boolean }>(
+    lastWriteScope: (handle, key) => {
+      const parsed = parseJson<{ scopes: unknown[]; open: boolean }>(
         abi.command(handle, 'last_write_scope', key),
-      ).scopes.map((v) => String(v)),
+      );
+
+      return { scopes: parsed.scopes.map((v) => String(v)), open: parsed.open };
+    },
 
     queryRows: (handle, query, params) =>
       abi.query(handle, LANG_GQL, query, params ?? null, FMT_JSON),
