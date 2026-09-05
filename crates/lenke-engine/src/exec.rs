@@ -617,7 +617,8 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
             props,
             on_create,
             on_update,
-        } => execute_merge(store, label, props, on_create, on_update),
+            tail,
+        } => execute_merge(store, label, props, on_create, on_update, tail.as_deref()),
         Plan::MergeEdge {
             start_label,
             start_props,

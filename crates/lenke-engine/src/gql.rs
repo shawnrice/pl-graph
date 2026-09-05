@@ -2110,11 +2110,25 @@ impl Parser {
             crate::ir::MergeUpdate::Clobber
         };
 
+        // `_MERGE (…) RETURN <items> [ORDER BY/OFFSET/LIMIT]` — a read-after-write tail
+        // over the merged node (bound at slot 0, above). Mirrors `INSERT … RETURN`;
+        // query_tail also supplies ORDER BY/OFFSET/LIMIT on the single-row result.
+        let tail = if self.peek_kw("RETURN")
+            || self.peek_kw("ORDER")
+            || self.peek_kw("OFFSET")
+            || self.peek_kw("LIMIT")
+        {
+            Some(Box::new(self.query_tail(Plan::Row)?))
+        } else {
+            None
+        };
+
         Ok(Plan::Merge {
             label,
             props,
             on_create,
             on_update,
+            tail,
         })
     }
 

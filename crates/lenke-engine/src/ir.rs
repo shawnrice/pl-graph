@@ -1091,6 +1091,10 @@ pub enum Plan {
         props: Vec<(String, Value)>,
         on_create: Vec<(String, Expr)>,
         on_update: MergeUpdate,
+        /// `_MERGE (…) RETURN <items> [ORDER BY/OFFSET/LIMIT]` — the read-after-write
+        /// tail (like [`Plan::InsertReturn`]'s), a Row-seeded projection with the merged
+        /// node bound at slot 0. `None` for a bare `_MERGE` (yields no rows).
+        tail: Option<Box<Plan>>,
     },
     /// Keyed upsert of ONE edge between two vertices matched by their unique keys
     /// (the `_MERGE` edge form, spec docs/design/gql-extensions.md §2 v1). Both

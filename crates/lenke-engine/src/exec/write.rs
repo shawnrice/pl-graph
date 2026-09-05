@@ -153,6 +153,7 @@ pub(super) fn execute_merge(
     props: &[(String, Value)],
     on_create: &[(String, Expr)],
     on_update: &crate::ir::MergeUpdate,
+    tail: Option<&crate::ir::Plan>,
 ) -> Result<Rows, String> {
     use crate::ir::MergeUpdate;
     let scope = stmt_begin(store);
@@ -172,52 +173,58 @@ pub(super) fn execute_merge(
         .copied()
         .find(|&id| key_bytes(&key_keys, |k| store.prop(id, k)) == want);
 
+    // The merged node's id, for a `_MERGE … RETURN` tail to project after commit.
+    let merged_id;
     match found {
-        Some(id) => match on_update {
-            MergeUpdate::Nothing => {}
-            MergeUpdate::Clobber => {
-                // Set every non-key payload property to the pattern's value.
-                for (k, v) in props {
-                    if !key_keys.contains(k) {
-                        store.set_prop(id, k, v.clone());
+        Some(id) => {
+            merged_id = id;
+            match on_update {
+                MergeUpdate::Nothing => {}
+                MergeUpdate::Clobber => {
+                    // Set every non-key payload property to the pattern's value.
+                    for (k, v) in props {
+                        if !key_keys.contains(k) {
+                            store.set_prop(id, k, v.clone());
+                        }
                     }
                 }
-            }
-            MergeUpdate::Set { assigns, filter } => {
-                let batch = Batch::of(vec![Col::Nodes(vec![id])]);
-                // Evaluate the gate and every assignment BEFORE mutating; a fault
-                // (e.g. a failed CAST) rolls the whole MERGE back rather than
-                // leaving the begun transaction open.
-                let gate = match filter.as_ref().map(|f| eval(f, store, &batch)).transpose() {
-                    Ok(g) => g.is_none_or(|c| matches!(c.value_at(0), Value::Bool(true))),
-                    Err(e) => {
-                        stmt_rollback(store, scope);
-                        return Err(e);
-                    }
-                };
-                if gate {
-                    let writes: Result<Vec<(String, Value)>, String> = assigns
-                        .iter()
-                        .map(|(k, e)| Ok((k.clone(), eval(e, store, &batch)?.value_at(0))))
-                        .collect();
-                    match writes {
-                        Ok(writes) => {
-                            for (k, v) in writes {
-                                store.set_prop(id, &k, v);
-                            }
-                        }
+                MergeUpdate::Set { assigns, filter } => {
+                    let batch = Batch::of(vec![Col::Nodes(vec![id])]);
+                    // Evaluate the gate and every assignment BEFORE mutating; a fault
+                    // (e.g. a failed CAST) rolls the whole MERGE back rather than
+                    // leaving the begun transaction open.
+                    let gate = match filter.as_ref().map(|f| eval(f, store, &batch)).transpose() {
+                        Ok(g) => g.is_none_or(|c| matches!(c.value_at(0), Value::Bool(true))),
                         Err(e) => {
                             stmt_rollback(store, scope);
                             return Err(e);
                         }
+                    };
+                    if gate {
+                        let writes: Result<Vec<(String, Value)>, String> = assigns
+                            .iter()
+                            .map(|(k, e)| Ok((k.clone(), eval(e, store, &batch)?.value_at(0))))
+                            .collect();
+                        match writes {
+                            Ok(writes) => {
+                                for (k, v) in writes {
+                                    store.set_prop(id, &k, v);
+                                }
+                            }
+                            Err(e) => {
+                                stmt_rollback(store, scope);
+                                return Err(e);
+                            }
+                        }
                     }
                 }
             }
-        },
+        }
         None => {
             let props_ref: Vec<(&str, Value)> =
                 props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
             let id = store.add_node(&[label], &props_ref);
+            merged_id = id;
             let batch = Batch::of(vec![Col::Nodes(vec![id])]);
             let writes: Result<Vec<(String, Value)>, String> = on_create
                 .iter()
@@ -242,7 +249,18 @@ pub(super) fn execute_merge(
         return Err(e);
     }
     stmt_commit(store, scope);
-    Ok(empty_rows())
+
+    // `_MERGE … RETURN <items>`: seed the merged node at slot 0 and project the read
+    // tail against the committed store (a Row-seeded projection, like InsertReturn).
+    match tail {
+        Some(tail) => {
+            let seed = Batch::of(vec![Col::Nodes(vec![merged_id])]);
+            let store_ref: &Store = store;
+            let batch = super::pull_body(tail, store_ref, &seed)?;
+            Ok(super::rows_from_batch(tail, &batch, store_ref))
+        }
+        None => Ok(empty_rows()),
+    }
 }
 
 /// Resolve a `_MERGE` edge endpoint: the vertex whose inferred unique key matches

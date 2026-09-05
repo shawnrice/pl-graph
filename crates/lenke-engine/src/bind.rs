@@ -201,6 +201,7 @@ fn bind_plan(plan: &mut Plan, params: &HashMap<&str, &Value>) -> Result<(), Stri
         Plan::Merge {
             on_create,
             on_update,
+            tail,
             ..
         } => {
             for (_, e) in on_create {
@@ -213,6 +214,9 @@ fn bind_plan(plan: &mut Plan, params: &HashMap<&str, &Value>) -> Result<(), Stri
                 if let Some(f) = filter {
                     bind_expr(f, params)?;
                 }
+            }
+            if let Some(tail) = tail {
+                bind_plan(tail, params)?;
             }
         }
         Plan::MergeEdge {

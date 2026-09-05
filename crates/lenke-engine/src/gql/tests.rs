@@ -5238,6 +5238,7 @@ fn merge_parse_matches_hand_plan() {
             assigns: vec![("seen".into(), Expr::Lit(n(1.0)))],
             filter: None,
         },
+        tail: None,
     };
     let query = "_MERGE (u:User {email: 'a', name: 'A'}) _ON_CREATE SET u.created = true \
                      _ON_UPDATE SET u.seen = 1";
@@ -5248,6 +5249,37 @@ fn merge_parse_matches_hand_plan() {
     let probe = "MATCH (u:User) RETURN u.email AS e, u.name AS nm, u.created AS c";
     let pp = super::parse(probe).unwrap();
     assert_eq!(bag(&run(&pp, &st_p)), bag(&run(&pp, &st_h)));
+}
+
+/// `_MERGE (…) RETURN <items>` binds the merged node at slot 0 and projects it — the
+/// keyed-upsert twin of `INSERT … RETURN`. The CREATE path returns the created node's
+/// values; a second `_MERGE` on the same key (the clobber UPDATE path) returns the
+/// updated values, and the store still holds exactly one node (upsert, not insert).
+#[test]
+fn merge_return_projects_merged_node() {
+    use crate::exec::execute;
+    let mut st = user_store();
+
+    // CREATE path: the returned row equals reading the created node back.
+    let created = execute(
+        &super::parse("_MERGE (u:User {email: 'a', name: 'A'}) RETURN u.email, u.name").unwrap(),
+        &mut st,
+    )
+    .unwrap();
+    assert_eq!(created.rows.len(), 1);
+    let probe = super::parse("MATCH (u:User {email: 'a'}) RETURN u.email, u.name").unwrap();
+    assert_eq!(bag(&created), bag(&run(&probe, &st)));
+
+    // UPDATE path (same key, clobber non-key payload): RETURN sees the NEW value.
+    let updated = execute(
+        &super::parse("_MERGE (u:User {email: 'a', name: 'A2'}) RETURN u.name").unwrap(),
+        &mut st,
+    )
+    .unwrap();
+    assert_eq!(updated.rows.len(), 1);
+    let probe2 = super::parse("MATCH (u:User {email: 'a'}) RETURN u.name").unwrap();
+    assert_eq!(bag(&updated), bag(&run(&probe2, &st)));
+    assert_eq!(st.nodes_with_label("User").len(), 1);
 }
 
 /// `INSERT (n:…) RETURN n.…` binds the created node into scope so the trailing
