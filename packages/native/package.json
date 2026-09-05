@@ -42,7 +42,7 @@
   "devDependencies": {
     "@lenke/dev": "workspace:*",
     "@types/bun": "^1.3.13",
-    "apache-arrow": "^21.1.0",
+    "apache-arrow": "^21.2.0",
     "bun-types": "latest"
   },
   "peerDependencies": {

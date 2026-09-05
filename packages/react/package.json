@@ -24,7 +24,7 @@
   },
   "devDependencies": {
     "@lenke/dev": "workspace:*",
-    "@testing-library/react": "^16.3.0",
+    "@testing-library/react": "^16.3.3",
     "@types/react": "^18.2.15",
     "@types/react-dom": "^18.2.7",
     "happy-dom": "^15.11.7",
