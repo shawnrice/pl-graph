@@ -48,5 +48,31 @@ describe('Gremlin tests', () => {
         { weight: 0.2 },
       ]);
     });
+
+    // doc: g.V().valueMap(true) — the includeTokens overload prepends id + label.
+    test('valueMap(true) prepends id + label on vertices', () => {
+      const result = arr(run(traversal(V(), valueMap(true)), tinkerGraph));
+      expect(result[0]).toEqual({ id: '1', label: 'PERSON', name: 'marko', age: 29 });
+      // A software vertex carries lang, not age.
+      expect(result[4]).toEqual({ id: '3', label: 'SOFTWARE', name: 'lop', lang: 'java' });
+    });
+
+    // doc: g.V().valueMap(true,'name') — tokens plus a filtered key set.
+    test('valueMap(true, key) keeps id + label and filters properties', () => {
+      const result = arr(run(traversal(V(), valueMap(true, 'name')), tinkerGraph));
+      expect(result[0]).toEqual({ id: '1', label: 'PERSON', name: 'marko' });
+    });
+
+    // doc: g.E().valueMap(true) — edges get id + label, but no IN/OUT (unlike elementMap).
+    test('valueMap(true) prepends id + label on edges, no IN/OUT', () => {
+      const result = arr(run(traversal(E(), valueMap(true)), tinkerGraph));
+      expect(result[0]).toEqual({ id: '7', label: 'KNOWS', weight: 0.5 });
+    });
+
+    // valueMap() without the boolean stays properties-only (no tokens).
+    test('valueMap() omits id + label', () => {
+      const result = arr(run(traversal(V(), valueMap()), tinkerGraph));
+      expect(result[0]).toEqual({ name: 'marko', age: 29 });
+    });
   });
 });

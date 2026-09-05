@@ -209,8 +209,16 @@ const emitModulatedStep = (step: Step): string | null => {
   switch (step.kind) {
     case 'path':
       return `path()${mods(step.bys)}`;
-    case 'valueMap':
-      return `valueMap(${(step.keys ?? []).map(emitLiteral).join(', ')})`;
+    case 'valueMap': {
+      const vmArgs = (step.keys ?? []).map(emitLiteral);
+
+      // `valueMap(true, ...)` — the leading boolean also emits id + label.
+      if (step.includeTokens) {
+        vmArgs.unshift('true');
+      }
+
+      return `valueMap(${vmArgs.join(', ')})`;
+    }
     case 'groupCount': {
       if (step.bys?.length) {
         return `groupCount()${mods(step.bys)}`;

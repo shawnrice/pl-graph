@@ -255,8 +255,9 @@ enum NodeMapKind {
     /// are NULL (not a dense-id fallback) when absent.
     Flat,
     /// Gremlin `valueMap()` (`wrap=false`) / `propertyMap()` (`wrap=true`, each value in
-    /// a one-element list) → just the present properties.
-    Value { wrap: bool },
+    /// a one-element list) → the present properties. `tokens` (from `valueMap(true)`)
+    /// also prepends id + label, like `Flat` but without an edge's IN/OUT submaps.
+    Value { wrap: bool, tokens: bool },
 }
 
 /// `g.V().project(k…).by(e…)` and GQL map projections — a terminal `Project{[MapLit]}`
@@ -388,10 +389,17 @@ fn try_fused_map_json(plan: &Plan, store: &Store) -> Option<String> {
                         _ => None,
                     })
                     .collect();
+                // value_map/property_map carry an include-tokens Bool (skipped as a key above).
+                let tokens = args[1..]
+                    .iter()
+                    .any(|e| matches!(e, Expr::Lit(Value::Bool(true))));
                 let kind = match name.as_str() {
                     "element_map" => NodeMapKind::Flat,
-                    "value_map" => NodeMapKind::Value { wrap: false },
-                    _ => NodeMapKind::Value { wrap: true },
+                    "value_map" => NodeMapKind::Value {
+                        wrap: false,
+                        tokens,
+                    },
+                    _ => NodeMapKind::Value { wrap: true, tokens },
                 };
                 (input.as_ref(), kind, *s, filter)
             }
@@ -424,7 +432,9 @@ fn try_fused_map_json(plan: &Plan, store: &Store) -> Option<String> {
                 match &kind {
                     NodeMapKind::Nested => write_node_nested_map(&mut out, store, id, &cols),
                     NodeMapKind::Flat => write_node_flat_map(&mut out, store, id, &cols),
-                    NodeMapKind::Value { wrap } => write_node_value_map(&mut out, id, &cols, *wrap),
+                    NodeMapKind::Value { wrap, tokens } => {
+                        write_node_value_map(&mut out, store, id, &cols, *wrap, *tokens);
+                    }
                 }
             }
         }
@@ -441,8 +451,8 @@ fn try_fused_map_json(plan: &Plan, store: &Store) -> Option<String> {
                 match &kind {
                     NodeMapKind::Nested => write_edge_nested_map(&mut out, store, eid, &cols),
                     NodeMapKind::Flat => write_edge_flat_map(&mut out, store, eid, &cols),
-                    NodeMapKind::Value { wrap } => {
-                        write_edge_value_map(&mut out, eid, &cols, *wrap)
+                    NodeMapKind::Value { wrap, tokens } => {
+                        write_edge_value_map(&mut out, store, eid, &cols, *wrap, *tokens);
                     }
                 }
             }
@@ -605,14 +615,31 @@ fn write_edge_flat_map(
 }
 
 /// `{sorted present edge props}` — Gremlin `valueMap()`/`propertyMap()` on an edge.
+/// With `tokens` (from `valueMap(true)`) id + label are prepended (no IN/OUT, unlike
+/// the flat elementMap); the token values are never list-wrapped.
 fn write_edge_value_map(
     out: &mut String,
+    store: &Store,
     eid: u32,
     cols: &[(std::sync::Arc<str>, EdgeCol<'_>)],
     wrap: bool,
+    tokens: bool,
 ) {
     out.push('{');
     let mut first = true;
+    if tokens {
+        out.push_str("\"id\":");
+        match store.edge_ext_id(eid) {
+            Some(ext) => crate::json::write_string(out, &ext),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"label\":");
+        match store.edge_type_name(eid) {
+            Some(t) => crate::json::write_string(out, &t),
+            None => out.push_str("null"),
+        }
+        first = false;
+    }
     for (k, col) in cols {
         if let Some(v) = col.cell(eid) {
             if !first {
@@ -719,16 +746,33 @@ fn write_node_flat_map(
 }
 
 /// `{sorted present props}` — Gremlin `valueMap()` (`wrap=false`) or `propertyMap()`
-/// (`wrap=true`, each value wrapped in a one-element list).
+/// (`wrap=true`, each value wrapped in a one-element list). With `tokens` (from
+/// `valueMap(true)`) id + label are prepended (NULL when absent), like the flat map
+/// but without an edge's IN/OUT — the token values are never list-wrapped.
 fn write_node_value_map(
     out: &mut String,
+    store: &Store,
     id: u32,
     cols: &[(std::sync::Arc<str>, &crate::store::Column)],
     wrap: bool,
+    tokens: bool,
 ) {
     let i = id as usize;
     out.push('{');
     let mut first = true;
+    if tokens {
+        out.push_str("\"id\":");
+        match store.node_ext_id(id) {
+            Some(ext) => crate::json::write_string(out, &ext),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"label\":");
+        match store.labels_of(id).first() {
+            Some(l) => crate::json::write_string(out, l),
+            None => out.push_str("null"),
+        }
+        first = false;
+    }
     for (k, col) in cols {
         if col.present_at(i) {
             if !first {

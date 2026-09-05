@@ -321,16 +321,83 @@ fn fused_map_json_matches_value_tree_bytes() {
     for q in [
         "g.V().out().elementMap()",
         "g.V().out().valueMap()",
+        "g.V().out().valueMap(true)",
+        "g.V().out().valueMap(true, 'name', 'age')",
         "g.V().out().elementMap('name', 'age')",
         "g.V().out().valueMap('city', 'missingkey')",
         "g.V().out()",
         "g.V().hasLabel('VIP').elementMap()",
+        "g.V().hasLabel('VIP').valueMap(true)",
+        "g.V().outE().valueMap(true)",
+        "g.V().outE().valueMap(true, 'name')",
     ] {
         let plan = crate::opt::optimize_indexed(super::parse(q).unwrap(), &st);
         let fused = crate::exec::run_gremlin_json(&plan, &st);
         let tree = crate::json::gremlin_results_json(&run(&plan, &st));
         assert_eq!(fused, tree, "fused vs value-tree diverged for `{q}`");
     }
+}
+
+/// `valueMap(true)` (TinkerPop's includeTokens overload) prepends id + label to the
+/// property map — like `elementMap()` but WITHOUT an edge's IN/OUT submaps. A key
+/// filter still keeps the tokens; plain `valueMap()` stays properties-only.
+#[test]
+fn value_map_true_includes_id_and_label_tokens() {
+    let nd = [
+        r#"{"id":"n1","labels":["Person","VIP"],"props":{"name":"alice","age":30}}"#,
+        r#"{"id":"n2","labels":["Person"],"props":{"name":"bob","age":25}}"#,
+        r#"{"from":"n1","to":"n2","id":"e1","type":"KNOWS","props":{"since":2020}}"#,
+    ]
+    .join("\n");
+    let st = crate::ndjson::from_ndjson(&nd).unwrap();
+    let json = |q: &str| {
+        let plan = crate::opt::optimize_indexed(super::parse(q).unwrap(), &st);
+        crate::exec::run_gremlin_json(&plan, &st)
+    };
+
+    // Node: id + label (the FIRST label of a multi-label node) then the props.
+    let vm = json("g.V().hasLabel('VIP').valueMap(true)");
+    assert!(vm.contains("\"id\":\"n1\""), "id token missing: {vm}");
+    assert!(
+        vm.contains("\"label\":\"Person\""),
+        "label token missing: {vm}"
+    );
+    assert!(vm.contains("\"name\":\"alice\""), "prop missing: {vm}");
+
+    // A key filter still keeps the tokens.
+    let vmf = json("g.V().hasLabel('VIP').valueMap(true, 'age')");
+    assert!(
+        vmf.contains("\"id\":\"n1\""),
+        "filtered id token missing: {vmf}"
+    );
+    assert!(vmf.contains("\"label\":\"Person\""));
+    assert!(vmf.contains("\"age\":30"));
+    assert!(!vmf.contains("\"name\""), "filter should drop name: {vmf}");
+
+    // Edge: id + label, but NO IN/OUT (that is elementMap's shape, not valueMap's).
+    let ve = json("g.E().valueMap(true)");
+    assert!(ve.contains("\"id\":\"e1\""), "edge id token missing: {ve}");
+    assert!(ve.contains("\"label\":\"KNOWS\""));
+    assert!(ve.contains("\"since\":2020"));
+    assert!(
+        !ve.contains("\"IN\""),
+        "valueMap(true) must not add IN: {ve}"
+    );
+    assert!(
+        !ve.contains("\"OUT\""),
+        "valueMap(true) must not add OUT: {ve}"
+    );
+
+    // Without the boolean, no tokens.
+    let plain = json("g.V().hasLabel('VIP').valueMap()");
+    assert!(
+        !plain.contains("\"id\":"),
+        "valueMap() must omit id: {plain}"
+    );
+    assert!(
+        !plain.contains("\"label\":"),
+        "valueMap() must omit label: {plain}"
+    );
 }
 
 /// Target-aware shortest-path early stop must be byte-identical to the full BFS: a

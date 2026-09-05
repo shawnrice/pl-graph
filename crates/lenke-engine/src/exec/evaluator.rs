@@ -746,6 +746,11 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                 // `property_map` is `value_map` with each value wrapped in a single-
                 // element LIST (a TinkerPop property is multi-valued; lenke is single).
                 let wrap = name == "property_map";
+                // A leading Bool arg (valueMap(true)) → also prepend id + label tokens,
+                // never list-wrapped. Byte-identical to the json_out fast path's tokens.
+                let tokens = args[1..]
+                    .iter()
+                    .any(|e| matches!(e, Expr::Lit(Value::Bool(true))));
                 // The filter keys are constant string literals after the element arg.
                 let filter: Vec<String> = args[1..]
                     .iter()
@@ -760,52 +765,71 @@ pub(super) fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, Str
                 // them, skipping the per-node key clone+sort and per-key HashMap probes.
                 let node_cols = resolve_node_cols(store, &filter);
                 let out: Vec<Value> = (0..n)
-                    .map(|i| {
-                        // The node arm emits its (already-sorted) pairs directly; only the
-                        // edge arm builds an unsorted `pairs` that needs the sort below.
-                        let mut pairs: Vec<(String, Value)> = match arg.value_at(i) {
-                            Value::Num(id) if matches!(arg, Col::Nodes(_)) => {
-                                let ni = id as usize;
-                                return {
-                                    let entries: Vec<(Value, Value)> = node_cols
-                                        .iter()
-                                        .filter(|(_, col)| col.present_at(ni))
-                                        .map(|(k, col)| {
-                                            let v = col.read(ni);
-                                            let v = if wrap { Value::List(vec![v]) } else { v };
-                                            (Value::Str(Arc::clone(k).into()), v)
-                                        })
-                                        .collect();
-                                    Value::Map(Arc::new(entries))
-                                };
+                    .map(|i| match arg.value_at(i) {
+                        Value::Num(id) if matches!(arg, Col::Nodes(_)) => {
+                            let ni = id as usize;
+                            let nid = id as u32;
+                            let mut entries: Vec<(Value, Value)> = Vec::new();
+                            if tokens {
+                                entries.push((
+                                    Value::Str(GStr::from("id")),
+                                    store.node_ext_id(nid).map_or(Value::Null, Value::Str),
+                                ));
+                                entries.push((
+                                    Value::Str(GStr::from("label")),
+                                    store.labels_of(nid).first().map_or(Value::Null, |l| {
+                                        Value::Str(GStr::from(l.as_str()))
+                                    }),
+                                ));
                             }
-                            Value::Num(eid) if matches!(arg, Col::Edges(_)) => {
-                                let eid = eid as u32;
-                                let keys = if filter.is_empty() {
-                                    store.edge_prop_keys()
-                                } else {
-                                    filter.clone()
-                                };
-                                keys.into_iter()
-                                    .filter(|k| store.has_edge_prop(eid, k))
-                                    .map(|k| {
-                                        let v = store.edge_prop(eid, &k);
-                                        (k, v)
-                                    })
-                                    .collect()
-                            }
-                            _ => return Value::Null,
-                        };
-                        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                        Value::Map(Arc::new(
-                            pairs
+                            // node_cols are already sorted; the token pairs stay ahead.
+                            entries.extend(
+                                node_cols.iter().filter(|(_, col)| col.present_at(ni)).map(
+                                    |(k, col)| {
+                                        let v = col.read(ni);
+                                        let v = if wrap { Value::List(vec![v]) } else { v };
+                                        (Value::Str(Arc::clone(k).into()), v)
+                                    },
+                                ),
+                            );
+                            Value::Map(Arc::new(entries))
+                        }
+                        Value::Num(eid) if matches!(arg, Col::Edges(_)) => {
+                            let eid = eid as u32;
+                            let keys = if filter.is_empty() {
+                                store.edge_prop_keys()
+                            } else {
+                                filter.clone()
+                            };
+                            let mut pairs: Vec<(String, Value)> = keys
                                 .into_iter()
-                                .map(|(k, v)| {
-                                    let v = if wrap { Value::List(vec![v]) } else { v };
-                                    (Value::Str(k.into()), v)
+                                .filter(|k| store.has_edge_prop(eid, k))
+                                .map(|k| {
+                                    let v = store.edge_prop(eid, &k);
+                                    (k, v)
                                 })
-                                .collect(),
-                        ))
+                                .collect();
+                            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                            let mut entries: Vec<(Value, Value)> = Vec::new();
+                            if tokens {
+                                entries.push((
+                                    Value::Str(GStr::from("id")),
+                                    store.edge_ext_id(eid).map_or(Value::Null, Value::Str),
+                                ));
+                                entries.push((
+                                    Value::Str(GStr::from("label")),
+                                    store.edge_type_name(eid).map_or(Value::Null, |t| {
+                                        Value::Str(GStr::from(t.as_str()))
+                                    }),
+                                ));
+                            }
+                            entries.extend(pairs.into_iter().map(|(k, v)| {
+                                let v = if wrap { Value::List(vec![v]) } else { v };
+                                (Value::Str(k.into()), v)
+                            }));
+                            Value::Map(Arc::new(entries))
+                        }
+                        _ => Value::Null,
                     })
                     .collect();
                 return Ok(Col::Gen(out));

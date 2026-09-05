@@ -348,7 +348,7 @@ export const applyStep = (
       return projectValues(stream, step.keys);
 
     case 'valueMap':
-      return projectValueMap(stream, step.keys);
+      return projectValueMap(stream, step.keys, step.includeTokens);
 
     case 'properties':
       return projectProperties(stream, step.keys);

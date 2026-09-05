@@ -192,7 +192,9 @@ export type Step =
   | { kind: 'unfold' }
   // Projection
   | { kind: 'values'; keys: readonly string[] }
-  | { kind: 'valueMap'; keys?: readonly string[] }
+  // `includeTokens` (from `valueMap(true)`) prepends `id` and `label` to the map,
+  // like a token-bearing `elementMap()` but without an edge's IN/OUT submaps.
+  | { kind: 'valueMap'; keys?: readonly string[]; includeTokens?: boolean }
   | { kind: 'properties'; keys: readonly string[] }
   | { kind: 'id' }
   | { kind: 'label' }

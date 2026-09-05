@@ -11,8 +11,18 @@ import {
 export const values = (...keys: string[]): StepFn => appendStep({ kind: 'values', keys });
 
 // Project to a single map of `{ [key]: value }`. With no keys, all properties.
-export const valueMap = (...keys: string[]): StepFn =>
-  appendStep({ kind: 'valueMap', keys: keys.length ? keys : undefined });
+// TinkerPop's `valueMap(includeTokens, ...keys)`: a leading boolean `true` also
+// includes `id` and `label` in the map (like `elementMap()`, but no edge IN/OUT).
+export const valueMap = (...args: (string | boolean)[]): StepFn => {
+  const includeTokens = typeof args[0] === 'boolean' ? args[0] : false;
+  const keys = (typeof args[0] === 'boolean' ? args.slice(1) : args) as string[];
+
+  return appendStep({
+    kind: 'valueMap',
+    keys: keys.length ? keys : undefined,
+    includeTokens: includeTokens || undefined,
+  });
+};
 
 // Project property objects (`{key, value}`) for the named keys.
 export const properties = (...keys: string[]): StepFn => appendStep({ kind: 'properties', keys });

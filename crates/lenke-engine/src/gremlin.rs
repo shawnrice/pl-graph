@@ -3146,15 +3146,31 @@ impl Parser {
             }
             "valuemap" | "propertymap" => {
                 // valueMap() → a PROPERTIES-only map (no id/label tokens) with scalar
-                // values; valueMap('k1',…) filters keys. propertyMap() is the same but
-                // each value is wrapped in a single-element list. Both lower to the
-                // gremlin-only `value_map`/`property_map` exec fn (element slot + keys).
+                // values; valueMap('k1',…) filters keys. A leading boolean —
+                // valueMap(true[, 'k1'…]), TinkerPop's includeTokens — also emits id +
+                // label (an elementMap without an edge's IN/OUT). propertyMap() is the
+                // same but each value is wrapped in a single-element list. Both lower to
+                // the gremlin-only `value_map`/`property_map` exec fn; the second arg is
+                // always the include-tokens Bool (downstream reads it, skips it as a key).
                 let fn_name = if lname == "propertymap" {
                     "property_map"
                 } else {
                     "value_map"
                 };
                 let mut fn_args = vec![Expr::Slot(self.current)];
+                // The include-tokens boolean is a valueMap-only overload (TinkerPop has no
+                // propertyMap(boolean)); propertyMap keeps its keys-only signature.
+                let mut include_tokens = false;
+                if lname == "valuemap"
+                    && matches!(self.peek(), Some(Tok::Ident(s))
+                        if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false"))
+                {
+                    include_tokens = matches!(self.literal()?, Value::Bool(true));
+                    if self.peek() == Some(&Tok::Comma) {
+                        self.bump();
+                    }
+                }
+                fn_args.push(Expr::Lit(Value::Bool(include_tokens)));
                 if !matches!(self.peek(), Some(Tok::RParen)) {
                     loop {
                         fn_args.push(Expr::Lit(Value::Str(self.str_arg()?.into())));
