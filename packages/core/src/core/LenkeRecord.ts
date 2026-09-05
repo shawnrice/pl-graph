@@ -55,6 +55,7 @@ export const isRecord = (v: unknown): v is LenkeRecord => v instanceof LenkeReco
 /** A key that looks like a tagged temporal (`@`-run + a recognized tag). */
 const isTemporalShaped = (key: string): boolean => {
   const bare = key.replace(/^@+/, '');
+
   return bare.length < key.length && TEMPORAL_TAG_KEYS.has(`@${bare}`);
 };
 

@@ -302,12 +302,14 @@ describe('schema ops roll back with the transaction', () => {
     const g = new Graph();
     g.addVertex({ id: 'a', labels: ['N'], properties: { k: 1 } });
     g.addVertex({ id: 'b', labels: ['N'], properties: { k: 2 } });
+
     return g;
   };
   const rolledBack = (g: Graph, fn: () => void): void => {
     try {
       g.transaction(() => {
         fn();
+
         throw new Error('abort');
       });
     } catch {

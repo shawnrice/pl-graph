@@ -601,6 +601,31 @@ const copyTypeMap = (
   }
 };
 
+// Bring a property index to exactly the `want` set of indexed keys against `elems`:
+// drop any indexed key not wanted (created inside a rolled-back transaction), and
+// (re)build any wanted key that is missing (dropped inside it), from the restored data.
+const reconcilePropertyIndex = <E extends { properties: Record<string, unknown> }>(
+  index: PropertyIndex<E>,
+  want: Set<string>,
+  elems: Iterable<E>,
+): void => {
+  for (const key of index.indexedKeys()) {
+    if (!want.has(key)) {
+      index.dropIndex(key);
+    }
+  }
+
+  for (const key of want) {
+    if (!index.indexedKeys().includes(key)) {
+      index.createIndex(key);
+
+      for (const el of elems) {
+        index.addForKey(el, key, el.properties[key]);
+      }
+    }
+  }
+};
+
 export class Graph {
   verticesById: Map<string, Vertex>;
   verticesByLabel: Map<string, Set<Vertex>>;
@@ -1159,30 +1184,8 @@ export class Graph {
     this.#clearRegistries();
     snap.registries.#copyRegistriesInto(this);
 
-    const reconcile = <E extends { properties: Record<string, unknown> }>(
-      index: PropertyIndex<E>,
-      want: Set<string>,
-      elems: Iterable<E>,
-    ): void => {
-      for (const key of index.indexedKeys()) {
-        if (!want.has(key)) {
-          index.dropIndex(key);
-        }
-      }
-
-      for (const key of want) {
-        if (!index.indexedKeys().includes(key)) {
-          index.createIndex(key);
-
-          for (const el of elems) {
-            index.addForKey(el, key, el.properties[key]);
-          }
-        }
-      }
-    };
-
-    reconcile(this.vertexPropertyIndex, snap.vIdx, this.verticesById.values());
-    reconcile(this.edgePropertyIndex, snap.eIdx, this.edgesById.values());
+    reconcilePropertyIndex(this.vertexPropertyIndex, snap.vIdx, this.verticesById.values());
+    reconcilePropertyIndex(this.edgePropertyIndex, snap.eIdx, this.edgesById.values());
   };
 
   /**
