@@ -319,6 +319,11 @@ struct MathParser<'a> {
     pos: usize,
     operand: &'a Expr,
     labels: &'a std::collections::HashMap<String, usize>,
+    /// The slot of the current frontier when it is a Map (a `project()`/`group()`/
+    /// select-scope row). A named variable that is not a step-label reads its entry from
+    /// that map — TinkerPop's MathStep scoping (`project('a','b')…math('a + b')`). `None`
+    /// on a non-map frontier, where an unbound name is a value error.
+    map_slot: Option<usize>,
 }
 
 impl MathParser<'_> {
@@ -462,7 +467,15 @@ impl MathParser<'_> {
                 }
                 match self.labels.get(&name) {
                     Some(&slot) => Ok(Expr::Slot(slot)),
-                    None => Err(format!("math(): unknown variable `{name}`")),
+                    // Not a step-label: read the entry from the current Map row, if any
+                    // (project/group/select scope). Otherwise the name is unbound.
+                    None => match self.map_slot {
+                        Some(slot) => Ok(Expr::Field {
+                            base: Box::new(Expr::Slot(slot)),
+                            key: name,
+                        }),
+                        None => Err(format!("math(): unknown variable `{name}`")),
+                    },
                 }
             }
             other => Err(format!("math(): unexpected token {other:?}")),
@@ -4600,7 +4613,11 @@ impl Parser {
                 } else {
                     Expr::Slot(self.current)
                 };
-                let e = self.parse_math(&expr_str, &operand)?;
+                // On a Map frontier (a project()/group()/select row), a named math variable
+                // reads its entry from that map (TinkerPop MathStep scoping). Use the
+                // INCOMING map flag — the pre-step reset above already cleared the live one.
+                let map_slot = incoming_is_map.then_some(self.current);
+                let e = self.parse_math(&expr_str, &operand, map_slot)?;
                 let p = plan.project(vec![("math".to_string(), e)]);
                 self.current = 0;
                 self.slots = 1;
@@ -5832,13 +5849,18 @@ impl Parser {
     /// Grammar precedence (mXparser/TinkerPop): `+ -` < `* / %` < `^` (right-assoc) <
     /// unary `- +` < primary (number, `(expr)`, `name(args)`, bare unary `sin _`,
     /// constant `pi`/`e`, or a variable). Maps to the same f64 kernels GQL uses.
-    fn parse_math(&self, src: &str, operand: &Expr) -> Result<Expr, String> {
+    fn parse_math(
+        &self,
+        src: &str,
+        operand: &Expr,
+        map_slot: Option<usize>,
+    ) -> Result<Expr, String> {
         // math() is an evaluation sublanguage: every failure — unknown function,
         // unknown variable, malformed expression — is a value error, matching the
         // pure-TS engine (which throws E_INVALID_VALUE for all of them). The prefix
         // routes it past the Gremlin parser's default E_SYNTAX classification at the
         // FFI boundary. See `crate::ffi` (Gremlin parse-error branch).
-        self.parse_math_inner(src, operand).map_err(|e| {
+        self.parse_math_inner(src, operand, map_slot).map_err(|e| {
             if e.starts_with("E_INVALID_VALUE: ") {
                 e
             } else {
@@ -5847,13 +5869,19 @@ impl Parser {
         })
     }
 
-    fn parse_math_inner(&self, src: &str, operand: &Expr) -> Result<Expr, String> {
+    fn parse_math_inner(
+        &self,
+        src: &str,
+        operand: &Expr,
+        map_slot: Option<usize>,
+    ) -> Result<Expr, String> {
         let toks = math_lex(src)?;
         let mut mp = MathParser {
             toks,
             pos: 0,
             operand,
             labels: &self.labels,
+            map_slot,
         };
         let e = mp.expr()?;
         if mp.pos != mp.toks.len() {

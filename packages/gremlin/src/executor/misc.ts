@@ -11,7 +11,16 @@ import type { Graph } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type { By, Step } from '../ast.js';
-import { byOr, evalBy, extend, recallTag, type RunContext, type Traverser } from './runtime.js';
+import {
+  byOr,
+  evalBy,
+  extend,
+  isEdge,
+  isVertex,
+  recallTag,
+  type RunContext,
+  type Traverser,
+} from './runtime.js';
 
 const IDENT = /[A-Za-z_][A-Za-z0-9_]*/g;
 
@@ -121,13 +130,29 @@ export const mathStep = function* (
       if (name === '_') {
         base = t.value;
       } else {
+        // A named variable resolves against a path tag first; failing that — TinkerPop's
+        // MathStep scoping — the current traverser's ENTRY at that key when it is a Map
+        // (`group()` row) or a plain object (`project()` row). So
+        // `project('a','b')…math('a + b')` reads the projected values. Elements are NOT
+        // scanned (an element property is read via `_` + `by`, not a bare name).
         const r = recallTag(t.tags, name, 'last');
 
-        if (!r.ok) {
+        if (r.ok) {
+          base = r.value;
+        } else if (t.value instanceof Map && t.value.has(name)) {
+          base = t.value.get(name);
+        } else if (
+          t.value !== null &&
+          typeof t.value === 'object' &&
+          !Array.isArray(t.value) &&
+          !isVertex(t.value) &&
+          !isEdge(t.value) &&
+          Object.hasOwn(t.value, name)
+        ) {
+          base = (t.value as Record<string, unknown>)[name];
+        } else {
           return undefined;
         }
-
-        base = r.value;
       }
 
       // A no-value by() coerces to `undefined` → NaN (unchanged from before NO_VALUE;

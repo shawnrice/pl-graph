@@ -4,7 +4,7 @@ import { ErrorCode, hasErrorCode } from '@lenke/errors';
 
 import { run } from '../executor.js';
 import { createTestTinkerGraph } from '../fixtures/createTestTinkerGraph.js';
-import { as_, out, V, hasId, inject, math, values } from '../steps.js';
+import { as_, constant, out, V, hasId, inject, math, project, values } from '../steps.js';
 import { traversal } from '../traversal.js';
 
 const arr = (r: Iterable<unknown>): unknown[] => [...r];
@@ -150,6 +150,30 @@ describe('math tests', () => {
     const r = arr(run(traversal(inject(42), as_('sin'), math('sin')), g));
     expect(r).toEqual([42]);
     expect(() => arr(run(traversal(inject(42), as_('sin'), math('sin _')), g))).toThrow();
+  });
+
+  // doc: g.V().project('a','b').by('age').by(constant(1)).math('a + b') — 30
+  // math() reads a named variable from the current project()/group() Map row (TinkerPop
+  // MathStep scoping), so a project can feed math without an explicit as()-tag.
+  test('math: named variables resolve from a project() row', () => {
+    // marko.age = 29; a=29, b=29 → 58.
+    expect(
+      arr(run(traversal(V(), hasId('1'), project('a', 'b').by('age').by('age'), math('a + b')), g)),
+    ).toEqual([58]);
+    // The canonical TinkerPop form with a constant second key: 29 + 1 = 30.
+    expect(
+      arr(
+        run(
+          traversal(V(), hasId('1'), project('a', 'b').by('age').by(constant(1)), math('a + b')),
+          g,
+        ),
+      ),
+    ).toEqual([30]);
+  });
+
+  test('math: an unbound name on a non-map frontier still faults', () => {
+    // No project/group scope and no as() tag → `a` is unbound (a value error).
+    expect(() => arr(run(traversal(V(), hasId('1'), math('a + b')), g))).toThrow();
   });
 
   // Every malformed-math fault carries the same code as native: E_INVALID_VALUE.

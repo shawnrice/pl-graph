@@ -338,6 +338,32 @@ fn fused_map_json_matches_value_tree_bytes() {
     }
 }
 
+/// `math()` reads a named variable from the current traverser when it is a Map — a
+/// `project()`/`group()` row (TinkerPop's MathStep scoping) — so a project can feed math
+/// without an as()-tag. On a bare element frontier an unbound name is still a value error.
+#[test]
+fn math_reads_named_vars_from_project_row() {
+    let st = crate::ndjson::from_ndjson(r#"{"id":"1","labels":["P"],"props":{"age":29}}"#).unwrap();
+
+    // a=29, b=29 → 58.
+    let rows = gremlin_rows(
+        "g.V().project('a','b').by('age').by('age').math('a + b')",
+        &st,
+    );
+    assert_eq!(rows.rows.len(), 1);
+    assert!(
+        matches!(rows.rows[0][0], Value::Num(x) if (x - 58.0).abs() < 1e-9),
+        "expected 58, got {:?}",
+        rows.rows[0][0]
+    );
+
+    // No project/group scope and no tag → `a` is unbound (a value error at parse).
+    assert!(
+        super::parse("g.V().math('a + b')").is_err(),
+        "an unbound math variable on a bare element frontier must be an error"
+    );
+}
+
 /// A keying `by('k')` (group/groupCount/order/dedup/select) over an ABSENT property
 /// FILTERS the traverser (TinkerPop semantics — no null bucket), while a stored PRESENT
 /// null is a value and is KEPT; `project('k').by(absent)` OMITS the key (keeps the row).
