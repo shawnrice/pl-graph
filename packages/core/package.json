@@ -24,7 +24,7 @@
   },
   "devDependencies": {
     "@lenke/dev": "workspace:*",
-    "@types/bun": "^1.3.13",
+    "@types/bun": "^1.4.1",
     "@types/debug": "^4.1.12",
     "bun-types": "latest",
     "debug": "^4.4.3",

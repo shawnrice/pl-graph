@@ -20,7 +20,7 @@
   },
   "devDependencies": {
     "@lenke/dev": "workspace:*",
-    "@types/bun": "latest",
+    "@types/bun": "^1.4.1",
     "bun-types": "latest"
   },
   "peerDependencies": {

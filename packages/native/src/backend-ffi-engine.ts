@@ -46,9 +46,14 @@ const decoder = new TextDecoder();
 // bun:ffi `ptr()` rejects a zero-length view; hand it a 1-byte scratch for an empty
 // payload while still passing the real (0) length (see backend-ffi.ts).
 const EMPTY_SCRATCH = new Uint8Array(1);
+// bun:ffi 1.4 types a returned pointer as `bigint | Pointer` (a 64-bit address may
+// exceed Number.MAX_SAFE_INTEGER, so it can come back as a bigint). Our handles/buffers
+// round-trip whatever bun hands back untouched, so accept the union everywhere a pointer
+// FLOWS BACK from a symbol.
+type FfiPtr = bigint | Pointer;
 const bytesPtr = (b: Uint8Array): Pointer => ptr(b.byteLength === 0 ? EMPTY_SCRATCH : b);
 const asPtr = (h: GraphHandle): Pointer => h as unknown as Pointer;
-const asHandle = (p: Pointer | null): GraphHandle => p as unknown as GraphHandle;
+const asHandle = (p: FfiPtr | null): GraphHandle => p as unknown as GraphHandle;
 
 /** Load `liblenke_engine` over bun:ffi. Pass the absolute path to the built cdylib. */
 export const createFfiEngineBackend = (libPath: string): Backend => {
@@ -93,7 +98,7 @@ export const createFfiEngineBackend = (libPath: string): Backend => {
 
   // A buffer-returning call: read the crate-owned (ptr, out_len) into a JS copy,
   // then hand the crate buffer back to `lnk_free`.
-  const takeResult = (call: (outLen: Pointer) => Pointer | null, op: string): Uint8Array => {
+  const takeResult = (call: (outLen: Pointer) => FfiPtr | null, op: string): Uint8Array => {
     const outLen = new BigUint64Array(1);
     const resPtr = call(ptr(outLen));
 

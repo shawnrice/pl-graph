@@ -20,7 +20,7 @@
     "debug": "^4.3.7"
   },
   "devDependencies": {
-    "@types/bun": "^1.3.13",
+    "@types/bun": "^1.4.1",
     "@types/debug": "^4.1.12",
     "bun-types": "latest",
     "prettier": "^3.3.3"
