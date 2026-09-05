@@ -22,7 +22,7 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.13 # matches "packageManager" in package.json
+          bun-version: 1.4.0 # matches "packageManager" in package.json
 
       # Rust toolchain (cargo/clippy/rustfmt) + the wasm32 target, so the wasm
       # backend can be built and its tests actually run (not silently skip).
@@ -103,7 +103,7 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.13
+          bun-version: 1.4.0
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@1.96.0
       - name: Cache cargo
