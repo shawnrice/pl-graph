@@ -313,7 +313,7 @@ const QUOTES = new Set(["'", '"', '`']);
 /**
  * Whitespace/comment-normalize query text for the dedupe signature ONLY (the
  * wire carries the author's text). Outside quoted regions, whitespace runs —
- * and, for GQL, comments (`//` / `--` line, `/* *​/` block; they are token
+ * and, for GQL, comments (`//` / `--` line, `/* * /` block; they are token
  * separators, exactly as the lexer treats them) — collapse to one space, so
  * formatting differences don't mint duplicate entries. Quoted regions
  * (`'…' "…" `…``) copy verbatim, backslash-aware: values and delimited

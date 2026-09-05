@@ -30,7 +30,7 @@
   },
   "peerDependencies": {
     "eslint": ">=8",
-    "oxlint": ">=0.15"
+    "oxlint": "^1.81.0"
   },
   "peerDependenciesMeta": {
     "eslint": {
