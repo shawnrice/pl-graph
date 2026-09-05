@@ -90,7 +90,7 @@ export const highlightFromQuery = (graph: Graph, text: string): Set<string> => {
     }
 
     if (value && typeof value === 'object' && 'id' in value) {
-      const { id } = value as { id: unknown };
+      const { id } = value;
 
       if (typeof id === 'string' && valid.has(id)) {
         ids.add(id);

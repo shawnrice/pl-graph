@@ -40,7 +40,7 @@ describe('loops tests', () => {
       run(
         traversal(
           V('1'),
-          repeat(out()).until(((p: Plan) => is(eq(2))(loops()(p))) as never),
+          repeat(out()).until((p: Plan) => is(eq(2))(loops()(p))),
           values('name'),
         ),
         tinkerGraph,

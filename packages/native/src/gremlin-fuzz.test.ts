@@ -500,7 +500,7 @@ const step = (r: () => number): unknown => {
   }
 
   if (p < 0.58) {
-    return has(pick(r, KEYS), pick(r, preds)(pick(r, VALUES) as never));
+    return has(pick(r, KEYS), pick(r, preds)(pick(r, VALUES)));
   }
 
   if (p < 0.63) {

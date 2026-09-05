@@ -339,7 +339,7 @@ export const createSyncEngine = (options: SyncEngineOptions): SyncEngine => {
     // Keys are in the definition's fixed order, so this tag is deterministic.
     const tag = keys.map((k) => JSON.stringify(scope[k])).join('\x01');
 
-    return { stateKey: `${name}\u0000${tag}`, scope: scope as QueryParams };
+    return { stateKey: `${name}\u0000${tag}`, scope: scope };
   };
 
   const stateOf = (stateKey: string): CollectionState => states.get(stateKey) ?? 'empty';

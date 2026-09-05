@@ -43,7 +43,7 @@ const canonValue = (v: unknown): unknown => {
   if (v !== null && typeof v === 'object') {
     const out: Record<string, unknown> = {};
 
-    for (const k of Object.keys(v as Record<string, unknown>).sort()) {
+    for (const k of Object.keys(v).sort()) {
       const val = (v as Record<string, unknown>)[k];
       out[k] =
         k === 'labels' && Array.isArray(val)

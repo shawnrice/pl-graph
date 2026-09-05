@@ -111,7 +111,7 @@ describe('serialize', () => {
     expect(isSerializable(plan)).toBe(true);
     const s = serialize(plan);
     const parsed = JSON.parse(s);
-    expect(parsed).toEqual(plan as unknown as typeof parsed);
+    expect(parsed).toEqual(plan);
   });
 
   test('plans with closure-bearing steps are NOT serializable', () => {

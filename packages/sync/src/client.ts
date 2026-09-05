@@ -642,7 +642,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     new Promise<R[]>((resolve, reject) => {
       const req = `q${++nextId}`;
       const msg: ClientMessage = { type: 'query', req, query: text, params, format: opts?.format };
-      pending.set(req, { resolve: resolve as (v: never) => void, reject, kind: 'query', msg });
+      pending.set(req, { resolve: resolve, reject, kind: 'query', msg });
       send(msg);
     });
 
@@ -656,7 +656,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
       // passes through (buildGremlin is @lenke/native's `gremlin` composer).
       const text = buildGremlin(traversal, ...subs);
       const msg: ClientMessage = { type: 'query', req, query: text, lang: 'gremlin' };
-      pending.set(req, { resolve: resolve as (v: never) => void, reject, kind: 'gremlin', msg });
+      pending.set(req, { resolve: resolve, reject, kind: 'gremlin', msg });
       send(msg);
     });
 
@@ -675,7 +675,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     return new Promise<void>((resolve, reject) => {
       const req = `m-${clientId}-${++nextId}`;
       const msg: ClientMessage = { type: 'mutate', req, text, params, lang, clientId };
-      pending.set(req, { resolve: resolve as (v: never) => void, reject, kind: 'mutate', msg });
+      pending.set(req, { resolve: resolve, reject, kind: 'mutate', msg });
       send(msg);
     });
   };
@@ -690,7 +690,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
       // passes through (buildGremlin is @lenke/native's `gremlin` composer).
       const text = buildGremlin(traversal, ...subs);
       const msg: ClientMessage = { type: 'mutate', req, text, lang: 'gremlin', clientId };
-      pending.set(req, { resolve: resolve as (v: never) => void, reject, kind: 'mutate', msg });
+      pending.set(req, { resolve: resolve, reject, kind: 'mutate', msg });
       send(msg);
     });
 

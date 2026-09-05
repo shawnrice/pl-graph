@@ -130,7 +130,7 @@ describe('hardening G7-G9: comparison/order/aggregation reject incomparable type
     // TinkerPop's has()/is()/where() filter a cross-type comparison (verified on
     // createModern(): `g.V().has('name', gte(0))` matches nothing) — they do NOT
     // throw. `max()`/`min()`/`sum()` still throw (below); order() total-orders.
-    expect(arr(run(traversal(inject(5), is(gt('x' as never))), new Graph()))).toEqual([]);
+    expect(arr(run(traversal(inject(5), is(gt('x'))), new Graph()))).toEqual([]);
   });
 
   // order()/min()/max() use a TOTAL order over mixed types — numbers before strings —

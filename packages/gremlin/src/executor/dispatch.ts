@@ -189,7 +189,7 @@ export const applyStep = (
         // which yields `{key, value}` per property. Match if the object's
         // `key` field equals one of the given keys.
         if (v !== null && typeof v === 'object' && 'key' in v) {
-          return step.keys.includes((v as { key: unknown }).key as string);
+          return step.keys.includes(v.key as string);
         }
 
         return false;
@@ -439,7 +439,7 @@ export const applyStep = (
     case 'hasValue':
       return filterStream(stream, (v) => {
         if (v !== null && typeof v === 'object' && 'value' in v) {
-          return step.values.includes((v as { value: unknown }).value);
+          return step.values.includes(v.value);
         }
 
         return step.values.includes(v);
@@ -551,7 +551,7 @@ export const applyStep = (
         // `label()` returns the key — matching TinkerPop's behavior of
         // treating the property's key field as its "label".
         if (v !== null && typeof v === 'object' && 'key' in v) {
-          return (v as { key: unknown }).key;
+          return v.key;
         }
 
         return undefined;

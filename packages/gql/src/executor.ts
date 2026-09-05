@@ -1623,7 +1623,7 @@ export const valueKey = (v: unknown): string => {
       }
 
       if ('id' in v) {
-        return `@${String((v as { id: unknown }).id)}`;
+        return `@${String(v.id)}`;
       }
 
       // Lists are native arrays (the common container key): recurse through the

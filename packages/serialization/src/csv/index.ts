@@ -349,9 +349,17 @@ const scalarToRaw = (scalar: ScalarType, value: PropertyValue): string => {
     return 'null';
   }
 
-  // A CSV scalar cell is only ever a string/number/null here (lists are written
-  // element-by-element, temporals/booleans/maps handled above).
-  return String(value as string | number | null);
+  // Everything object-shaped (list / temporal / map) was handled above; a scalar
+  // (string / number / boolean / null) remains. This defensive guard both documents
+  // that and NARROWS the broad PropertyValue so `String()` can't hit an object's
+  // `[object Object]` default (satisfies no-base-to-string without a cast).
+  if (typeof value === 'object' && value !== null) {
+    throw new LenkeError('a non-scalar property cannot be serialized to a csv cell', {
+      code: ErrorCode.Unsupported,
+    });
+  }
+
+  return String(value);
 };
 
 // A finite decimal/scientific literal — the grammar Rust's f64::from_str accepts

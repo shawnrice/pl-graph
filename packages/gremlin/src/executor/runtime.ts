@@ -385,7 +385,7 @@ export const projectToken = (token: 'id' | 'label' | 'key' | 'value', value: unk
   // `T.key` / `T.value` apply to property objects of shape `{ key, value }`
   // (as produced by `properties()`). For anything else, undefined.
   if (typeof value === 'object' && value !== null && 'key' in value && 'value' in value) {
-    return (value as { key: unknown; value: unknown })[token];
+    return value[token];
   }
 
   return undefined;

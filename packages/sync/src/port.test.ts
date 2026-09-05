@@ -75,7 +75,7 @@ describe('servePort', () => {
     const { engine, hosts } = makeFakeEngine();
     const fake = makeFakePort();
 
-    servePort(engine as never, fake.port);
+    servePort(engine, fake.port);
     expect(hosts).toHaveLength(1);
 
     fake.deliver({ type: 'subscribe', sub: 's1' });
@@ -96,7 +96,7 @@ describe('servePort', () => {
     const fake = makeFakePort();
     let closed = false;
 
-    servePort(engine as never, fake.port, { onClose: () => (closed = true) });
+    servePort(engine, fake.port, { onClose: () => (closed = true) });
     fake.fireClose();
 
     expect(hosts[0].calls.closed).toBe(1);
@@ -107,7 +107,7 @@ describe('servePort', () => {
     const { engine, hosts } = makeFakeEngine();
     const fake = makeFakePort();
 
-    const served = servePort(engine as never, fake.port);
+    const served = servePort(engine, fake.port);
     served.sendStatus();
     expect(hosts[0].calls.statuses).toBe(1);
 

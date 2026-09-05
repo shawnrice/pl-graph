@@ -207,7 +207,7 @@ export const createStore = (graph: RustGraph): Store => {
 
     if (!cell) {
       cell = { deps, run, seenVersion: -1, seenFingerprint: -1, cached: [], refs: 0 };
-      pool.set(signature, cell as Cell<unknown>);
+      pool.set(signature, cell);
     }
 
     // The handle closes over the cell, so it stays usable even after the cell is

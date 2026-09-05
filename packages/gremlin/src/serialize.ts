@@ -23,7 +23,7 @@ const findClosuresInArrayItem = (v: unknown, path: string): string[] => {
 
   // `branch.options` is `[{ match, plan }, ...]` — recurse via `.plan`.
   if (v && typeof v === 'object' && 'plan' in v) {
-    const inner = (v as { plan: unknown }).plan;
+    const inner = v.plan;
 
     if (isPlan(inner)) {
       return findClosures(inner, `${path}.plan`);

@@ -834,7 +834,7 @@ export const callScalar = (
       return !isNullish(a) && !isNullish(b) && structuralEq(a, b) ? null : (a ?? null);
     case 'element_id':
       // ISO `<element_id function>`: the identifier of a node or edge.
-      return a && typeof a === 'object' && 'id' in a ? (a as { id: unknown }).id : null;
+      return a && typeof a === 'object' && 'id' in a ? a.id : null;
     default:
       // Graph/conversion/string/list functions live in a second dispatcher so
       // neither switch exceeds the complexity budget.
@@ -1204,7 +1204,7 @@ export const toListScalar = (a: unknown): unknown[] | null => {
     return a;
   }
 
-  return typeof a === 'string' ? (splitScalar(a, '') as string[]) : [a];
+  return typeof a === 'string' ? splitScalar(a, '') : [a];
 };
 
 export const UTF8 = new TextEncoder();

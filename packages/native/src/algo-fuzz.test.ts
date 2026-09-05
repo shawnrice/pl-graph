@@ -177,8 +177,8 @@ const ALGOS: Algo[] = [
   },
   {
     name: 'neighborAggregate',
-    ts: (c, g) => neighborAggregate({ ...c, feature: 'vec' } as AlgorithmConfig, g),
-    nat: (g, c) => g.neighborAggregate({ ...c, feature: 'vec' } as AlgorithmConfig),
+    ts: (c, g) => neighborAggregate({ ...c, feature: 'vec' }, g),
+    nat: (g, c) => g.neighborAggregate({ ...c, feature: 'vec' }),
   },
 ];
 

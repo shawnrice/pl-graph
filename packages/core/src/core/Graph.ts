@@ -912,7 +912,7 @@ export class Graph {
     graphMutationEvents.forEach((type) => {
       // The same listener is registered against many event types; we erase
       // the per-event listener type here.
-      this.on(type, markMutated as never);
+      this.on(type, markMutated);
       this.on(type, onMutate as never);
     });
   }
@@ -2330,7 +2330,7 @@ export class Graph {
 
     // Temporals carry a `kind` discriminant ('date' | 'datetime' | 'duration').
     if (typeof v === 'object' && 'kind' in v) {
-      const k = (v as { kind: unknown }).kind;
+      const k = v.kind;
 
       if (k === 'date' || k === 'datetime' || k === 'duration') {
         return k;
@@ -3533,13 +3533,13 @@ export class Graph {
       // removal evicts the element (nulls its graph ref) before this event is
       // dispatched at commit, after which its `labels` getter would throw.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (event as any)[TX_TOKENS] = this.tokensOf(event as never);
+      (event as any)[TX_TOKENS] = this.tokensOf(event);
       this.txEvents.push(event);
 
       return event;
     }
 
-    return this.emitter.emit(event as never) as T;
+    return this.emitter.emit(event as never);
   };
 
   /* Transactions */

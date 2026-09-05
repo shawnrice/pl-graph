@@ -61,6 +61,6 @@ describe('traversal AST', () => {
     const plan = traversal(V(1), out('knows'), has('age', gt(30)), take(5));
     // eslint-disable-next-line unicorn/prefer-structured-clone -- the assertion is specifically about JSON-serializability, not deep cloning
     const roundTripped = JSON.parse(JSON.stringify(plan));
-    expect(roundTripped).toEqual(plan as unknown as typeof roundTripped);
+    expect(roundTripped).toEqual(plan);
   });
 });

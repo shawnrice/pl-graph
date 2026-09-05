@@ -347,7 +347,7 @@ suite('type-constraint differential (TS vs native)', () => {
     const backend = createFfiEngineBackend(LIB);
     const nativeGraph = graphFromNdjson(backend, SEED);
 
-    const ts = outcome(() => tsGraph.createTypeConstraint('Acct', 'age', 'int' as never));
+    const ts = outcome(() => tsGraph.createTypeConstraint('Acct', 'age', 'int'));
     const native = outcome(() => nativeGraph.createTypeConstraint('Acct', 'age', 'int' as never));
 
     expect(native).toEqual(ts);
@@ -527,7 +527,7 @@ suite('edge type-constraint differential (TS vs native)', () => {
     const backend = createFfiEngineBackend(LIB);
     const nativeGraph = graphFromNdjson(backend, SEED);
 
-    const ts = outcome(() => tsGraph.createEdgeTypeConstraint('FOLLOWS', 'since', 'int' as never));
+    const ts = outcome(() => tsGraph.createEdgeTypeConstraint('FOLLOWS', 'since', 'int'));
     const native = outcome(() =>
       nativeGraph.createEdgeTypeConstraint('FOLLOWS', 'since', 'int' as never),
     );

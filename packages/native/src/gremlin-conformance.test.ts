@@ -722,8 +722,8 @@ suite('gremlin conformance: bitemporal as-of across the bridge', () => {
     V(),
     has('id', eq('a')),
     outE('R'),
-    has('vf', lte(asOf as never)),
-    has('vt', gte(asOf as never)),
+    has('vf', lte(asOf)),
+    has('vt', gte(asOf)),
     inV(),
     values('id'),
   );
