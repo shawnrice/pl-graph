@@ -21,8 +21,7 @@
     "@types/bun": "^1.4.1",
     "@types/debug": "^4.1.12",
     "bun-types": "latest",
-    "debug": "^4.4.3",
-    "prettier": "^3.2.5"
+    "debug": "^4.4.3"
   },
   "peerDependencies": {
     "typescript": "^6.0.0"
